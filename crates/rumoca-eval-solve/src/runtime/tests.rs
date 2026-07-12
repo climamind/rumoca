@@ -687,12 +687,33 @@ fn refresh_newton_repivots_mode_dependent_coupled_residuals() {
     assert_eq!(runtime.algebraic_refresh.simultaneous_plan.blocks.len(), 1);
 
     let mut solver_y = model.initial_y.clone();
-    runtime
-        .refresh_algebraic_and_output_slots(0.0, &mut solver_y, &[0.0], 1.0e-10, 4)
-        .expect("coupled Newton solve should dynamically repivot the residuals");
+    // Reuse the same prepared runtime and warm start while the first row loses
+    // and regains dependence on x; every equation must still be satisfied.
+    for parameter in [1.0, 0.0, 1.0] {
+        runtime
+            .refresh_algebraic_and_output_slots(0.0, &mut solver_y, &[parameter], 1.0e-10, 4)
+            .expect("coupled Newton solve should dynamically repivot the residuals");
 
-    assert!((solver_y[0] - 2.0).abs() <= 1.0e-9);
-    assert!((solver_y[1] - 1.0).abs() <= 1.0e-9);
+        let expected_x = 2.0 / (1.0 + parameter);
+        assert!((solver_y[0] - expected_x).abs() <= 1.0e-9);
+        assert!((solver_y[1] - (3.0 - expected_x)).abs() <= 1.0e-9);
+        for row in 0..2 {
+            let residual = runtime
+                .implicit_scalar_rhs
+                .eval_row_unchecked_with_context(
+                    row,
+                    &solver_y,
+                    &[parameter],
+                    0.0,
+                    runtime.row_eval_context(),
+                )
+                .expect("complete implicit residual should evaluate");
+            assert!(
+                residual.abs() <= 1.0e-9,
+                "row {row} residual at k={parameter}: {residual}"
+            );
+        }
+    }
 }
 
 #[test]
