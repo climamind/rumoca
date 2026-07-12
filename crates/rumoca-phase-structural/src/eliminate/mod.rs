@@ -19,6 +19,7 @@ use std::collections::HashSet;
 
 use indexmap::{IndexMap, IndexSet};
 
+use crate::static_eval::{eval_static_number, structural_scalar_bindings};
 use rumoca_core::{
     ExpressionRewriter, FallibleExpressionRewriter, maybe_elapsed_seconds, maybe_start_timer_if,
 };
@@ -42,17 +43,14 @@ mod tearing_elimination;
 mod unknown_index;
 
 use aggregate_alias::{
-    aggregate_alias_for_elimination, aggregate_variable_fully_resolved,
+    aggregate_definition_for_elimination, aggregate_variable_fully_resolved,
     is_scalarized_element_of_aggregate,
 };
 use boundary_scan::{BoundaryScanCtx, BoundaryScanState, scan_boundary_equations};
 use connection_policy::should_skip_connection_equation;
 use diagnostics::trace_singular_reduced_rows;
 use direct_definition_index::DirectDefinitionIndex;
-use flow_policy::{
-    expr_contains_indexed_multiscalar_ref, expr_contains_indexed_multiscalar_slice_ref,
-    is_flow_equation_origin,
-};
+use flow_policy::{expr_contains_indexed_multiscalar_ref, is_flow_equation_origin};
 use orphan_unknowns::{drop_unreferenced_continuous_unknowns, output_partition_contains_unknown};
 use profiling::{eliminate_profile_enabled, log_eliminate_profile};
 use runtime_known::singular_rows_are_runtime_known_assignments;
@@ -66,16 +64,20 @@ use scalar_shape::expression_is_scalar_after_subscripts;
 pub use solve_for_unknown::try_solve_for_unknown;
 use solve_for_unknown::{expr_contains_unknown_in_dae, try_solve_for_unknown_in_dae};
 use substitution_application::{
-    apply_substitutions_to_dae_partitions, apply_substitutions_to_remaining_once,
-    canonicalize_exact_indexing_in_continuous_equations, equation_analysis_expr,
+    apply_substitutions_in_order, apply_substitutions_to_dae_partitions,
+    apply_substitutions_to_remaining_once, canonicalize_exact_indexing_in_continuous_equations,
+    equation_analysis_expr, simplify_arithmetic_identities,
+};
+use substitution_target::{
+    expr_contains_derivative_substitution_target, expr_contains_substitution_target,
 };
 use substitution_target::{
     expr_contains_derivative_substitution_target, expr_contains_substitution_target,
 };
 use tearing_elimination::tear_and_eliminate_loop_block;
 use unknown_index::{
-    BoundaryUnknownIndex, checked_count_live_unknowns, find_live_scalar_unknowns,
-    has_any_live_unknown,
+    BoundaryUnknownIndex, checked_count_live_unknowns, expression_references_boundary_unknown,
+    find_live_scalar_unknowns, has_any_live_unknown,
 };
 
 use crate::variable_scope::{DaeVariableScope, DaeVariableShape, scalar_count_from_dims};
@@ -189,13 +191,21 @@ pub fn eliminate_trivial(dae: &mut Dae) -> Result<EliminationResult, StructuralE
         sort_input.continuous.equations.len(),
     );
     let p_drop = maybe_start_timer_if(profile);
-    drop_unreferenced_continuous_unknowns(&mut sort_input);
+    drop_unreferenced_continuous_unknowns(&mut sort_input)?;
     log_eliminate_profile(
         profile,
         "drop_unreferenced_unknowns",
         p_drop,
         sort_input.continuous.equations.len(),
     );
+    let uses_scalar_view = sort_input
+        .continuous
+        .equations
+        .iter()
+        .any(|equation| equation.scalar_count != 1);
+    if uses_scalar_view {
+        crate::scalarize::scalarize_equations(&mut sort_input)?;
+    }
     let p_sort = maybe_start_timer_if(profile);
     let blocks = match sort_dae(&sort_input) {
         Ok(sorted) => Some(sorted.blocks.clone()),
@@ -216,7 +226,7 @@ pub fn eliminate_trivial(dae: &mut Dae) -> Result<EliminationResult, StructuralE
         p_sort,
         blocks.as_ref().map_or(0, Vec::len),
     );
-    if let Some(blocks) = blocks {
+    if let Some(blocks) = blocks.filter(|_| !uses_scalar_view) {
         let state_names: Vec<VarName> = dae.variables.states.keys().cloned().collect();
         let t_blt = maybe_start_timer_if(trace);
         let p_blt = maybe_start_timer_if(profile);
@@ -403,11 +413,7 @@ fn resolve_boundary_and_direct_demotions_to_fixpoint(
         result.substitutions.extend(pass.substitutions);
 
         let p_demote = maybe_start_timer_if(profile);
-        let demoted =
-            crate::dae_prepare::demote_direct_assigned_states_with_boundary_substitutions(
-                dae,
-                &result.substitutions,
-            )?;
+        let demoted = crate::dae_prepare::demote_direct_assigned_states(dae)?;
         log_eliminate_profile(profile, "boundary_direct_demotion", p_demote, demoted);
         total_demoted += demoted;
         if eliminated == 0 && demoted == 0 {
@@ -439,7 +445,6 @@ fn eliminate_trace_enabled() -> bool {
 ///
 /// ODE equations (containing `der(state)`) are always skipped.
 fn resolve_boundary_equations(dae: &mut Dae) -> Result<EliminationResult, StructuralError> {
-    canonicalize_exact_indexing_in_continuous_equations(dae)?;
     let profile = eliminate_profile_enabled();
     let p_unknowns = maybe_start_timer_if(profile);
     let all_unknowns = collect_boundary_unknowns(dae)?;
@@ -478,6 +483,7 @@ fn resolve_boundary_equations(dae: &mut Dae) -> Result<EliminationResult, Struct
         direct_definitions.len(),
     );
     let mut scan_state = BoundaryScanState::new(dae.continuous.equations.len());
+
     let p_order = maybe_start_timer_if(profile);
     let eq_order = boundary_equation_order(dae, &unknown_index, &scan_state.resolved)?;
     log_eliminate_profile(profile, "boundary_equation_order", p_order, eq_order.len());
@@ -486,6 +492,7 @@ fn resolve_boundary_equations(dae: &mut Dae) -> Result<EliminationResult, Struct
     {
         let scan_ctx = BoundaryScanCtx {
             dae,
+            state_names: &state_names,
             unknown_index: &unknown_index,
             state_derivative_matcher: &state_derivative_matcher,
             runtime_protected_unknowns: &runtime_protected_unknowns,
@@ -508,8 +515,6 @@ fn resolve_boundary_equations(dae: &mut Dae) -> Result<EliminationResult, Struct
         scan_state.eliminated_eq_flags,
         scan_state.eliminated_eq_indices,
         &scan_state.resolved,
-        &runtime_protected_unknowns,
-        &runtime_defined_discrete_targets,
     )?;
     log_eliminate_profile(profile, "boundary_finish", p_finish, result.n_eliminated);
     Ok(result)
@@ -571,7 +576,9 @@ fn shift_structured_families_after_equation_removal(dae: &mut Dae, removed_sorte
         return;
     }
     dae.continuous.structured_equations.retain_mut(|family| {
-        let total: usize = family.equation_counts.iter().sum();
+        let total = family
+            .scalar_view_row_count()
+            .expect("validated structured family row count");
         let block_end = family.first_equation_index + total;
         let removed_inside_block = removed_sorted
             .iter()
@@ -600,7 +607,9 @@ fn drop_structured_families_touching_equations(dae: &mut Dae, touched_sorted: &[
         return;
     }
     dae.continuous.structured_equations.retain(|family| {
-        let total: usize = family.equation_counts.iter().sum();
+        let total = family
+            .scalar_view_row_count()
+            .expect("validated structured family row count");
         let block_end = family.first_equation_index + total;
         !touched_sorted
             .iter()
@@ -909,6 +918,22 @@ fn try_eliminate_zero_unknown_equation(
     {
         return Ok(());
     }
+    if ctx.substitutions.len() == n_subs_before {
+        let bindings = structural_scalar_bindings(ctx.dae);
+        let simplified = simplify_arithmetic_identities(eq_rhs.clone());
+        match eval_static_number(&simplified, &bindings) {
+            Some(value) if value.is_finite() && value == 0.0 => {}
+            Some(value) if value.is_finite() => {
+                let equation = &ctx.dae.continuous.equations[eq_idx];
+                return Err(StructuralError::InconsistentEquation {
+                    residual: value,
+                    origin: equation.origin.clone(),
+                    span: equation.span,
+                });
+            }
+            Some(_) | None => return Ok(()),
+        }
+    }
     ctx.eliminated_eq_indices.push(eq_idx);
     ctx.eliminated_eq_flags[eq_idx] = true;
     Ok(())
@@ -956,25 +981,16 @@ fn choose_solvable_unknown_for_elimination(
     ctx: &EliminationChoiceContext<'_>,
     rhs: &Expression,
     live: &[VarName],
+    has_state_derivative: bool,
+    runtime_protected_unknowns: &IndexSet<String>,
+    direct_definitions: &DirectDefinitionIndex,
 ) -> Result<Option<(VarName, Expression)>, StructuralError> {
     let mut candidates: Vec<&VarName> = live.iter().collect();
     let dae = ctx.dae;
     let connection_rhs = connection_rhs_assignment_target(dae, ctx.eq_idx, rhs);
     candidates.sort_by(|a, b| {
-        let a_is_connection_rhs =
-            connection_rhs.is_some_and(|target| is_assignment_target(dae, target, a));
-        let b_is_connection_rhs =
-            connection_rhs.is_some_and(|target| is_assignment_target(dae, target, b));
-        let a_has_definition = ctx
-            .direct_definitions
-            .has_other_direct_definition(ctx.eq_idx, a)
-            && !can_ignore_internal_output_definition_for_choice(ctx, a);
-        let b_has_definition = ctx
-            .direct_definitions
-            .has_other_direct_definition(ctx.eq_idx, b)
-            && !can_ignore_internal_output_definition_for_choice(ctx, b);
-        let a_internal_defined_output = can_ignore_internal_output_definition_for_choice(ctx, a);
-        let b_internal_defined_output = can_ignore_internal_output_definition_for_choice(ctx, b);
+        let a_has_definition = direct_definitions.has_other_direct_definition(eq_idx, a);
+        let b_has_definition = direct_definitions.has_other_direct_definition(eq_idx, b);
         let a_is_output = output_partition_contains_unknown(dae, a);
         let b_is_output = output_partition_contains_unknown(dae, b);
         b_is_connection_rhs
@@ -1017,199 +1033,6 @@ fn choose_solvable_unknown_for_elimination(
         return Ok(Some((candidate.clone(), solution)));
     }
     Ok(None)
-}
-
-fn elimination_solution_is_valid(
-    ctx: &EliminationChoiceContext<'_>,
-    candidate: &VarName,
-    solution: &Expression,
-    is_output: bool,
-    direct_assignment_solution: bool,
-    live_len: usize,
-) -> Result<bool, StructuralError> {
-    let dae = ctx.dae;
-    if expr_contains_unknown_in_dae(dae, solution, candidate) {
-        return Ok(false);
-    }
-    if !solution_matches_candidate_scalar_shape(dae, candidate, solution)? {
-        return Ok(false);
-    }
-    if !is_trivial_alias_in_dae(dae, solution)
-        && !solution_is_cheap_for_symbolic_substitution(solution)
-    {
-        return Ok(false);
-    }
-    if !runtime_protected_elimination_is_valid(ctx, candidate, solution, direct_assignment_solution)
-    {
-        return Ok(false);
-    }
-    if !scalarized_candidate_elimination_is_valid(
-        ctx,
-        candidate,
-        solution,
-        direct_assignment_solution,
-    )? {
-        return Ok(false);
-    }
-    if !state_derivative_elimination_is_valid(
-        ctx,
-        candidate,
-        solution,
-        is_output,
-        direct_assignment_solution,
-    ) {
-        return Ok(false);
-    }
-    if is_output
-        && !is_trivial_alias_in_dae(dae, solution)
-        && !is_internal_component_output(dae, candidate)
-        && !is_connection_rhs_boundary_input(ctx, candidate, direct_assignment_solution)
-    {
-        return Ok(false);
-    }
-    if !direct_assignment_solution && !is_symbolically_stable_solution(solution) {
-        return Ok(false);
-    }
-    if solution_has_blocking_unsliced_multiscalar_ref(solution, dae)? {
-        return Ok(false);
-    }
-    if indexed_multiscalar_slice_solution_is_blocked(dae, solution)? {
-        return Ok(false);
-    }
-    Ok(live_len <= 1
-        || direct_assignment_solution
-        || (ctx.allow_multi_live_trivial_alias && is_trivial_alias_in_dae(dae, solution)))
-}
-
-fn runtime_protected_elimination_is_valid(
-    ctx: &EliminationChoiceContext<'_>,
-    candidate: &VarName,
-    _solution: &Expression,
-    _direct_assignment_solution: bool,
-) -> bool {
-    !is_runtime_protected_unknown(candidate, ctx.runtime_protected_unknowns)
-}
-
-fn scalarized_candidate_elimination_is_valid(
-    ctx: &EliminationChoiceContext<'_>,
-    candidate: &VarName,
-    solution: &Expression,
-    direct_assignment_solution: bool,
-) -> Result<bool, StructuralError> {
-    let dae = ctx.dae;
-    let is_scalarized_element = is_scalarized_element_of_aggregate(dae, candidate)?;
-    if !is_scalarized_element {
-        return Ok(true);
-    }
-    let is_trivial_alias = is_trivial_alias_in_dae(dae, solution);
-    if direct_assignment_solution
-        && !is_trivial_alias
-        && expr_contains_runtime_sensitive_operator(solution)
-        && scalarized_element_has_non_connection_use(dae, candidate)
-    {
-        return Ok(false);
-    }
-    if ctx.has_state_derivative {
-        return Ok(false);
-    }
-    if scalarized_element_has_coupled_derivative_use(dae, candidate) && !is_trivial_alias {
-        return Ok(false);
-    }
-    Ok(scalarized_element_has_non_connection_use(dae, candidate))
-}
-
-fn state_derivative_elimination_is_valid(
-    ctx: &EliminationChoiceContext<'_>,
-    candidate: &VarName,
-    solution: &Expression,
-    is_output: bool,
-    direct_assignment_solution: bool,
-) -> bool {
-    !ctx.has_state_derivative
-        || is_output
-        || (direct_assignment_solution
-            && ctx
-                .direct_definitions
-                .has_other_direct_definition(ctx.eq_idx, candidate)
-            && is_derivative_alias_expr(solution))
-}
-
-fn is_connection_rhs_boundary_input(
-    ctx: &EliminationChoiceContext<'_>,
-    candidate: &VarName,
-    direct_assignment_solution: bool,
-) -> bool {
-    direct_assignment_solution
-        && connection_rhs_assignment_target(
-            ctx.dae,
-            ctx.eq_idx,
-            &ctx.dae.continuous.equations[ctx.eq_idx].rhs,
-        )
-        .is_some_and(|target| is_assignment_target(ctx.dae, target, candidate))
-}
-
-fn indexed_multiscalar_slice_solution_is_blocked(
-    dae: &Dae,
-    solution: &Expression,
-) -> Result<bool, StructuralError> {
-    if !expr_contains_indexed_multiscalar_slice_ref(solution, dae)? {
-        return Ok(false);
-    }
-    Ok(!(is_scalar_reduction_solution_tree(solution)
-        || is_trivial_alias_in_dae(dae, solution)
-            && expression_is_scalar_after_subscripts(solution, dae)?))
-}
-
-fn solution_matches_candidate_scalar_shape(
-    dae: &Dae,
-    candidate: &VarName,
-    solution: &Expression,
-) -> Result<bool, StructuralError> {
-    if DaeVariableScope::new(dae).size(candidate)? > 1 {
-        return Ok(true);
-    }
-    Ok(!expression_is_multiscalar_literal(solution))
-}
-
-fn expression_is_multiscalar_literal(expr: &Expression) -> bool {
-    match expr {
-        Expression::Array { elements, .. } | Expression::Tuple { elements, .. } => {
-            literal_scalar_count(elements) > 1
-        }
-        _ => false,
-    }
-}
-
-fn literal_scalar_count(elements: &[Expression]) -> usize {
-    elements
-        .iter()
-        .map(|element| match element {
-            Expression::Array { elements, .. } | Expression::Tuple { elements, .. } => {
-                literal_scalar_count(elements)
-            }
-            _ => 1,
-        })
-        .sum()
-}
-
-fn connection_rhs_assignment_target<'a>(
-    dae: &'a Dae,
-    eq_idx: usize,
-    rhs: &'a Expression,
-) -> Option<&'a Expression> {
-    let eq = dae.continuous.equations.get(eq_idx)?;
-    if !eq.origin.starts_with("connection equation:") {
-        return None;
-    }
-    let Expression::Binary {
-        op: OpBinary::Sub,
-        rhs: target,
-        ..
-    } = rhs
-    else {
-        return None;
-    };
-    Some(target.as_ref())
 }
 
 fn choose_solvable_non_unknown_alias_for_elimination(
@@ -2837,6 +2660,7 @@ fn can_use_scalar_equation_for_elimination(
         eq.origin.starts_with("connection equation:"),
         std::slice::from_ref(var_name),
         runtime_defined_discrete_targets,
+        false,
     )
 }
 
@@ -3386,6 +3210,29 @@ struct RecordFieldAggregateRewriter<'a> {
     dae_scope: Option<DaeVariableScope<'a>>,
 }
 
+impl RecordFieldAggregateRewriter<'_> {
+    fn aggregate_replacement(
+        &self,
+        name: &Reference,
+        subscripts: &[rumoca_core::Subscript],
+        span: rumoca_core::Span,
+    ) -> Option<Expression> {
+        let group = self.aggregate_alias_groups.get(name.var_name())?;
+        if !self.group_covers_reference_dims(name, group) {
+            return self
+                .aggregate_dims_for_reference(name)
+                .and_then(|dims| group.to_partial_replacement_expr(name, &dims, span));
+        }
+        if subscripts.is_empty() {
+            group.to_replacement_expr(span)
+        } else if subscripts_are_static_scalar_indices(subscripts) {
+            None
+        } else {
+            group.to_indexed_replacement_expr(subscripts, span)
+        }
+    }
+}
+
 impl ExpressionRewriter for RecordFieldAggregateRewriter<'_> {
     fn rewrite_var_ref_expression(
         &mut self,
@@ -3425,6 +3272,24 @@ impl ExpressionRewriter for RecordFieldAggregateRewriter<'_> {
             .and_then(|group| group.to_constructor_expr(span))
             .unwrap_or_else(|| self.walk_var_ref_expression(name, subscripts, span))
     }
+
+    fn walk_field_access_expression(
+        &mut self,
+        base: &Expression,
+        field: &str,
+        span: rumoca_core::Span,
+    ) -> Expression {
+        if let Some((name, subscripts)) = rumoca_ir_dae::indexed_field_var_ref(base, field)
+            && let Some(replacement) = self.aggregate_replacement(&name, &subscripts, span)
+        {
+            return replacement;
+        }
+        Expression::FieldAccess {
+            base: Box::new(self.rewrite_expression(base)),
+            field: field.to_owned(),
+            span,
+        }
+    }
 }
 
 impl RecordFieldAggregateRewriter<'_> {
@@ -3460,6 +3325,29 @@ pub fn resolve_substitutions_in_expr(
         out = next;
     }
     Ok(out)
+}
+
+fn expr_contains_unsliced_multiscalar_ref(
+    expr: &Expression,
+    dae: &Dae,
+) -> Result<bool, StructuralError> {
+    let mut refs = Vec::new();
+    collect_var_ref_nodes(expr, &mut refs);
+    let scope = DaeVariableScope::new(dae);
+    for (name, subscripts) in refs {
+        if !subscripts.is_empty() || name.as_str() == "time" {
+            continue;
+        }
+        match scope.shape_for_reference(&name)? {
+            DaeVariableShape::Dimensions(dims) => {
+                if scalar_count_from_dims(name.var_name(), &dims)? > 1 {
+                    return Ok(true);
+                }
+            }
+            DaeVariableShape::StructuredAggregate => {}
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn embedded_alias_indices_for_substitution(
@@ -3936,7 +3824,7 @@ pub(super) fn var_ref_matches_unknown_for_substitution(
     var_ref_matches_unknown(name, subscripts, &substitution.var_name)
 }
 
-fn scalar_subscript_ref_matches_substitution(
+pub(super) fn aggregate_subscript_ref_matches_var(
     name: &Reference,
     subscripts: &[rumoca_core::Subscript],
     substitution: &Substitution,

@@ -60,9 +60,9 @@ mod errors;
 
 pub use codegen::{
     CodegenInput, DaeTemplateContext, SolveTemplateRenderer, dae_template_json,
-    render_ast_template, render_ast_template_with_name, render_flat_template_with_name,
-    render_solve_template_with_name, render_template, render_template_file,
-    render_template_for_input, render_template_with_dae_json,
+    fmi3_native_projection_available, render_ast_template, render_ast_template_with_name,
+    render_flat_template_with_name, render_solve_template_with_name, render_template,
+    render_template_file, render_template_for_input, render_template_with_dae_json,
     render_template_with_dae_json_and_name, render_template_with_name,
     render_template_with_name_for_input,
 };

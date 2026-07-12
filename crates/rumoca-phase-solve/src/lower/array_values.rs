@@ -13,6 +13,7 @@ mod selection_helpers;
 mod structural_standard;
 #[cfg(test)]
 mod tests;
+pub(in crate::lower) use helpers::index_choice_tuples;
 use helpers::*;
 pub(super) use selection_helpers::*;
 const MAX_STATIC_RANGE_VALUES: usize = 100_000;
@@ -32,8 +33,8 @@ pub(super) struct ArrayOperand {
 }
 
 pub(in crate::lower) struct ArraySelectionPart {
-    selector: Option<Reg>,
-    slice_indices: Option<Vec<usize>>,
+    pub(in crate::lower) selector: Option<Reg>,
+    pub(in crate::lower) slice_indices: Option<Vec<usize>>,
 }
 
 struct StructuralIndexLowerCtx<'a> {
@@ -53,6 +54,22 @@ pub(super) struct MatMulShape {
 enum LocalSubscriptResolution {
     NotLocal,
     Values(Vec<Reg>),
+}
+
+struct IndexedSliceReference {
+    display_key: String,
+    group_key: ComponentReferenceKey,
+}
+
+struct LocalArraySelection<'a> {
+    key: &'a str,
+    subscripts: &'a [rumoca_core::Subscript],
+    scope: &'a Scope,
+    call_depth: usize,
+    span: rumoca_core::Span,
+    dims: &'a [i64],
+    scoped_bindings: &'a [LocalIndexedBinding],
+    local_bindings: &'a [LocalIndexedBinding],
 }
 
 fn is_modelica_array_constructor_function(name: &rumoca_core::Reference) -> bool {
@@ -256,13 +273,15 @@ fn single_usize_vec(
     Ok(values)
 }
 
-/// True when every subscript selects a single element (no `:` and no range),
-/// i.e. the access reduces to one scalar array element. Such selections — even
-/// with a runtime (non-constant) index like `wp[current_wp, 1]` — must use the
-/// scalar VarRef path (which lowers runtime indices to indexed loads), not the
-/// compile-time slice enumeration which would try to fold the index.
-fn subscripts_select_single_element(subscripts: &[rumoca_core::Subscript]) -> bool {
+/// True when a full-rank subscript list selects one scalar element (no `:` and
+/// no range). Partial scalar subscript lists preserve trailing dimensions
+/// (`A[i]` for a matrix is a row slice), so they must stay on the slice path.
+fn subscripts_select_single_element(
+    subscripts: &[rumoca_core::Subscript],
+    source_rank: Option<usize>,
+) -> bool {
     !subscripts.is_empty()
+        && source_rank == Some(subscripts.len())
         && subscripts.iter().all(|subscript| match subscript {
             rumoca_core::Subscript::Colon { .. } => false,
             rumoca_core::Subscript::Expr { expr, .. } => {
@@ -1953,13 +1972,12 @@ impl<'a> LowerBuilder<'a> {
             Some(span) => span,
             None => self.required_reference_or_context_span(name, "array slice lowering")?,
         };
-        // A single-element selection (no `:`/range) yields one scalar element.
-        // Route it through the scalar VarRef path, which supports runtime
-        // (non-constant) subscripts via indexed loads. The compile-time slice
-        // enumeration below only handles constant indices/ranges, so sending a
-        // runtime index like `wp[current_wp, 1]` (e.g. as a function argument)
-        // through it would fail trying to fold the index.
-        if subscripts_select_single_element(subscripts) {
+        // A full-rank single-element selection (no `:`/range) yields one scalar
+        // element. Route it through the scalar VarRef path, which supports
+        // runtime (non-constant) subscripts via indexed loads. Partial scalar
+        // selections keep trailing dimensions and must stay on the slice path.
+        let source_rank = self.layout.shape(name.as_str()).map(<[usize]>::len);
+        if subscripts_select_single_element(subscripts, source_rank) {
             return Ok(vec![
                 self.lower_var_ref(name, subscripts, span, scope, call_depth)?,
             ]);
@@ -2005,10 +2023,10 @@ impl<'a> LowerBuilder<'a> {
         scope: &Scope,
     ) -> Result<Option<Vec<Reg>>, LowerError> {
         let grouped = self.indexed_bindings.clone();
-        let Some(key) = indexed_key_for_reference(&grouped, name, span)? else {
+        let Some(source) = self.indexed_slice_reference(&grouped, name, span)? else {
             return Ok(None);
         };
-        let Some(meta) = self.indexed_meta_for_key(&key) else {
+        let Some(meta) = self.indexed_meta_for_key(&source.group_key) else {
             return Ok(None);
         };
         if meta.dims.is_empty() {
@@ -2019,10 +2037,11 @@ impl<'a> LowerBuilder<'a> {
         // sorted selections) instead of filtering the whole group: the
         // filter walk was quadratic in array size. Sorting per-dim
         // reproduces the previous index-sorted output order.
-        let entries = grouped.get(&key).ok_or_else(|| {
+        let entries = grouped.get(&source.group_key).ok_or_else(|| {
             LowerError::contract_violation(
                 format!(
-                    "indexed binding metadata for `{key:?}` has no corresponding binding group"
+                    "indexed binding metadata for `{:?}` has no corresponding binding group",
+                    source.group_key
                 ),
                 span,
             )
@@ -2044,12 +2063,36 @@ impl<'a> LowerBuilder<'a> {
             return Err(unsupported_at(
                 format!(
                     "array slice for `{}` selected no indexed solve-layout bindings",
-                    name.as_str()
+                    source.display_key
                 ),
                 span,
             ));
         }
-        self.lower_indexed_entries_values(name.as_str(), &selected_entries, span)
+        self.lower_indexed_entries_values(source.display_key.as_str(), &selected_entries, span)
+    }
+
+    fn indexed_slice_reference(
+        &self,
+        grouped: &IndexMap<ComponentReferenceKey, Vec<IndexedBinding>>,
+        name: &rumoca_core::Reference,
+        span: rumoca_core::Span,
+    ) -> Result<Option<IndexedSliceReference>, LowerError> {
+        if let Some(pre_key) = self.pre_mode_base_key(name.as_str()) {
+            let group_key = ComponentReferenceKey::generated(pre_key.as_str());
+            if grouped.contains_key(&group_key) {
+                return Ok(Some(IndexedSliceReference {
+                    display_key: pre_key,
+                    group_key,
+                }));
+            }
+        }
+        let Some(group_key) = indexed_key_for_reference(grouped, name, span)? else {
+            return Ok(None);
+        };
+        Ok(Some(IndexedSliceReference {
+            display_key: name.as_str().to_string(),
+            group_key,
+        }))
     }
 
     /// Resolve `name[subscripts]` against a function-scope (local) array
@@ -2098,7 +2141,16 @@ impl<'a> LowerBuilder<'a> {
                 span,
             ));
         };
-        let Some(bindings) = scope.indexed_entries(&key_path) else {
+        let scoped_bindings = scope
+            .indexed_entries(&key_path)
+            .map(<[LocalIndexedBinding]>::to_vec)
+            .unwrap_or_default();
+        let local_bindings = self
+            .local_indexed_bindings
+            .get(key)
+            .cloned()
+            .unwrap_or_default();
+        if scoped_bindings.is_empty() && local_bindings.is_empty() {
             if let Some(indices) = self.compile_time_subscript_indices(subscripts, span)? {
                 return Err(LowerError::MissingBinding {
                     name: format_subscript_binding_key(key, &indices),
@@ -2108,11 +2160,44 @@ impl<'a> LowerBuilder<'a> {
                 format!("subscripted local array `{key}` has no assigned elements"),
                 span,
             ));
+        }
+        self.resolve_local_array_selection(LocalArraySelection {
+            key,
+            subscripts,
+            scope,
+            call_depth,
+            span,
+            dims: &dims,
+            scoped_bindings: &scoped_bindings,
+            local_bindings: &local_bindings,
+        })
+    }
+
+    fn resolve_local_array_selection(
+        &mut self,
+        selection: LocalArraySelection<'_>,
+    ) -> Result<LocalSubscriptResolution, LowerError> {
+        let LocalArraySelection {
+            key,
+            subscripts,
+            scope,
+            call_depth,
+            span,
+            dims,
+            scoped_bindings,
+            local_bindings,
+        } = selection;
+        if dims.iter().any(|dim| *dim < 0) {
+            let shape = format_i64_dims(dims);
+            return Err(unsupported_at(
+                format!("subscripted local array `{key}` has negative dimensions {shape}"),
+                span,
+            ));
         };
         let mut shape = crate::lower_vec_with_capacity(dims.len(), "local array shape rank", span)?;
-        for dim in &dims {
+        for dim in dims {
             let Ok(dim) = usize::try_from(*dim) else {
-                let shape = format_i64_dims(&dims);
+                let shape = format_i64_dims(dims);
                 return Err(unsupported_at(
                     format!("subscripted local array `{key}` has unsupported dimensions {shape}"),
                     span,
@@ -2131,7 +2216,15 @@ impl<'a> LowerBuilder<'a> {
                 )?;
                 return Ok(LocalSubscriptResolution::Values(vec![value]));
             };
-            if let Some(binding) = bindings.iter().find(|binding| binding.indices == indices) {
+            if let Some(binding) = local_bindings
+                .iter()
+                .find(|binding| binding.indices == indices)
+                .or_else(|| {
+                    scoped_bindings
+                        .iter()
+                        .find(|binding| binding.indices == indices)
+                })
+            {
                 return Ok(LocalSubscriptResolution::Values(vec![binding.reg]));
             }
             return Err(LowerError::MissingBinding {
@@ -2151,7 +2244,15 @@ impl<'a> LowerBuilder<'a> {
         let mut regs =
             crate::lower_vec_with_capacity(combos.len(), "local array slice value count", span)?;
         for combo in &combos {
-            let Some(binding) = bindings.iter().find(|binding| binding.indices == *combo) else {
+            let Some(binding) = local_bindings
+                .iter()
+                .find(|binding| binding.indices == *combo)
+                .or_else(|| {
+                    scoped_bindings
+                        .iter()
+                        .find(|binding| binding.indices == *combo)
+                })
+            else {
                 return Err(LowerError::MissingBinding {
                     name: format_subscript_binding_key(key, combo),
                 });
@@ -2180,6 +2281,29 @@ impl<'a> LowerBuilder<'a> {
         {
             return self
                 .lower_index_array_like_values(arg, subscripts, owner_span, scope, call_depth);
+        }
+        if let rumoca_core::Expression::VarRef { name, .. } = base {
+            let has_runtime_selector = subscripts.iter().any(|subscript| {
+                matches!(
+                    subscript,
+                    rumoca_core::Subscript::Expr { expr, .. }
+                        if !matches!(expr.as_ref(), rumoca_core::Expression::Range { .. })
+                            && self
+                                .eval_compile_time_expr(expr, &self.local_const_bindings)
+                                .is_err()
+                )
+            });
+            if has_runtime_selector
+                && let Some(values) = self.lower_array_like_dynamic_selection_values(
+                    base, subscripts, owner_span, scope, call_depth,
+                )?
+            {
+                return Ok(values);
+            }
+            match self.local_shadowed_subscript_values(name, subscripts, scope, call_depth)? {
+                LocalSubscriptResolution::Values(values) => return Ok(values),
+                LocalSubscriptResolution::NotLocal => {}
+            }
         }
         if matches!(
             base,
@@ -2217,6 +2341,30 @@ impl<'a> LowerBuilder<'a> {
         }
         if scalar_literal_projection(base, subscripts, owner_span)? {
             return Ok(vec![self.lower_expr(base, scope, call_depth)?]);
+        }
+        let selection_span = required_expr_span_from_subscripts_or_base(
+            subscripts,
+            base,
+            owner_span,
+            "record function field scalar selection",
+        )?;
+        if matches!(base, rumoca_core::Expression::FieldAccess { .. })
+            && let Some([index]) =
+                static_subscript_indices_with_owner(subscripts, selection_span)?.as_deref()
+        {
+            let values = self.lower_array_like_values_with_optional_source_context(
+                base, owner_span, scope, call_depth,
+            )?;
+            let value = values.get(index - 1).copied().ok_or_else(|| {
+                unsupported_at(
+                    format!(
+                        "record function field index {index} exceeds projected width {}",
+                        values.len()
+                    ),
+                    selection_span,
+                )
+            })?;
+            return Ok(vec![value]);
         }
         if let Some(values) = self.lower_array_like_dynamic_selection_values(
             base, subscripts, owner_span, scope, call_depth,

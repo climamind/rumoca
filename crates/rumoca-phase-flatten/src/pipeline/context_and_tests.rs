@@ -2,6 +2,9 @@
 // symbolic dimension reconciliation, and class-instance flatten entry wiring.
 // split plan: move dimension inference/reconciliation helpers into a dedicated
 // pipeline::dimensions module after the current redeclare/package-scope merge.
+use super::context_import_shadowing::{
+    imports_without_shadowed_aliases, qualify_expression_with_effective_imports,
+};
 use super::enum_dimensions::{enum_type_dimension, infer_enum_range_dimensions};
 use super::*;
 
@@ -2167,12 +2170,14 @@ pub(crate) struct ComponentInstanceProcess<'a, 'tree> {
     pub(crate) flat: &'a mut Model,
     pub(crate) instance_data: &'a rumoca_ir_ast::InstanceData,
     pub(crate) simulated_root_name: Option<&'a str>,
+    pub(crate) canonical_type_id: rumoca_core::TypeId,
     pub(crate) component_override_map: &'a ComponentOverrideMap,
     pub(crate) tree: &'a rumoca_ir_ast::ClassTree,
     pub(crate) class_index: &'a rumoca_ir_ast::ClassDefIndex<'tree>,
     pub(crate) import_cache: &'a mut ImportCaches<'tree>,
     pub(crate) scope_index: &'a OverlayScopeIndex<'a>,
     pub(crate) component_members: &'a component_member_scope::ComponentMemberScopes,
+    pub(crate) identity_space: InstanceIdentitySpace,
 }
 
 pub(crate) fn process_component_instance(
@@ -2184,9 +2189,28 @@ pub(crate) fn process_component_instance(
         return Ok(());
     }
 
-    // Skip non-primitive types (class types like connectors, models, records)
-    // These are containers, not scalar variables
+    // Record fields are Flat variables; retain only their container's resolved
+    // identity so downstream record equations can expand without name recovery.
     if !request.instance_data.is_primitive {
+        if let Some(record) = variables::create_record_instance(
+            request.instance_data,
+            request.tree,
+            request.class_index,
+            request.canonical_type_id,
+        )? {
+            if !request.flat.record_types.contains_key(&record.type_def_id) {
+                let record_type = variables::create_record_type(
+                    record.type_def_id,
+                    request.tree,
+                    request.class_index,
+                )?;
+                request
+                    .flat
+                    .record_types
+                    .insert(record.type_def_id, record_type);
+            }
+            request.flat.record_instances.insert(var_name, record);
+        }
         return Ok(());
     }
 
@@ -2200,6 +2224,7 @@ pub(crate) fn process_component_instance(
     )?;
     let mut flat_var = variables::create_flat_variable(
         request.instance_data,
+        request.canonical_type_id,
         request.tree,
         request.class_index,
         &import_context,
@@ -2209,7 +2234,8 @@ pub(crate) fn process_component_instance(
     assign_instance_identity_to_flat_variable(
         request.flat,
         &mut flat_var,
-        request.tree,
+        request.identity_space,
+        request.class_index,
         request.instance_data,
     );
     let instance_scope = request.instance_data.qualified_name.to_component_path();
@@ -2322,19 +2348,17 @@ pub(crate) fn qualify_expression_imports_with_def_map(
     } else {
         imports
     };
-    qualify_expression_with_effective_imports(expr, prefix, imports, def_map, opts, None)
+    qualify_expression_with_effective_imports(expr, prefix, imports, def_map, opts, None, None)
 }
 
-/// Like `qualify_expression_imports_with_def_map`, but receives flatten context
-/// semantic metadata. The context is currently used by class-reference
-/// canonicalization in qualification call sites; keeping this entry point
-/// prevents those call sites from falling back to context-free qualification.
+/// Qualify with flatten-context semantic metadata for class-reference canonicalization.
 pub(crate) fn qualify_expression_imports_with_def_map_ctx(
     expr: &ast::Expression,
     prefix: &QualifiedName,
     imports: &qualify::ImportMap,
     def_map: Option<&crate::ResolveDefMap>,
     ctx: &Context,
+    locals: Option<&std::collections::HashSet<String>>,
 ) -> Result<rumoca_core::Expression, FlattenError> {
     let opts = qualify::QualifyOptions {
         preserve_def_id: true,
@@ -2358,26 +2382,12 @@ pub(crate) fn qualify_expression_imports_with_def_map_ctx(
         def_map,
         opts,
         instance_name.as_deref(),
+        locals,
     )
 }
 
-fn qualify_expression_with_effective_imports(
-    expr: &ast::Expression,
-    prefix: &QualifiedName,
-    imports: &qualify::ImportMap,
-    def_map: Option<&crate::ResolveDefMap>,
-    opts: qualify::QualifyOptions,
-    instance_name: Option<&str>,
-) -> Result<rumoca_core::Expression, FlattenError> {
-    let qualified = qualify::qualify_expression_with_imports(expr, prefix, opts, imports);
-    crate::ast_lower::expression_from_ast_with_context(
-        &qualified,
-        crate::ast_lower::LoweringContext {
-            def_map,
-            class_tree: None,
-            instance_name,
-        },
-    )
+pub(super) fn resolved_path_has_import_alias(resolved_path: &str, alias: &str) -> bool {
+    rumoca_core::top_level_last_segment(resolved_path) == alias
 }
 
 #[cfg(test)]

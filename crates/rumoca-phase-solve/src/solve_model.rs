@@ -14,9 +14,10 @@ use crate::initial_values::apply_initial_equations_to_start_values;
 #[cfg(test)]
 use rumoca_eval_dae::build_runtime_parameter_tail_env_with_runtime;
 use rumoca_eval_dae::constant::eval_scalar_const_expr;
-#[cfg(test)]
-use rumoca_eval_dae::eval::external_table_data_for_parameter_values_in;
-use rumoca_eval_dae::eval::{EvalError, EvalRuntimeState, eval_shaped_array_values};
+use rumoca_eval_dae::eval::{
+    EvalError, EvalRuntimeState, eval_shaped_array_values,
+    external_table_data_for_parameter_values_in,
+};
 use rumoca_eval_dae::{
     all_external_table_data_in_env,
     build_partial_runtime_parameter_tail_env_with_declared_slots_and_runtime,
@@ -360,30 +361,6 @@ fn lower_runtime_visible_outputs(
     Ok((visible_names, visible_value_rows, variable_meta))
 }
 
-fn prepare_structural_derivative_states(
-    dae_model: &mut dae::Dae,
-) -> Result<(), SolveModelLowerError> {
-    rumoca_phase_structural::dae_prepare::demote_direct_assigned_states(dae_model)
-        .map_err(|source| SolveModelLowerError::Structural { source })?;
-    rumoca_phase_structural::dae_prepare::reduce_constrained_dummy_derivatives(dae_model)
-        .map_err(|source| SolveModelLowerError::Structural { source })?;
-    Ok(())
-}
-
-fn runtime_visible_expressions(
-    dae_model: &dae::Dae,
-    visible_expressions: Option<Vec<VisibleExpression>>,
-    profile: SolveModelLoweringProfile,
-) -> Result<Vec<VisibleExpression>, SolveModelLowerError> {
-    if !profile.needs_runtime_support() {
-        return Ok(Vec::new());
-    }
-    match visible_expressions {
-        Some(visible_expressions) => Ok(visible_expressions),
-        None => visible_expressions_for_dae(dae_model).map_err(SolveModelLowerError::Lower),
-    }
-}
-
 fn lower_dae_to_solve_model_inner(
     mut dae_model: dae::Dae,
     visible_expressions: Option<Vec<VisibleExpression>>,
@@ -392,11 +369,14 @@ fn lower_dae_to_solve_model_inner(
     param_overrides: &HashMap<String, f64>,
 ) -> Result<solve::SolveModel, SolveModelLowerError> {
     let timer = crate::timing::stage_start();
-    prepare_structural_derivative_states(&mut dae_model)?;
-    crate::timing::log_stage("model.prepare_structural_derivative_states", timer);
-    let timer = crate::timing::stage_start();
-    let visible_expressions =
-        runtime_visible_expressions(&dae_model, visible_expressions, profile)?;
+    let visible_expressions = if profile.needs_runtime_support() {
+        match visible_expressions {
+            Some(visible_expressions) => visible_expressions,
+            None => visible_expressions_for_dae(&dae_model).map_err(SolveModelLowerError::Lower)?,
+        }
+    } else {
+        Vec::new()
+    };
     crate::timing::log_stage("model.visible_expressions", timer);
     let state_count = scalar_count(dae_model.variables.states.values())?;
     let eval_runtime = Arc::new(EvalRuntimeState::default());
@@ -466,10 +446,7 @@ fn lower_dae_to_solve_model_inner(
         eval_runtime,
     )
     .map_err(|source| runtime_tail_error(&dae_model, source))?;
-    let external_tables = merged_external_tables(
-        crate::lower::external_table_data_for_dae(&dae_model)?,
-        &table_env,
-    );
+    let external_tables = external_table_data_for_parameter_values_in(&table_env, &parameters);
     crate::timing::log_stage("model.external_tables", timer);
     let (visible_names, visible_value_rows, variable_meta) = lower_runtime_visible_outputs(
         &dae_model,
@@ -489,20 +466,6 @@ fn lower_dae_to_solve_model_inner(
         visible_value_rows,
         variable_meta,
     })
-}
-
-fn merged_external_tables(
-    mut tables: Vec<rumoca_core::ExternalTableData>,
-    env: &rumoca_eval_dae::VarEnv<f64>,
-) -> Vec<rumoca_core::ExternalTableData> {
-    let mut seen = tables.iter().map(|table| table.id).collect::<HashSet<_>>();
-    for table in all_external_table_data_in_env(env) {
-        if seen.insert(table.id) {
-            tables.push(table);
-        }
-    }
-    tables.sort_by_key(|table| table.id);
-    tables
 }
 
 fn lower_contract_violation(reason: String, span: rumoca_core::Span) -> LowerError {
@@ -961,7 +924,7 @@ fn start_values(
 ) -> Result<Vec<f64>, SolveModelLowerError> {
     let default_start = default_start_value(dae_model, var);
     let size = solve_model_variable_size(var)?;
-    if size == 0 && !var.dims.is_empty() {
+    if size == 0 {
         return Ok(Vec::new());
     }
     let Some(expr) = var.start.as_ref() else {

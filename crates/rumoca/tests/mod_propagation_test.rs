@@ -133,6 +133,43 @@ fn assert_indexed_single_ref(expr: &ast::Expression, name: &str, index: &str) {
     assert_eq!(token.text.as_ref(), index);
 }
 
+#[test]
+fn test_array_component_modifier_reference_selects_scalar_element() {
+    let source = r#"
+        model Cell
+            parameter Real x;
+        end Cell;
+
+        model Group
+            parameter Real values[2];
+            Cell cells[2](x = values);
+        end Group;
+
+        model Top
+            Group group(values = {1.0, 2.0});
+        end Top;
+    "#;
+
+    let (_tree, overlay) = instantiate_test_model(source, "Top");
+
+    for (name, expected) in [("group.cells[1].x", "1.0"), ("group.cells[2].x", "2.0")] {
+        let component =
+            find_component(&overlay, name).unwrap_or_else(|| panic!("{name} should exist"));
+        let ast::Expression::Terminal {
+            terminal_type: ast::TerminalType::UnsignedReal,
+            token,
+            ..
+        } = component
+            .binding
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} should have a binding"))
+        else {
+            panic!("{name} should bind to one scalar array element");
+        };
+        assert_eq!(token.text.as_ref(), expected);
+    }
+}
+
 /// Helper: Assert that a component has the expected dimensions.
 fn assert_dims(overlay: &ast::InstanceOverlay, comp_name: &str, expected_dims: &[i64]) {
     let data =
@@ -1929,6 +1966,71 @@ fn test_nested_modifier_forwarding_keeps_outer_alias_scope() {
             .any(|name| name.as_str() == "mach.friction.frictionParameters.wRef"),
         "forwarded nested record field should not be unbound fixed parameter; unbound={unbound:?}"
     );
+}
+
+#[test]
+fn test_nested_modifier_on_array_component_selects_element_row() {
+    let source = r#"
+        record Curve
+            parameter Real eta[:];
+        end Curve;
+
+        record Performance
+            parameter Curve motorEfficiency(eta={1.0});
+        end Performance;
+
+        model Pump
+            parameter Performance per;
+            Real y = per.motorEfficiency.eta[1];
+        end Pump;
+
+        model Top
+            parameter Real motorEta[2, 2] = {{0.87, 0.88}, {0.77, 0.78}};
+            Pump pumps[2](per(motorEfficiency(eta=motorEta)));
+            Pump shared[2](per(motorEfficiency(each eta={5, 6})));
+        end Top;
+    "#;
+
+    let compiled = rumoca::Compiler::new()
+        .model("Top")
+        .compile_str(source, "test.mo")
+        .expect("nested modifier should select one row for each array element");
+
+    for index in 1..=2 {
+        let name = format!("pumps[{index}].per.motorEfficiency.eta");
+        let eta = compiled
+            .flat
+            .variables
+            .get(&rumoca_core::VarName::new(&name))
+            .unwrap_or_else(|| panic!("{name} should be present"));
+        assert_eq!(eta.dims, vec![2]);
+        match eta.binding.as_ref().expect("binding should be preserved") {
+            rumoca_core::Expression::VarRef {
+                name, subscripts, ..
+            } => {
+                assert_eq!(name.as_str(), "motorEta");
+                assert!(
+                    matches!(
+                        subscripts.as_slice(),
+                        [rumoca_core::Subscript::Index { value, .. }] if *value == index
+                    ),
+                    "expected row {index}, got {subscripts:?}"
+                );
+            }
+            other => panic!("expected selected source row, got {other:?}"),
+        }
+
+        let shared = format!("shared[{index}].per.motorEfficiency.eta");
+        let binding = compiled.flat.variables[&rumoca_core::VarName::new(&shared)]
+            .binding
+            .as_ref()
+            .expect("each binding should be preserved");
+        let rumoca_core::Expression::Array { elements, .. } = binding else {
+            panic!("each modifier should keep the full array, got {binding:?}");
+        };
+        assert!(flat_expr_is_numeric_value(&elements[0], 5));
+        assert!(flat_expr_is_numeric_value(&elements[1], 6));
+    }
 }
 
 /// Helper: Parse source and instantiate a model.

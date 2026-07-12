@@ -234,8 +234,8 @@ fn debug_check_one_regular_family(
 /// neighbor cells -- never an interior row -- so it stays correct even when the
 /// interior rows carry no real body.
 ///
-/// `None` when the corner model does not apply: a non-uniform per-cell equation
-/// count, a domain/row-count mismatch, a missing corner row, or a row whose
+/// `None` when the corner model does not apply: a domain/row-count mismatch, a
+/// missing corner row, or a row whose
 /// incidence is not a uniform per-binder translation (i.e. not actually regular).
 fn synthesize_regular_family_incidence(
     family: &dae::StructuredEquationFamily,
@@ -243,21 +243,17 @@ fn synthesize_regular_family_incidence(
 ) -> Option<Vec<HashSet<usize>>> {
     // A uniform scalar equation count per domain point is what lets cell `p` occupy
     // the contiguous row range `[first + p*per_cell .. first + (p+1)*per_cell)`.
-    let (&per_cell, rest) = family.equation_counts.split_first()?;
-    if per_cell == 0 || rest.iter().any(|&n| n != per_cell) {
+    let per_cell = family.equations_per_point;
+    if per_cell == 0 {
         return None;
     }
-    let num_cells = family.equation_counts.len();
+    let num_cells = family.point_count().ok()?;
 
-    // Binder extents from the enumerated index domain (row-major, outermost binder
-    // most significant -- the order flatten materializes cells in).
-    let tuples = family.domain.index_tuples().ok()?;
-    if tuples.len() != num_cells {
-        return None;
-    }
+    // Binder extents and row-major strides come directly from compact range
+    // arithmetic; structural analysis does not materialize the domain tuples.
+    let extents = family.domain.extents().ok()?;
     let ndim = family.domain.binders.len();
-    let extents = binder_extents_from_tuples(&tuples, ndim);
-    let cell_strides = rumoca_core::row_major_strides(&extents);
+    let cell_strides = family.domain.ordinal_strides().ok()?;
     let first = family.first_equation_index;
 
     // The base cell's per-row unknown sets (corner: cell 0).
@@ -274,7 +270,7 @@ fn synthesize_regular_family_incidence(
         if extent <= 1 {
             continue;
         }
-        let neighbor_cell = cell_strides[k] as usize;
+        let neighbor_cell = cell_strides[k];
         for offset in 0..per_cell {
             let neighbor = eq_unknowns.get(first + neighbor_cell * per_cell + offset)?;
             units[offset][k] = uniform_translation(&base_rows[offset], neighbor)?;
@@ -287,8 +283,7 @@ fn synthesize_regular_family_incidence(
         for offset in 0..per_cell {
             let shift: i64 = (0..ndim)
                 .map(|k| {
-                    cell_coordinate(cell, cell_strides[k] as usize, extents[k]) as i64
-                        * units[offset][k]
+                    cell_coordinate(cell, cell_strides[k], extents[k]) as i64 * units[offset][k]
                 })
                 .sum();
             synthesized.push(
@@ -300,21 +295,6 @@ fn synthesize_regular_family_incidence(
         }
     }
     Some(synthesized)
-}
-
-/// Number of distinct values taken by each binder position across the enumerated
-/// domain tuples. The domain is a Cartesian product of independent binder ranges,
-/// so this recovers each binder's extent.
-fn binder_extents_from_tuples(tuples: &[Vec<i64>], ndim: usize) -> Vec<usize> {
-    (0..ndim)
-        .map(|k| {
-            tuples
-                .iter()
-                .filter_map(|tuple| tuple.get(k).copied())
-                .collect::<std::collections::BTreeSet<i64>>()
-                .len()
-        })
-        .collect()
 }
 
 /// The position-count of cell `cell` along one binder, given that binder's
@@ -413,7 +393,10 @@ fn push_unknowns_for_variable(
     kind: UnknownKind,
 ) {
     let size = var.size();
-    if size <= 1 {
+    if size == 0 {
+        return;
+    }
+    if size == 1 {
         push_unknown(
             map,
             names,
@@ -496,33 +479,6 @@ fn collect_equation_unknowns(
     result
 }
 
-fn direct_residual_definition_target(
-    expr: &rumoca_core::Expression,
-) -> Option<(&rumoca_core::Reference, &[rumoca_core::Subscript])> {
-    let rumoca_core::Expression::Binary {
-        op, lhs, rhs: _, ..
-    } = expr
-    else {
-        return None;
-    };
-    if !matches!(op, rumoca_core::OpBinary::Sub) {
-        return None;
-    }
-    let rumoca_core::Expression::VarRef {
-        name, subscripts, ..
-    } = lhs.as_ref()
-    else {
-        return None;
-    };
-    Some((name, subscripts))
-}
-
-fn equation_contains_derivative(expr: &rumoca_core::Expression) -> bool {
-    let mut checker = DerivativeCallChecker { found: false };
-    checker.visit_expression(expr);
-    checker.found
-}
-
 /// Collects the operand of every `der(...)` call in an expression, keeping the
 /// operand's name and subscripts so the structural incidence can resolve the
 /// exact scalar `der` unknown (e.g. `der(p[2])` -> `p[2]`) instead of the
@@ -544,32 +500,6 @@ impl ExpressionVisitor for DerOperandCollector {
             }) = args.first()
         {
             self.operands.push((name.clone(), subscripts.clone()));
-        }
-        for arg in args {
-            self.visit_expression(arg);
-        }
-    }
-}
-
-struct DerivativeCallChecker {
-    found: bool,
-}
-
-impl ExpressionVisitor for DerivativeCallChecker {
-    fn visit_expression(&mut self, expr: &rumoca_core::Expression) {
-        if !self.found {
-            self.walk_expression(expr);
-        }
-    }
-
-    fn visit_builtin_call(
-        &mut self,
-        function: &rumoca_core::BuiltinFunction,
-        args: &[rumoca_core::Expression],
-    ) {
-        if *function == rumoca_core::BuiltinFunction::Der {
-            self.found = true;
-            return;
         }
         for arg in args {
             self.visit_expression(arg);
@@ -902,6 +832,25 @@ impl ExpressionVisitor for ExpressionUnknownCollector<'_> {
     }
 
     fn visit_field_access(&mut self, base: &rumoca_core::Expression, field: &str) {
+        if let Some((reference, subscripts)) = dae::indexed_field_var_ref(base, field) {
+            let resolved = self
+                .constants
+                .map(|constants| {
+                    self.resolver.resolve_var_ref_all_with_constants(
+                        &reference,
+                        &subscripts,
+                        constants,
+                    )
+                })
+                .unwrap_or_else(|| self.resolver.resolve_var_ref_all(&reference, &subscripts));
+            for idx in resolved {
+                self.cols.insert(idx);
+            }
+            for subscript in &subscripts {
+                self.visit_subscript(subscript);
+            }
+            return;
+        }
         if self.collect_indexed_field_access_unknowns(base, field) {
             return;
         }
@@ -1004,6 +953,9 @@ impl ExpressionUnknownCollector<'_> {
             rumoca_core::Expression::Index {
                 base, subscripts, ..
             } => {
+                if self.collect_indexed_field_access_unknowns(base, field) {
+                    return;
+                }
                 self.visit_projected_field_expression(base, field);
                 for subscript in subscripts {
                     self.visit_subscript(subscript);
@@ -1581,6 +1533,73 @@ mod tests {
     }
 
     #[test]
+    fn incidence_keeps_direct_algebraic_target_in_derivative_residual() {
+        let mut dae = dae::Dae::new();
+        dae.variables.states.insert(
+            rumoca_core::VarName::new("x"),
+            dae::Variable::new(rumoca_core::VarName::new("x"), test_span()),
+        );
+        dae.variables.algebraics.insert(
+            rumoca_core::VarName::new("v"),
+            dae::Variable::new(rumoca_core::VarName::new("v"), test_span()),
+        );
+        dae.continuous.equations.push(eq(sub(
+            var("v"),
+            rumoca_core::Expression::BuiltinCall {
+                function: rumoca_core::BuiltinFunction::Der,
+                args: vec![var("x")],
+                span: test_span(),
+            },
+        )));
+
+        let incidence = build_incidence(&dae);
+        let derivative = incidence
+            .unknown_names
+            .iter()
+            .position(|unknown| *unknown == UnknownId::DerState(rumoca_core::VarName::new("x")))
+            .expect("der(x) unknown");
+        let voltage = incidence
+            .unknown_names
+            .iter()
+            .position(|unknown| *unknown == UnknownId::Variable(rumoca_core::VarName::new("v")))
+            .expect("v unknown");
+
+        assert_eq!(incidence.eq_unknowns.len(), 1);
+        assert!(incidence.eq_unknowns[0].contains(&derivative));
+        assert!(incidence.eq_unknowns[0].contains(&voltage));
+    }
+
+    #[test]
+    fn incidence_omits_zero_length_array_unknowns() {
+        let mut dae = dae::Dae::new();
+        dae.variables.algebraics.insert(
+            rumoca_core::VarName::new("x"),
+            dae::Variable::new(rumoca_core::VarName::new("x"), test_span()),
+        );
+        let mut empty = dae::Variable::new(rumoca_core::VarName::new("empty"), test_span());
+        empty.dims = vec![0];
+        dae.variables
+            .algebraics
+            .insert(rumoca_core::VarName::new("empty"), empty);
+        dae.continuous.equations.push(eq(sub(
+            var("x"),
+            rumoca_core::Expression::BuiltinCall {
+                function: rumoca_core::BuiltinFunction::Sum,
+                args: vec![var("empty")],
+                span: test_span(),
+            },
+        )));
+
+        let incidence = build_incidence(&dae);
+
+        assert_eq!(
+            incidence.unknown_names,
+            [UnknownId::Variable(rumoca_core::VarName::new("x"))]
+        );
+        assert_eq!(incidence.eq_unknowns, [HashSet::from([0])]);
+    }
+
+    #[test]
     fn test_build_solver_sparsity_triplets_skips_derivative_argument_dependencies() {
         let mut dae = dae::Dae::new();
         dae.variables.states.insert(
@@ -1958,17 +1977,26 @@ mod tests {
     }
 
     #[test]
-    fn binder_extents_recovers_cartesian_shape() {
-        // Tuples enumerated row-major over a 2x3 domain.
-        let tuples = vec![
-            vec![0, 0],
-            vec![0, 1],
-            vec![0, 2],
-            vec![1, 0],
-            vec![1, 1],
-            vec![1, 2],
-        ];
-        assert_eq!(binder_extents_from_tuples(&tuples, 2), vec![2, 3]);
+    fn compact_domain_reports_cartesian_extents() {
+        let domain = rumoca_core::StructuredIndexDomain {
+            binders: vec![
+                rumoca_core::StructuredIndexBinder {
+                    id: 0,
+                    display_name: "i".to_string(),
+                    lower: 0,
+                    upper: 1,
+                    step: 1,
+                },
+                rumoca_core::StructuredIndexBinder {
+                    id: 1,
+                    display_name: "j".to_string(),
+                    lower: 0,
+                    upper: 2,
+                    step: 1,
+                },
+            ],
+        };
+        assert_eq!(domain.extents(), Ok(vec![2, 3]));
     }
 
     /// A 1-D `regular` family of `cells` cells (`i = 1..cells`, one equation per
@@ -1986,7 +2014,7 @@ mod tests {
                 }],
             },
             first_equation_index: 0,
-            equation_counts: vec![1; cells as usize],
+            equations_per_point: 1,
             span: test_span(),
             origin: "corner_check_fixture".to_string(),
             // The inner check does not gate on `regular`; production only reaches it
@@ -2013,7 +2041,7 @@ mod tests {
                 binders: vec![binder(0, "i", rows), binder(1, "j", cols)],
             },
             first_equation_index: 0,
-            equation_counts: vec![1; (rows * cols) as usize],
+            equations_per_point: 1,
             span: test_span(),
             origin: "corner_check_fixture_2d".to_string(),
             regular: None,

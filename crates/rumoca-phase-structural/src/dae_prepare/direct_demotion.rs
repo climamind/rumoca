@@ -10,17 +10,17 @@ fn log_direct_demotion_scan_summary(
         return;
     }
     crate::structural_trace!(
-        "[sim-trace] direct-assignment-demotion scan: states={} candidates={} accepted={} skip_flow_sum_origin={} skip_unsafe_non_state_alias={} skip_when={} skip_self_der={} skip_der_in_defining_expr={} skip_unsliced_vector_ref={} skip_extra_state_refs={} skip_no_der={} skip_non_state_der={}",
+        "[sim-trace] direct-assignment-demotion scan: states={} candidates={} accepted={} skip_flow_sum_origin={} skip_unsafe_non_state_alias={} skip_when={} skip_always={} skip_self_der={} skip_der_in_defining_expr={} skip_unsliced_vector_ref={} skip_no_der={} skip_non_state_der={}",
         state_count,
         counters.n_candidates,
         substitutions.len(),
         counters.n_skip_flow_sum_origin,
         counters.n_skip_unsafe_non_state_alias,
         counters.n_skip_when_assigned,
+        counters.n_skip_always_state,
         counters.n_skip_self_der,
         counters.n_skip_der_in_defining_expr,
         counters.n_skip_unsliced_vector_ref,
-        counters.n_skip_extra_state_refs,
         counters.n_skip_no_der_expr,
         counters.n_skip_non_state_der
     );
@@ -242,10 +242,7 @@ fn apply_direct_demotion_plans(
 pub(super) fn apply_direct_demotion_plan(dae: &mut Dae, plan: &DirectStateDemotionPlan) -> usize {
     promote_plan_derivative_algebraics(dae, &plan.promote_der_algebraics);
     ensure_scalar_state_partition_for_plan(dae, &plan.state_name);
-    let state_dims = variable_dims_for_direct_demotion(dae, &plan.state_name);
-    for eq in &mut dae.continuous.equations {
-        eq.rhs = substitute_der_of_state(&eq.rhs, &plan.state_name, &plan.der_expr, &state_dims);
-    }
+    rewrite_state_derivative_everywhere(dae, &plan.state_name, &plan.der_expr);
     if let Some(mut var) = dae.variables.states.shift_remove(&plan.state_name) {
         var.fixed = Some(false);
         dae.variables
@@ -315,6 +312,16 @@ fn direct_demotion_plan_for_equation(
     log_direct_assignment_candidate(round.trace, counters, round.dae, eq, &state_name);
     if round.when_assigned_states.contains(state_name.as_str()) {
         counters.n_skip_when_assigned += 1;
+        return Ok(None);
+    }
+    if round
+        .dae
+        .variables
+        .states
+        .get(&state_name)
+        .is_some_and(|state| state.state_select == rumoca_core::StateSelect::Always)
+    {
+        counters.n_skip_always_state += 1;
         return Ok(None);
     }
     if expr_contains_der_of_state_or_indexed(&defining_expr, &state_name) {
@@ -688,7 +695,8 @@ fn aggregate_direct_assignment_component_slots(
     })?;
     let mut slots = Vec::with_capacity(size);
     for flat_index in 0..size {
-        let expr = project_flat_index_with_span(&defining_expr, &dims, flat_index, None)?;
+        let expr =
+            project_flat_index_with_span(&defining_expr, &dims, flat_index, None, round.dae)?;
         slots.push((flat_index, expr));
     }
     Some((state_name, slots))
@@ -1109,8 +1117,9 @@ pub fn demote_direct_assigned_states_with_boundary_substitutions(
 ) -> Result<usize, StructuralError> {
     let max_rounds = dae.variables.states.len().clamp(1, 8);
     let mut total_demoted = 0usize;
+    let mut round_index = 0usize;
 
-    for round_index in 0..max_rounds {
+    loop {
         let trace = sim_trace_enabled();
         let label = format!("direct_demotion.round[{round_index}].collect_plans");
         let timer = structural_timing_start(&label);
@@ -1134,6 +1143,7 @@ pub fn demote_direct_assigned_states_with_boundary_substitutions(
             break;
         }
         total_demoted += demoted_this_round;
+        round_index += 1;
     }
 
     Ok(total_demoted)

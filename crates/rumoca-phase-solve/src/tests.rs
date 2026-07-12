@@ -571,7 +571,6 @@ fn algebraic_projection_plan_uses_blt_scalar_blocks() {
     for block in &plan.blocks {
         assert_eq!(block.rows.len(), 1);
         assert_eq!(block.y_indices.len(), 1);
-        assert!(block.causal_steps.is_empty());
     }
 }
 
@@ -803,7 +802,7 @@ fn algebraic_projection_loop_uses_blt_unknowns_not_dependency_inputs() {
 }
 
 #[test]
-fn algebraic_projection_loop_keeps_explicit_row_targets() -> Result<(), LowerError> {
+fn algebraic_projection_loop_uses_only_matched_unknowns() -> Result<(), LowerError> {
     let projection_incidence = ProjectionIncidence {
         incidence: Incidence::new(
             vec![BTreeSet::from([0, 1, 2]).into_iter().collect()],
@@ -815,71 +814,17 @@ fn algebraic_projection_loop_keeps_explicit_row_targets() -> Result<(), LowerErr
             ],
         ),
         unknown_y_indices: vec![10, 11, 12],
+        preferred_unknowns: vec![None],
     };
-    let row_targets = vec![
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(solve::scalar_slot_y(12)),
-    ];
-
     let block = super::lower_algebraic_loop_projection_block(
         &[EquationRef(7)],
-        &[UnknownId::SolverY(10), UnknownId::SolverY(11)],
-        &row_targets,
+        &[UnknownId::SolverY(10)],
         &projection_incidence,
         solve_test_span(),
     )?;
-    let Some(block) = block else {
-        return Err(LowerError::ContractViolation {
-            reason: "targeted loop block should lower".to_string(),
-            span: solve_test_span(),
-        });
-    };
 
     assert_eq!(block.rows, vec![7]);
-    assert_eq!(block.y_indices, vec![10, 11, 12]);
-    Ok(())
-}
-
-#[test]
-fn algebraic_projection_plan_merges_blocks_that_share_row_targets() -> Result<(), LowerError> {
-    let blocks = super::merge_overlapping_projection_blocks(
-        vec![
-            solve::AlgebraicProjectionBlock {
-                rows: vec![10],
-                y_indices: vec![3],
-                causal_steps: Vec::new(),
-            },
-            solve::AlgebraicProjectionBlock {
-                rows: vec![20, 21],
-                y_indices: vec![3, 4],
-                causal_steps: Vec::new(),
-            },
-            solve::AlgebraicProjectionBlock {
-                rows: vec![30],
-                y_indices: vec![8],
-                causal_steps: Vec::new(),
-            },
-        ],
-        solve_test_span(),
-    )?;
-
-    assert_eq!(blocks.len(), 2);
-    assert!(
-        blocks
-            .iter()
-            .any(|block| { block.rows == vec![10, 20, 21] && block.y_indices == vec![3, 4] })
-    );
-    assert!(
-        blocks
-            .iter()
-            .any(|block| { block.rows == vec![30] && block.y_indices == vec![8] })
-    );
+    assert_eq!(block.y_indices, vec![10]);
     Ok(())
 }
 
@@ -1435,6 +1380,7 @@ fn solve_appendix_b_validation_allows_load_seed_in_jvp_artifact_rows() {
             ),
             ..solve::ContinuousSolveArtifacts::default()
         },
+        ..solve::SolveArtifacts::default()
     };
 
     appendix_b_validation::validate_solve_artifacts_appendix_b_invariants(&artifacts)
@@ -1451,6 +1397,7 @@ fn solve_appendix_b_validation_rejects_invalid_artifact_registers() {
             ),
             ..solve::ContinuousSolveArtifacts::default()
         },
+        ..solve::SolveArtifacts::default()
     };
 
     let err = appendix_b_validation::validate_solve_artifacts_appendix_b_invariants(&artifacts)
@@ -1937,7 +1884,7 @@ fn solve_problem_lowers_structured_continuous_residual_to_map() {
                 }],
             },
             first_equation_index: 1,
-            equation_counts: vec![1, 1, 1],
+            equations_per_point: 1,
             span,
             origin: "structured z=w residual".to_string(),
             regular: None,
@@ -1946,8 +1893,15 @@ fn solve_problem_lowers_structured_continuous_residual_to_map() {
         });
 
     let problem = lower_solve_problem(&dae_model).expect("structured residual should lower");
+    let report = tensor_preservation_report(&dae_model, &problem)
+        .expect("tensor preservation report should inspect compact metadata");
 
     assert_eq!(problem.continuous.residual.len(), Ok(3));
+    assert_eq!(report.compact_family_count, 1);
+    assert_eq!(report.compact_domain_points, 3);
+    assert_eq!(report.preserved_family_bodies, 1);
+    assert_eq!(report.scalarized_family_rows, 0);
+    assert!(report.fallbacks.is_empty());
     assert!(matches!(
         problem.continuous.residual.nodes.as_slice(),
         [solve::ComputeNode::Map { .. }]
@@ -2030,7 +1984,7 @@ fn solve_problem_lowers_structured_continuous_residual_with_scalar_math_to_map()
                 }],
             },
             first_equation_index: 1,
-            equation_counts: vec![1, 1, 1],
+            equations_per_point: 1,
             span,
             origin: "structured trig residual".to_string(),
             regular: None,
@@ -2114,7 +2068,7 @@ fn solve_problem_lowers_structured_continuous_residual_with_guard_to_map() {
                 }],
             },
             first_equation_index: 1,
-            equation_counts: vec![1, 1, 1],
+            equations_per_point: 1,
             span,
             origin: "structured guarded residual".to_string(),
             regular: None,

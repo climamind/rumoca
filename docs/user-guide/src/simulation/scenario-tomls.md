@@ -34,6 +34,8 @@ name = "Ball"
 [sim]
 solver = "rk-like"
 t_end = 10.0
+atol = 1e-6
+rtol = 1e-6
 
 [[plot.views]]
 id = "states_time"
@@ -76,13 +78,15 @@ every scenario; scenario `source_roots` are for paths specific to this run.
 ```toml
 [sim]
 dt = 0.01          # simulation timestep [s]
-t_end = 10.0       # batch/report stop time; interactive runners may ignore it
+t_end = 10.0       # batch/results-panel output horizon
+atol = 1e-6        # optional absolute solver tolerance
+rtol = 1e-6        # optional relative solver tolerance
 solver = "auto"    # auto | bdf | esdirk34 | trbdf2 | rk-like
 output = "results.html"
 mode = "realtime"  # optional pacing, see below
 ```
 
-`mode` selects runner pacing:
+`mode` selects schedule pacing:
 
 | Mode | Behavior |
 |---|---|
@@ -92,6 +96,12 @@ mode = "realtime"  # optional pacing, see below
 
 The default is `lockstep` when external coupling is configured and
 `realtime` standalone.
+
+`t_end` terminates batch/results-panel simulations. Scheduled and browser-live
+simulations ignore it as a stop condition and extend the solver horizon while
+they run; stop those runs explicitly with their configured quit signal, the
+viewer stop control, or an interrupt. Interactive-only scenarios can omit
+`t_end`.
 
 ### `[[plot.views]]`
 
@@ -144,7 +154,7 @@ bfbs = ["/path/to/your_schema.bfbs"]
 root_type = "your.namespace.MotorOutput"
 
 [receive.route]
-"motors.m0" = { to = "stepper:omega_m1", scale = 1100.0 }
+"motors.m0" = { to = "model:omega_m1", scale = 1100.0 }
 "armed"     = { to = "local:armed" }
 
 [send]
@@ -154,7 +164,7 @@ root_type = "your.namespace.SimInput"
 "gyro.x" = { key = "gyro_x" }
 ```
 
-### `[locals]` — named persistent runner state
+### `[locals]` — named persistent simulation state
 
 ```toml
 [locals]

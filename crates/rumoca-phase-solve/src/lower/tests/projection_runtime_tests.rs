@@ -69,7 +69,7 @@ fn lower_discrete_rhs_expands_tuple_function_assignment_outputs() {
                 },
                 rumoca_core::Expression::FunctionCall {
                     name: rumoca_core::Reference::from_component_reference(
-                        source_component_ref_from_name("Pkg.randomLike"),
+                        test_component_ref_from_name("Pkg.randomLike"),
                     ),
                     args: vec![rumoca_core::Expression::Array {
                         elements: vec![
@@ -209,10 +209,11 @@ fn lower_discrete_rhs_expands_external_random_tuple_outputs() {
                     span,
                 },
                 rumoca_core::Expression::FunctionCall {
-                    name: rumoca_core::VarName::new(
-                        "Modelica.Math.Random.Generators.Xorshift64star.random",
-                    )
-                    .into(),
+                    name: rumoca_core::Reference::from_component_reference(
+                        source_component_ref_from_name(
+                            "Modelica.Math.Random.Generators.Xorshift64star.random",
+                        ),
+                    ),
                     args: vec![
                         rumoca_core::Expression::FunctionCall {
                             name: rumoca_core::Reference::from_component_reference(
@@ -266,10 +267,11 @@ fn lower_discrete_rhs_expands_external_random_tuple_outputs() {
 }
 
 fn xorshift64star_random_function(span: rumoca_core::Span) -> rumoca_core::Function {
-    let mut random = rumoca_core::Function::new(
+    let mut random = test_function(
         "Modelica.Math.Random.Generators.Xorshift64star.random",
         span,
     );
+    random.def_id = Some(source_fixture_def_id(random.name.as_str()));
     random.external = Some(Default::default());
     random
         .inputs
@@ -349,7 +351,7 @@ fn lower_discrete_rhs_lowers_impure_random_event_call() {
 fn lower_discrete_rhs_lowers_impure_random_call_inside_scalar_wrapper() {
     let mut dae_model = dae::Dae::default();
     let span = lower_test_span();
-    let mut impure_random = rumoca_core::Function::new(
+    let mut impure_random = test_function(
         "Modelica.Math.Random.Utilities.impureRandom",
         lower_test_span(),
     );
@@ -370,7 +372,7 @@ fn lower_discrete_rhs_lowers_impure_random_call_inside_scalar_wrapper() {
         .functions
         .insert(impure_random.name.clone(), impure_random);
 
-    let mut wrapper = rumoca_core::Function::new("Pkg.impureWrapper", lower_test_span());
+    let mut wrapper = test_function("Pkg.impureWrapper", lower_test_span());
     wrapper.pure = false;
     wrapper.inputs.push(rumoca_core::FunctionParam::new(
         "id",
@@ -454,7 +456,7 @@ fn lower_discrete_rhs_lowers_impure_random_call_inside_scalar_wrapper() {
 fn lower_discrete_rhs_expands_random_state_out_array_projection() {
     let mut dae_model = dae::Dae::default();
     let span = lower_test_span();
-    let mut random = rumoca_core::Function::new(
+    let mut random = test_function(
         "Modelica.Math.Random.Generators.Xorshift64star.random",
         lower_test_span(),
     );
@@ -485,10 +487,11 @@ fn lower_discrete_rhs_expands_random_state_out_array_projection() {
         .push(dae::Equation::explicit_with_scalar_count(
             rumoca_core::VarName::new("state64"),
             rumoca_core::Expression::FunctionCall {
-                name: rumoca_core::VarName::new(
-                    "Modelica.Math.Random.Generators.Xorshift64star.random.stateOut",
-                )
-                .into(),
+                name: rumoca_core::Reference::from_component_reference(
+                    test_component_ref_from_name(
+                        "Modelica.Math.Random.Generators.Xorshift64star.random.stateOut",
+                    ),
+                ),
                 args: vec![rumoca_core::Expression::FunctionCall {
                     name: rumoca_core::Reference::from_component_reference(
                         test_component_ref_from_name("previous"),
@@ -520,7 +523,7 @@ fn lower_discrete_rhs_expands_random_state_out_array_projection() {
 }
 
 fn random_like_function() -> rumoca_core::Function {
-    let mut random_like = rumoca_core::Function::new("Pkg.randomLike", lower_test_span());
+    let mut random_like = test_function("Pkg.randomLike", lower_test_span());
     random_like.inputs.push(
         rumoca_core::FunctionParam::new("seedIn", "Integer", lower_test_span()).with_dims(vec![3]),
     );
@@ -576,7 +579,7 @@ fn random_like_function() -> rumoca_core::Function {
 #[test]
 fn lower_expression_binds_named_function_arguments_by_name() {
     let mut functions = IndexMap::new();
-    let mut function = rumoca_core::Function::new("Pkg.f", lower_test_span());
+    let mut function = test_function("Pkg.f", lower_test_span());
     function.inputs.push(function_param("a"));
     function.inputs.push(function_param("b"));
     function.outputs.push(function_param("y"));
@@ -663,7 +666,7 @@ fn lower_initial_expression_rows_read_lowered_pre_parameter() {
 #[test]
 fn lower_expression_handles_constructor_field_access_by_signature() {
     let mut dae_model = dae::Dae::default();
-    let mut constructor = rumoca_core::Function::new("My.Record", lower_test_span());
+    let mut constructor = test_function("My.Record", lower_test_span());
     constructor.inputs.push(function_param("R"));
     constructor.inputs.push(function_param("C"));
     dae_model
@@ -1030,6 +1033,48 @@ fn lower_expression_handles_dynamic_index_subscript_expr() {
         );
     }
 }
+#[test]
+fn lower_expression_projects_indexed_unary_array_expression() {
+    let span = lower_test_span();
+    let mut dae_model = dae::Dae::default();
+    dae_model
+        .variables
+        .parameters
+        .insert(rumoca_core::VarName::new("axis"), array_var("axis", &[3]));
+    dae_model
+        .variables
+        .parameters
+        .insert(rumoca_core::VarName::new("length"), scalar_var("length"));
+    let layout = build_var_layout(&dae_model).expect("test DAE layout should build");
+    let expr = rumoca_core::Expression::Index {
+        base: Box::new(rumoca_core::Expression::Unary {
+            op: rumoca_core::OpUnary::Minus,
+            rhs: Box::new(mul(
+                var("axis"),
+                rumoca_core::Expression::Binary {
+                    op: rumoca_core::OpBinary::Div,
+                    lhs: Box::new(var("length")),
+                    rhs: Box::new(real_lit(2.0)),
+                    span,
+                },
+            )),
+            span,
+        }),
+        subscripts: vec![rumoca_core::Subscript::generated_index(2, span)],
+        span,
+    };
+    let lowered = lower_expression(&expr, &layout, &IndexMap::new())
+        .expect("indexed unary array expression should lower");
+    let mut p = vec![0.0; layout.p_scalars()];
+    set_p_value(&layout, &mut p, "axis[1]", 1.0);
+    set_p_value(&layout, &mut p, "axis[2]", 2.0);
+    set_p_value(&layout, &mut p, "axis[3]", 3.0);
+    set_p_value(&layout, &mut p, "length", 6.0);
+
+    let (regs, _) = eval_linear_ops(&lowered.ops, &[], &p, 0.0);
+    assert_eq!(read_reg(&regs, lowered.result), -6.0);
+}
+
 #[test]
 fn lower_expression_handles_dynamic_index_over_array_literal() {
     let span = lower_test_span();

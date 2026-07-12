@@ -448,6 +448,37 @@ fn expand_values_to_size_preserves_broadcast_and_padding_behavior() {
 }
 
 #[test]
+fn zero_length_start_values_do_not_evaluate_elements() -> Result<(), SolveModelLowerError> {
+    let span = solve_model_test_span();
+    let empty_strings = rumoca_core::Expression::BuiltinCall {
+        function: rumoca_core::BuiltinFunction::Fill,
+        args: vec![string_expr(""), int_expr(0)],
+        span,
+    };
+    let empty_extent = rumoca_core::Expression::BuiltinCall {
+        function: rumoca_core::BuiltinFunction::Size,
+        args: vec![empty_strings, int_expr(1)],
+        span,
+    };
+    let mut empty = scalar_var("empty");
+    empty.dims = vec![0];
+    empty.start = Some(rumoca_core::Expression::BuiltinCall {
+        function: rumoca_core::BuiltinFunction::Fill,
+        args: vec![int_expr(0), empty_extent],
+        span,
+    });
+
+    let values = start_values(
+        &dae::Dae::default(),
+        &empty,
+        &rumoca_eval_dae::VarEnv::new(),
+    )?;
+
+    assert!(values.is_empty());
+    Ok(())
+}
+
+#[test]
 fn default_start_values_for_size_reports_capacity_overflow_with_source_span() {
     let span = rumoca_core::Span::from_offsets(
         rumoca_core::SourceId::from_source_name("phase_solve_solve_model_tests_source_46.mo"),
@@ -1440,6 +1471,7 @@ fn lower_supports_visible_observation_with_array_literal_size_range() {
         rumoca_core::Function {
             name: rumoca_core::VarName::new("My.badSizeRange"),
             def_id: None,
+            instance_id: None,
             inputs: vec![],
             outputs: vec![rumoca_core::FunctionParam::new(
                 "out",
@@ -1519,6 +1551,7 @@ fn lower_skips_visible_observation_with_unbound_function_input() {
         rumoca_core::Function {
             name: rumoca_core::VarName::new("My.needsInput"),
             def_id: None,
+            instance_id: None,
             inputs: vec![rumoca_core::FunctionParam::new(
                 "u",
                 "Real",

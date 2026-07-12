@@ -18,14 +18,9 @@ pub(super) fn infer_dims_from_values(dims: &[i64], len: usize) -> Result<Vec<usi
         return Ok((len > 1).then_some(len).into_iter().collect());
     }
 
-    let mut inferred: Vec<usize> = dims
-        .iter()
-        .map(|&dim| {
-            usize::try_from(dim).map_err(|_| EvalError::UnsupportedExpression {
-                kind: "array dimensions",
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // Negative dims are size-expression placeholders; treat them like the
+    // `0` unknown-extent sentinel so a single unknown axis is still inferred.
+    let mut inferred: Vec<usize> = dims.iter().map(|&dim| dim.max(0) as usize).collect();
     let unknown_idxs = inferred
         .iter()
         .enumerate()
@@ -132,28 +127,23 @@ fn collect_dense_indexed_values_generic<T: SimFloat>(
     Some(values)
 }
 
-fn collect_dense_declared_values_generic<T: SimFloat>(
+fn collect_dense_shaped_values_generic<T: SimFloat>(
     name: &str,
     dims: &[i64],
     scalar_count: usize,
     env: &VarEnv<T>,
 ) -> Option<Vec<T>> {
-    if let Some(values) = collect_dense_indexed_values_generic(name, scalar_count, env) {
-        return Some(values);
-    }
-    if dims.len() <= 1 {
+    if dims.len() < 2 {
         return None;
     }
-    let mut values = Vec::with_capacity(scalar_count);
-    for flat_index in 0..scalar_count {
-        let subscripts = dae::flat_index_to_subscripts(dims, flat_index)?;
-        values.push(
+    (0..scalar_count)
+        .map(|flat_index| {
+            let subscripts = dae::flat_index_to_subscripts(dims, flat_index)?;
             env.vars
-                .get(dae::format_subscript_key(name, &subscripts).as_str())
-                .copied()?,
-        );
-    }
-    Some(values)
+                .get(&dae::format_subscript_key(name, &subscripts))
+                .copied()
+        })
+        .collect()
 }
 
 fn collect_dense_record_field_indexed_values_generic<T: SimFloat>(
@@ -174,12 +164,14 @@ pub(super) fn array_values_from_env_name_generic<T: SimFloat>(
     name: &str,
     env: &VarEnv<T>,
 ) -> Result<Option<Vec<T>>, EvalError> {
-    let declared_zero_count = if let Some(dims) = env.dims.get(name) {
+    if let Some(dims) = env.dims.get(name) {
         let scalar_count = dims.iter().map(|&d| d.max(0) as usize).product::<usize>();
         if scalar_count > 0 {
-            if let Some(values) =
-                collect_dense_declared_values_generic(name, dims, scalar_count, env)
+            if let Some(values) = collect_dense_shaped_values_generic(name, dims, scalar_count, env)
             {
+                return Ok(Some(values));
+            }
+            if let Some(values) = collect_dense_indexed_values_generic(name, scalar_count, env) {
                 return Ok(Some(values));
             }
             if scalar_count == 1
@@ -192,6 +184,15 @@ pub(super) fn array_values_from_env_name_generic<T: SimFloat>(
             {
                 return Ok(Some(values));
             }
+            if env.vars.parent_namespace_is_hidden(name) {
+                let keys = cached_indexed_keys(&env.runtime, name, scalar_count);
+                let missing = keys
+                    .iter()
+                    .find(|key| env.vars.get(key.as_str()).is_none())
+                    .map(|key| key.as_str().to_string())
+                    .unwrap_or_else(|| name.to_string());
+                return Err(EvalError::MissingBinding { name: missing });
+            }
         }
         if scalar_count == 0
             && let Some(values) = collect_indexed_array_values_generic(name, env)
@@ -203,14 +204,16 @@ pub(super) fn array_values_from_env_name_generic<T: SimFloat>(
         {
             return Ok(Some(values));
         }
-        scalar_count == 0
-    } else {
-        false
-    };
+        // Statically zero-sized array (every dim known, some dim zero): the
+        // empty value is exact, unlike unknown-dim placeholders (negative).
+        if scalar_count == 0 && dims.iter().all(|&dim| dim >= 0) {
+            return Ok(Some(Vec::new()));
+        }
+    }
 
     if let Some(dims) = env.dims.get(name)
         && !dims.is_empty()
-        && let Some(start_expr) = env.start_exprs.get(name)
+        && let Some(start_expr) = env.visible_start_expr(name)
         && !matches!(start_expr, Expression::VarRef { name: start_name, .. } if start_name.as_str() == name)
     {
         let values = if dims.len() >= 2 {
@@ -227,8 +230,8 @@ pub(super) fn array_values_from_env_name_generic<T: SimFloat>(
         }
     }
 
-    if declared_zero_count {
-        return Ok(Some(Vec::new()));
+    if env.vars.local_scalar_shadows_parent_namespace(name) {
+        return Ok(None);
     }
 
     Ok(collect_indexed_array_values_generic(name, env)
@@ -310,6 +313,32 @@ pub(super) fn eval_unary_builtin_array_values<T: SimFloat>(
     Some(mapped)
 }
 
+fn eval_function_call_field_array_values<T: SimFloat>(
+    name: &rumoca_core::Reference,
+    args: &[Expression],
+    fields: &[String],
+    env: &VarEnv<T>,
+) -> Result<Vec<T>, EvalError> {
+    let function = env
+        .functions
+        .get(name.as_str())
+        .ok_or_else(|| EvalError::MissingFunction {
+            name: name.to_string(),
+        })?;
+    let output = function
+        .outputs
+        .first()
+        .ok_or(EvalError::UnsupportedExpression {
+            kind: "record function output",
+        })?;
+    let output_path = if fields.first().is_some_and(|field| field == &output.name) {
+        fields.join(".")
+    } else {
+        format!("{}.{}", output.name, fields.join("."))
+    };
+    eval_user_function_output_array_path_pub(name.var_name(), args, output_path.as_str(), env)
+}
+
 pub(super) fn try_eval_field_access_array_values<T: SimFloat>(
     base: &Expression,
     field: &str,
@@ -325,7 +354,26 @@ pub(super) fn try_eval_field_access_array_values<T: SimFloat>(
     {
         return Ok(values);
     }
+
+    if let Some((name, args, fields)) = function_call_field_path(base, field) {
+        return eval_function_call_field_array_values(name, args, &fields, env);
+    }
+
     match base {
+        Expression::Index {
+            base, subscripts, ..
+        } => {
+            let indices = super::try_eval_index_subscripts(subscripts, env)?;
+            let Some(path) = try_eval_field_access_path(base, env)? else {
+                return Err(EvalError::UnsupportedExpression {
+                    kind: "field access array value",
+                });
+            };
+            let selected = dae::format_subscript_key(path.as_str(), &indices);
+            let field_path = format!("{selected}.{field}");
+            array_values_from_env_name_generic(field_path.as_str(), env)?
+                .ok_or(EvalError::MissingBinding { name: field_path })
+        }
         Expression::FunctionCall {
             name,
             args,
@@ -483,6 +531,37 @@ fn positive_array_field_index(value: f64) -> Result<usize, EvalError> {
         });
     }
     Ok(value as usize)
+}
+
+/// Return the root user-function call and the complete selected field path for
+/// an expression such as `f(x).pose.position`.  Keeping the path intact avoids
+/// imposing a fixed record nesting depth or array rank on the evaluator.
+pub(super) fn function_call_field_path<'a>(
+    base: &'a Expression,
+    field: &str,
+) -> Option<(&'a rumoca_core::Reference, &'a [Expression], Vec<String>)> {
+    let mut fields = vec![field.to_string()];
+    let mut cursor = base;
+    while let Expression::FieldAccess {
+        base: nested,
+        field: nested_field,
+        ..
+    } = cursor
+    {
+        fields.push(nested_field.clone());
+        cursor = nested;
+    }
+    let Expression::FunctionCall {
+        name,
+        args,
+        is_constructor: false,
+        ..
+    } = cursor
+    else {
+        return None;
+    };
+    fields.reverse();
+    Some((name, args.as_slice(), fields))
 }
 
 fn try_eval_function_record_field_array_values<T: SimFloat>(

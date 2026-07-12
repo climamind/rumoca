@@ -722,11 +722,12 @@ fn lower_expression_supports_size_builtin_for_known_array_dims() {
 #[test]
 fn lower_function_local_structural_symmetric_orientation() {
     let mut dae_model = dae::Dae::default();
-    let mut function = rumoca_core::Function::new("Space.phases", test_span());
+    let mut function = test_function("Space.phases", test_span());
     function.inputs.push(function_param_with_dims("x", &[3]));
     function.outputs.push(function_param_with_dims("y", &[3]));
     function.locals.push(rumoca_core::FunctionParam {
         def_id: None,
+        type_def_id: None,
         name: "m".to_string(),
         span: test_span(),
         type_name: "Integer".to_string(),
@@ -744,10 +745,13 @@ fn lower_function_local_structural_symmetric_orientation() {
             ],
             span: test_span(),
         }),
+        min: None,
+        max: None,
         description: None,
     });
     function.locals.push(rumoca_core::FunctionParam {
         def_id: None,
+        type_def_id: None,
         name: "phi".to_string(),
         span: test_span(),
         type_name: "Real".to_string(),
@@ -766,6 +770,8 @@ fn lower_function_local_structural_symmetric_orientation() {
             is_constructor: false,
             span: test_span(),
         }),
+        min: None,
+        max: None,
         description: None,
     });
     function.body = vec![
@@ -1204,7 +1210,7 @@ fn lower_initial_residual_does_not_treat_initial_rows_as_derivative_rows() {
 }
 
 #[test]
-fn lower_initial_residual_keeps_derivative_rows_with_algebraic_targets() {
+fn lower_initial_residual_excludes_coupled_derivative_rows() {
     let mut dae_model = dae::Dae::default();
     dae_model
         .variables
@@ -1221,9 +1227,28 @@ fn lower_initial_residual_keeps_derivative_rows_with_algebraic_targets() {
     let layout = build_var_layout(&dae_model).expect("test DAE layout should build");
 
     let rows = lower_initial_residual(&dae_model, &layout)
-        .expect("algebraic derivative row should stay in initial residual");
+        .expect("coupled derivative row should lower through derivative RHS");
 
-    assert_eq!(rows.len(), 1);
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn lower_initial_residual_excludes_derivative_rows_without_algebraic_unknowns() {
+    let mut dae_model = dae::Dae::default();
+    dae_model
+        .variables
+        .states
+        .insert(rumoca_core::VarName::new("x"), scalar_var("x"));
+    dae_model
+        .continuous
+        .equations
+        .push(residual(sub(der(var("x")), var("x"))));
+    let layout = build_var_layout(&dae_model).expect("test DAE layout should build");
+
+    let rows = lower_initial_residual(&dae_model, &layout)
+        .expect("direct state derivative row should lower");
+
+    assert!(rows.is_empty());
 }
 
 #[test]
@@ -1328,8 +1353,7 @@ fn lower_expression_prefers_qualified_normal_quantile_intrinsic_over_function_bo
         .parameters
         .insert(rumoca_core::VarName::new("c"), source_array_var("c", &[1]));
 
-    let mut quantile =
-        rumoca_core::Function::new("Modelica.Math.Distributions.Normal.quantile", test_span());
+    let mut quantile = test_function("Modelica.Math.Distributions.Normal.quantile", test_span());
     quantile.inputs = vec![
         rumoca_core::FunctionParam::new("p", "Real", test_span()),
         rumoca_core::FunctionParam::new("mu", "Real", test_span()),

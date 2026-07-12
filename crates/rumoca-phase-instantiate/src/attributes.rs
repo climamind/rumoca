@@ -10,6 +10,7 @@ pub(super) struct ComponentAttrsAndBinding {
     pub(super) binding_source: Option<ast::Expression>,
     pub(super) binding_source_scope: Option<ast::QualifiedName>,
     pub(super) binding_from_modification: bool,
+    pub(super) binding_is_each: bool,
 }
 
 #[cfg(test)]
@@ -53,14 +54,12 @@ pub(super) fn extract_component_attrs_and_binding_in_scope(
     if binding_from_modification && binding_source_scope.is_none() {
         binding_source_scope = declaration_scope.cloned();
     }
-    let binding_source = if binding_from_modification {
-        let binding_path = ast::QualifiedName::from_ident(&comp.name);
-        mod_env
-            .get(&binding_path)
-            .and_then(|mod_value| mod_value.source.clone())
-    } else {
-        None
-    };
+    let binding_path = ast::QualifiedName::from_ident(&comp.name);
+    let binding_modification = binding_from_modification
+        .then(|| mod_env.get(&binding_path))
+        .flatten();
+    let binding_source = binding_modification.and_then(|value| value.source.clone());
+    let binding_is_each = binding_modification.is_some_and(|value| value.each);
 
     // MLS §4.4.4: declaration binding may provide a default start for
     // parameter/constant declarations when no explicit start is present.
@@ -77,6 +76,7 @@ pub(super) fn extract_component_attrs_and_binding_in_scope(
         binding_source,
         binding_source_scope,
         binding_from_modification,
+        binding_is_each,
     })
 }
 

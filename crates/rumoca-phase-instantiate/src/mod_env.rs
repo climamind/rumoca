@@ -968,3 +968,7 @@ fn preserves_source_scoped_attribute(attr_name: &str) -> bool {
 #[cfg(test)]
 #[path = "mod_env_tests.rs"]
 mod mod_env_tests;
+
+#[cfg(test)]
+#[path = "mod_env_inline_tests.rs"]
+mod tests;

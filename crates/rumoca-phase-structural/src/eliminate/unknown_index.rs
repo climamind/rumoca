@@ -299,6 +299,16 @@ fn exact_scalar_unknown_exists(dae: &Dae, unknown: &VarName) -> Result<bool, Str
     Ok(scope.exact(unknown).is_some() && scope.size(unknown)? == 1)
 }
 
+pub(super) fn expression_references_boundary_unknown(
+    expr: &Expression,
+    unknown: &VarName,
+    dae: &Dae,
+) -> Result<bool, StructuralError> {
+    let mut refs = Vec::new();
+    collect_var_ref_nodes(expr, &mut refs);
+    refs_contain_unknown(&refs, unknown, dae)
+}
+
 fn unknown_scalar_size(dae: &Dae, unknown: &VarName) -> Result<usize, StructuralError> {
     DaeVariableScope::new(dae).size(unknown)
 }

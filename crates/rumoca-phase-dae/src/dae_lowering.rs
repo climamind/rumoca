@@ -36,6 +36,12 @@ struct RecordArgDecomposition {
 mod record_field_inference;
 use record_field_inference::{FieldUseMap, infer_record_fields_by_function};
 
+#[derive(Default)]
+struct ArrayParamMap {
+    by_def_id: HashMap<rumoca_core::DefId, Vec<usize>>,
+    by_name: HashMap<String, Vec<usize>>,
+}
+
 /// DAE value prepared for code generators that need DAE-level convenience
 /// rewrites without mutating the simulation DAE.
 #[derive(Debug, Clone)]
@@ -68,63 +74,33 @@ pub fn prepare_dae_for_codegen(dae: &dae::Dae) -> Result<CodegenDae, ToDaeError>
     Ok(CodegenDae { dae: prepared })
 }
 
-fn unwrap_block_constructor_value_wrappers(dae: &mut Dae) {
-    let functions = dae.symbols.functions.clone();
-    BlockConstructorValueUnwrapper {
-        functions: &functions,
-    }
-    .rewrite_dae(dae);
-    for function in dae.symbols.functions.values_mut() {
-        function.body = BlockConstructorValueUnwrapper {
-            functions: &functions,
-        }
-        .rewrite_statements(&function.body);
-    }
+/// Prepare a DAE copy for FMI modelDescription XML metadata.
+///
+/// FMI XML start attributes carry concrete values, not Modelica expressions.
+/// This preparation is intentionally separate from runtime codegen prep so FMU
+/// implementation code can still evaluate start expressions after importer
+/// parameter overrides.
+pub fn prepare_dae_for_fmi_model_description(dae: &dae::Dae) -> Result<CodegenDae, ToDaeError> {
+    let mut prepared = dae.clone();
+    crate::fmi_metadata_values::fold_fmi_model_description_values_to_literals(&mut prepared)?;
+    Ok(CodegenDae { dae: prepared })
 }
 
-struct BlockConstructorValueUnwrapper<'a> {
-    functions: &'a IndexMap<rumoca_core::VarName, rumoca_core::Function>,
-}
-
-impl ExpressionRewriter for BlockConstructorValueUnwrapper<'_> {
-    fn rewrite_expression(&mut self, expr: &rumoca_core::Expression) -> rumoca_core::Expression {
-        if let rumoca_core::Expression::FunctionCall {
-            name,
-            args,
-            is_constructor: true,
-            span,
-        } = expr
-        {
-            let args = self.rewrite_expressions(args);
-            if args.len() == 1
-                && self
-                    .functions
-                    .get(name.var_name())
-                    .is_some_and(is_block_constructor_value_wrapper)
-            {
-                return args.into_iter().next().expect("checked len");
-            }
-            return rumoca_core::Expression::FunctionCall {
-                name: name.clone(),
-                args,
-                is_constructor: true,
-                span: *span,
-            };
-        }
-        self.walk_expression(expr)
-    }
-}
-
-impl StatementRewriter for BlockConstructorValueUnwrapper<'_> {}
-impl DaeExpressionRewriter for BlockConstructorValueUnwrapper<'_> {}
-
-fn is_block_constructor_value_wrapper(function: &rumoca_core::Function) -> bool {
-    function.is_constructor
-        && !function.inputs.is_empty()
-        && function
-            .inputs
-            .iter()
-            .all(|input| input.type_class == Some(rumoca_core::ClassType::Connector))
+/// Project the DAE to the metadata needed by FMI XML and native Solve-IR
+/// implementations before folding numeric attributes. Evaluation still uses
+/// the complete source DAE, so parameter and user-function starts retain their
+/// semantics without cloning numerical equation graphs into the result.
+pub fn project_dae_for_fmi_metadata(dae: &dae::Dae) -> Result<CodegenDae, ToDaeError> {
+    let mut projected = Dae::new();
+    projected.schema_version = dae.schema_version;
+    projected.variables = dae.variables.clone();
+    projected.conditions = dae.conditions.clone();
+    projected.events = dae.events.clone();
+    projected.clocks = dae.clocks.clone();
+    projected.metadata.model_description = dae.metadata.model_description.clone();
+    projected.metadata.symbol_ancestry = dae.metadata.symbol_ancestry.clone();
+    crate::fmi_metadata_values::fold_fmi_model_description_values_from_source(&mut projected, dae)?;
+    Ok(CodegenDae { dae: projected })
 }
 
 // =============================================================================
@@ -134,25 +110,27 @@ fn is_block_constructor_value_wrapper(function: &rumoca_core::Function) -> bool 
 pub(crate) fn record_constructor_fields_from_metadata<'a, I>(
     functions: I,
     type_name: &str,
+    type_def_id: rumoca_core::DefId,
 ) -> Option<Vec<rumoca_core::FunctionParam>>
 where
     I: IntoIterator<Item = (&'a rumoca_core::VarName, &'a rumoca_core::Function)>,
 {
-    functions
-        .into_iter()
-        .find(|(name, function)| {
-            function.is_constructor
-                && rumoca_core::qualified_type_name_matches(name.as_str(), type_name)
-        })
-        .map(|(_, function)| function.inputs.clone())
-        .filter(|fields| !fields.is_empty())
+    rumoca_core::resolve_record_constructor(
+        functions.into_iter().map(|(_, function)| function),
+        type_name,
+        type_def_id,
+    )
+    .ok()
+    .map(|function| function.inputs.clone())
+    .filter(|fields| !fields.is_empty())
 }
 
 fn record_fields_from_constructor_metadata(
     functions: &IndexMap<rumoca_core::VarName, rumoca_core::Function>,
     type_name: &str,
+    type_def_id: rumoca_core::DefId,
 ) -> Option<Vec<String>> {
-    record_constructor_fields_from_metadata(functions.iter(), type_name)
+    record_constructor_fields_from_metadata(functions.iter(), type_name, type_def_id)
         .map(|fields| fields.into_iter().map(|param| param.name).collect())
 }
 
@@ -162,17 +140,39 @@ fn record_fields_from_constructor_metadata(
 /// Decompose record-typed function params in the DAE for code generators.
 /// Must NOT be called before simulation — only before codegen rendering.
 pub fn lower_record_function_params_dae(dae: &mut Dae) -> Result<(), ToDaeError> {
-    let record_fields_by_type = dae
+    let mut record_fields_by_type = HashMap::new();
+    for input in dae
         .symbols
         .functions
         .values()
         .flat_map(|function| function.inputs.iter())
         .filter(|input| input.type_class == Some(rumoca_core::ClassType::Record))
-        .filter_map(|input| {
-            record_fields_from_constructor_metadata(&dae.symbols.functions, &input.type_name)
-                .map(|fields| (input.type_name.clone(), fields))
-        })
-        .collect::<HashMap<_, _>>();
+    {
+        let type_def_id = input.type_def_id.ok_or_else(|| {
+            ToDaeError::runtime_contract_violation_at(
+                format!(
+                    "record parameter `{}` lacks resolved type identity",
+                    input.name
+                ),
+                input.span,
+            )
+        })?;
+        let fields = record_fields_from_constructor_metadata(
+            &dae.symbols.functions,
+            &input.type_name,
+            type_def_id,
+        )
+        .ok_or_else(|| {
+            ToDaeError::runtime_contract_violation_at(
+                format!(
+                    "record parameter `{}` has no constructor for resolved type identity",
+                    input.name
+                ),
+                input.span,
+            )
+        })?;
+        record_fields_by_type.insert(type_def_id, fields);
+    }
 
     let inferred_fields_by_function =
         infer_record_fields_by_function(&dae.symbols.functions, &record_fields_by_type);
@@ -229,7 +229,7 @@ pub fn lower_record_function_params_dae(dae: &mut Dae) -> Result<(), ToDaeError>
 fn record_inputs_to_decompose(
     func_name: &str,
     func: &rumoca_core::Function,
-    record_fields_by_type: &HashMap<String, Vec<String>>,
+    record_fields_by_type: &HashMap<rumoca_core::DefId, Vec<String>>,
     inferred_fields_by_function: &HashMap<String, FieldUseMap>,
 ) -> Vec<(usize, String, Vec<String>)> {
     func.inputs
@@ -250,14 +250,15 @@ fn record_inputs_to_decompose(
 fn record_fields_for_input(
     func_name: &str,
     input: &rumoca_core::FunctionParam,
-    record_fields_by_type: &HashMap<String, Vec<String>>,
+    record_fields_by_type: &HashMap<rumoca_core::DefId, Vec<String>>,
     inferred_fields_by_function: &HashMap<String, FieldUseMap>,
 ) -> Vec<String> {
     if input.type_class == Some(rumoca_core::ClassType::Class) {
         return Vec::new();
     }
-    record_fields_by_type
-        .get(&input.type_name)
+    input
+        .type_def_id
+        .and_then(|id| record_fields_by_type.get(&id))
         .into_iter()
         .flatten()
         .cloned()
@@ -362,6 +363,7 @@ fn push_flat_record_input(
 ) {
     func.inputs.push(rumoca_core::FunctionParam {
         def_id: None,
+        type_def_id: None,
         name,
         span,
         type_name: "Real".to_string(),
@@ -369,6 +371,8 @@ fn push_flat_record_input(
         dims,
         shape_expr: Vec::new(),
         default: None,
+        min: None,
+        max: None,
         description: None,
     });
 }
@@ -735,27 +739,27 @@ fn is_obviously_scalar(expr: &rumoca_core::Expression) -> bool {
 /// Insert size arguments for variable-size array params at DAE call sites.
 /// Must NOT be called before simulation — only before codegen rendering.
 pub fn insert_array_size_args_dae(dae: &mut Dae) -> Result<(), ToDaeError> {
-    let array_param_map: ArrayParamMap = dae
-        .symbols
-        .functions
-        .iter()
-        .filter_map(|(name, func)| {
-            let indices: Vec<(usize, String)> = func
-                .inputs
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| !p.dims.is_empty())
-                .map(|(i, p)| (i, p.name.clone()))
-                .collect();
-            if indices.is_empty() {
-                None
-            } else {
-                Some((name.as_str().to_string(), indices))
-            }
-        })
-        .collect();
+    let mut array_param_map = ArrayParamMap::default();
+    for (name, func) in &dae.symbols.functions {
+        let indices: Vec<usize> = func
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.dims.is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        if indices.is_empty() {
+            continue;
+        }
+        if let Some(def_id) = func.def_id {
+            array_param_map.by_def_id.insert(def_id, indices.clone());
+        }
+        array_param_map
+            .by_name
+            .insert(name.as_str().to_string(), indices);
+    }
 
-    if array_param_map.is_empty() {
+    if array_param_map.by_name.is_empty() {
         return Ok(());
     }
 
@@ -808,8 +812,8 @@ impl ExpressionRewriter for DaeSizeArgInserter<'_> {
         } = expr
         {
             let mut args = self.rewrite_expressions(args);
-            if let Some(array_params) = self.map.get(name.as_str())
-                && let Err(error) = insert_dae_size_args(&mut args, array_params, *span)
+            if let Some(array_indices) = array_param_indices_for_call(self.map, name)
+                && let Err(error) = insert_dae_size_args(&mut args, array_indices, *span)
             {
                 return self.record_error(error, expr);
             }
@@ -838,6 +842,17 @@ impl DaeSizeArgInserter<'_> {
 impl StatementRewriter for DaeSizeArgInserter<'_> {}
 
 impl DaeExpressionRewriter for DaeSizeArgInserter<'_> {}
+
+fn array_param_indices_for_call<'a>(
+    map: &'a ArrayParamMap,
+    call_name: &rumoca_core::Reference,
+) -> Option<&'a Vec<usize>> {
+    call_name
+        .component_ref()
+        .and_then(|reference| reference.def_id)
+        .and_then(|def_id| map.by_def_id.get(&def_id))
+        .or_else(|| map.by_name.get(call_name.as_str()))
+}
 
 fn insert_dae_size_args(
     args: &mut Vec<rumoca_core::Expression>,

@@ -184,6 +184,7 @@ pub(crate) fn flat_output_type_name(
 /// ensuring that imported functions are correctly looked up by name.
 pub(crate) fn create_flat_variable(
     instance: &ast::InstanceData,
+    canonical_type_id: TypeId,
     tree: &ast::ClassTree,
     class_index: &ast::ClassDefIndex<'_>,
     imports: &VariableImportContext,
@@ -252,7 +253,7 @@ pub(crate) fn create_flat_variable(
         name,
         component_ref,
         source_span,
-        type_id: instance.type_id,
+        type_id: canonical_type_id,
         // Type prefixes from component declaration (MLS §4.4.2)
         variability: instance.variability.clone(),
         causality: instance.causality.clone(),
@@ -345,6 +346,57 @@ fn is_valid_modelica_identifier(part: &str) -> bool {
     };
     (first == '_' || first.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+pub(crate) fn create_record_instance(
+    instance: &ast::InstanceData,
+    tree: &ast::ClassTree,
+    class_index: &ast::ClassDefIndex<'_>,
+    canonical_type_id: TypeId,
+) -> Result<Option<flat::RecordInstance>, FlattenError> {
+    let Some(type_def_id) = instance.type_def_id else {
+        return Ok(None);
+    };
+    let Some(class_def) = class_index.get(type_def_id) else {
+        return Ok(None);
+    };
+    if class_def.class_type != rumoca_core::ClassType::Record {
+        return Ok(None);
+    }
+    let source_span = instance_source_span(instance, tree, "flat record instance")?;
+    let component_ref = instance.component_ref.clone().ok_or_else(|| {
+        FlattenError::missing_source_context(format!(
+            "record instance `{}` lacks a resolved component reference",
+            instance.qualified_name.to_flat_string()
+        ))
+    })?;
+    Ok(Some(flat::RecordInstance {
+        component_ref,
+        source_span,
+        canonical_type_id,
+        type_name: instance.type_name.clone(),
+        type_def_id,
+        dims: instance.dims.clone(),
+    }))
+}
+
+pub(crate) fn create_record_type(
+    type_def_id: rumoca_core::DefId,
+    tree: &ast::ClassTree,
+    class_index: &ast::ClassDefIndex<'_>,
+) -> Result<flat::RecordType, FlattenError> {
+    let class_def = class_index.get(type_def_id).ok_or_else(|| {
+        FlattenError::missing_source_context(format!(
+            "record type {type_def_id} is absent from the resolved class index"
+        ))
+    })?;
+    let qualified_name = class_index
+        .qualified_name(type_def_id)
+        .unwrap_or(class_def.name.text.as_ref());
+    Ok(flat::RecordType {
+        name: qualified_name.to_string(),
+        fields: functions::record_type_fields(class_index, class_def, qualified_name, tree)?,
+    })
 }
 
 fn canonicalize_function_calls(
@@ -660,6 +712,7 @@ mod tests {
         let class_index = ast::ClassDefIndex::from_tree(&tree);
         let flat = create_flat_variable(
             &instance,
+            instance.type_id,
             &tree,
             &class_index,
             &imports,
@@ -714,6 +767,7 @@ mod tests {
         let class_index = ast::ClassDefIndex::from_tree(&tree);
         let flat = create_flat_variable(
             &instance,
+            instance.type_id,
             &tree,
             &class_index,
             &imports,

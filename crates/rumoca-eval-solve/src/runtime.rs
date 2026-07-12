@@ -1,9 +1,10 @@
 use indexmap::IndexMap;
 use rumoca_ir_solve as solve;
 use rumoca_solver::{
-    EventActionOutcome, RuntimeEventStop, RuntimeSolveError, SolveStopSchedule,
-    discrete_row_pre_mode, push_visible_values, replace_last_visible_values,
-    row_reads_solver_or_time, timeline::sample_time_match_with_tol, update_relation_memory_slots,
+    EventActionOutcome, ImplicitProjectionModel, RuntimeEventStop, RuntimeSolveError,
+    SolveStopSchedule, project_algebraic_seed_with_plan, project_algebraics_with_plan,
+    push_visible_values, replace_last_visible_values, timeline::sample_time_match_with_tol,
+    update_relation_memory_slots,
 };
 use std::{cell::RefCell, collections::HashMap};
 
@@ -13,21 +14,21 @@ use crate::refresh_plan::{
 };
 use crate::runtime_events::{
     apply_discrete_slot_values, current_dynamic_time_event_stop, eval_event_actions_with_context,
-    event_eval_params_with_relation_overrides, next_runtime_event_stop,
-    visible_values_with_context,
+    next_runtime_event_stop, visible_values_with_context,
 };
 use crate::{
     self as solve_eval, EvalSolveError, PreparedComputeBlock, PreparedScalarProgramBlock,
     RowEvalContext, to_scalar_program_block,
 };
 
+mod discrete_rows;
 mod event_update;
 mod initial_event;
 mod plans;
 mod refresh_batch;
 mod sensitivity;
 mod support;
-use event_update::{DiscretePreSnapshot, DiscreteRowsSettleInput, EventEvalParamCache};
+use event_update::{DiscretePreSnapshot, DiscreteRowsSettleInput};
 pub use event_update::{EventUpdateRowFilter, ProjectedEventUpdateInput};
 pub use initial_event::{
     InitialEventObservation, ProjectedInitialEventInput, ProjectedInitialEventOutcome,
@@ -38,9 +39,8 @@ use plans::{
     direct_time_root_value, direct_visible_value, root_condition_plan, visible_value_plan,
 };
 use support::{
-    NewtonProbe, apply_newton_steps, copy_runtime_values, copy_runtime_values_into,
-    reserve_runtime_index_map_capacity, reserve_runtime_vec_capacity, resize_runtime_values,
-    write_refresh_targets, zero_runtime_values,
+    copy_runtime_values, copy_runtime_values_into, reserve_runtime_index_map_capacity,
+    reserve_runtime_vec_capacity, resize_runtime_values, zero_runtime_values,
 };
 
 struct RefreshSlotArgs<'a> {
@@ -51,9 +51,152 @@ struct RefreshSlotArgs<'a> {
     max_iters: usize,
 }
 
-struct RefreshIterationMax {
-    delta: f64,
-    target: Option<(usize, usize, f64)>,
+struct RefreshProjectionModel<'a> {
+    runtime: &'a SolveRuntime,
+    plan: &'a solve::AlgebraicProjectionPlan,
+    jacobian_v: ProjectionJacobian<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum ProjectionJacobian<'a> {
+    SolverY(&'a PreparedComputeBlock),
+    SolverYAndParameters(&'a PreparedScalarProgramBlock),
+}
+
+impl ProjectionJacobian<'_> {
+    fn eval(
+        self,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        context: RowEvalContext<'_>,
+        out: &mut [f64],
+    ) -> Result<(), EvalSolveError> {
+        match self {
+            Self::SolverY(block) => block.eval_with_context(y, p, t, context, out),
+            Self::SolverYAndParameters(block) => block.eval_with_context(y, p, t, context, out),
+        }
+    }
+}
+
+impl ImplicitProjectionModel for RefreshProjectionModel<'_> {
+    fn eval_residual(
+        &self,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        out: &mut [f64],
+    ) -> Result<(), RuntimeSolveError> {
+        self.runtime
+            .implicit_rhs
+            .eval_with_context(y, p, t, self.runtime.row_eval_context(), out)
+            .map_err(Into::into)
+    }
+
+    fn eval_jacobian_v(
+        &self,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+        v: &[f64],
+        out: &mut [f64],
+    ) -> Result<(), RuntimeSolveError> {
+        self.jacobian_v
+            .eval(
+                y,
+                p,
+                t,
+                RowEvalContext {
+                    seed: Some(v),
+                    ..self.runtime.row_eval_context()
+                },
+                out,
+            )
+            .map_err(Into::into)
+    }
+
+    fn eval_implicit_residual_row(
+        &self,
+        row_idx: usize,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+    ) -> Result<Option<f64>, RuntimeSolveError> {
+        let Some(program_idx) = self
+            .runtime
+            .implicit_scalar_rhs
+            .single_output_row_for_output_index(row_idx)
+        else {
+            return Ok(None);
+        };
+        self.runtime
+            .implicit_scalar_rhs
+            .eval_row_unchecked_with_context(program_idx, y, p, t, self.runtime.row_eval_context())
+            .map(Some)
+            .map_err(Into::into)
+    }
+
+    fn eval_implicit_target_value(
+        &self,
+        row_idx: usize,
+        target_y_index: usize,
+        y: &[f64],
+        p: &[f64],
+        t: f64,
+    ) -> Result<Option<f64>, RuntimeSolveError> {
+        let Some(program_idx) = self
+            .runtime
+            .implicit_scalar_rhs
+            .single_output_row_for_output_index(row_idx)
+        else {
+            return Ok(None);
+        };
+        self.runtime
+            .implicit_scalar_rhs
+            .eval_target_assignment_row_unchecked_with_context(
+                program_idx,
+                target_y_index,
+                y,
+                p,
+                t,
+                self.runtime.row_eval_context(),
+            )
+            .map_err(Into::into)
+    }
+
+    fn implicit_target(&self, row_idx: usize) -> Option<solve::ScalarSlot> {
+        self.runtime
+            .model
+            .problem
+            .continuous
+            .implicit_row_targets
+            .get(row_idx)
+            .copied()
+            .flatten()
+    }
+
+    fn algebraic_projection_plan(&self) -> &solve::AlgebraicProjectionPlan {
+        self.plan
+    }
+
+    fn target_name_for_row(&self, row_idx: usize) -> Option<&str> {
+        self.runtime
+            .model
+            .problem
+            .solve_layout
+            .solver_maps
+            .names
+            .get(row_idx)
+            .map(String::as_str)
+    }
+}
+
+fn seed_error_allows_projection(error: &RuntimeSolveError) -> bool {
+    matches!(
+        error,
+        RuntimeSolveError::NonFiniteValue { .. }
+            | RuntimeSolveError::RefreshTargetUnassignable { .. }
+    )
 }
 
 impl From<solve_eval::EvalSolveError> for RuntimeSolveError {
@@ -68,6 +211,7 @@ pub struct SolveRuntime {
     pub state_count: usize,
     pub solver_count: usize,
     implicit_rhs: PreparedComputeBlock,
+    implicit_projection_jacobian_v: PreparedComputeBlock,
     implicit_scalar_rhs: PreparedScalarProgramBlock,
     derivative_rhs: PreparedComputeBlock,
     /// Forward-mode AD Jacobian-vector product of `derivative_rhs`
@@ -80,19 +224,21 @@ pub struct SolveRuntime {
     /// `(∂der/∂[solver_y|p])ᵀ·λ` (Track A scalar reverse core).
     derivative_scalar: PreparedScalarProgramBlock,
     /// Per-row forward-mode AD Jacobian-vector product of `implicit_rhs`
-    /// (`d(residual_row)/d(y)·v`). Used to propagate the state seed through the
-    /// algebraic projection (`d(alg)/d(state)`) row by row.
+    /// (`d(residual_row)/d[y|p]·v`). Used to propagate state and parameter seeds
+    /// through the algebraic projection row by row.
     implicit_jacobian_v: PreparedScalarProgramBlock,
     algebraic_refresh: RefreshPlan,
     derivative_refresh: RefreshPlan,
     root_refresh: RefreshPlan,
     root_condition_rows: PreparedScalarProgramBlock,
     root_condition_plan: Option<RootConditionPlan>,
+    discrete_rhs: PreparedScalarProgramBlock,
     visible_name_index: HashMap<String, usize>,
     visible_value_rows: PreparedScalarProgramBlock,
     visible_value_plan: Option<VisibleValuePlan>,
     visible_scratch: RefCell<Vec<f64>>,
     refresh_probe_scratch: RefCell<Vec<f64>>,
+    refresh_tensor_scratch: RefCell<Vec<f64>>,
     runtime_state: solve_eval::SimulationRuntimeState,
     derivative_scratch: RefCell<StateDerivativeScratch>,
     root_scratch: RefCell<Vec<f64>>,
@@ -116,7 +262,7 @@ impl SolveRuntime {
         trace_refresh_plan(model, "derivative", &derivative_refresh);
         trace_refresh_plan(model, "root", &root_refresh);
         let visible_value_plan = visible_value_plan(model);
-        let root_condition_plan = root_condition_plan(model);
+        let root_condition_plan = root_condition_plan(model, &root_refresh);
         Ok(Self {
             model: model.clone(),
             state_count: model.state_scalar_count(),
@@ -124,6 +270,10 @@ impl SolveRuntime {
             implicit_rhs: PreparedComputeBlock::new_with_label(
                 &model.problem.continuous.implicit_rhs,
                 "runtime_implicit_rhs",
+            )?,
+            implicit_projection_jacobian_v: PreparedComputeBlock::new_with_label(
+                &model.artifacts.continuous.implicit_jacobian_v,
+                "runtime_implicit_projection_jacobian_v",
             )?,
             implicit_scalar_rhs,
             derivative_rhs: PreparedComputeBlock::new_with_label(
@@ -148,6 +298,7 @@ impl SolveRuntime {
                 model.problem.events.root_conditions.clone(),
             )?,
             root_condition_plan,
+            discrete_rhs: PreparedScalarProgramBlock::new(model.problem.discrete.rhs.clone())?,
             visible_name_index: model
                 .visible_names
                 .iter()
@@ -158,6 +309,7 @@ impl SolveRuntime {
             visible_value_plan,
             visible_scratch: RefCell::new(Vec::new()),
             refresh_probe_scratch: RefCell::new(Vec::new()),
+            refresh_tensor_scratch: RefCell::new(Vec::new()),
             runtime_state: solve_eval::SimulationRuntimeState::new(),
             derivative_scratch: RefCell::new(StateDerivativeScratch::default()),
             root_scratch: RefCell::new(Vec::new()),
@@ -205,15 +357,11 @@ impl SolveRuntime {
         t: f64,
         state: &[f64],
         params: &[f64],
-        guess: &mut Vec<f64>,
+        guess: &mut [f64],
         tol: f64,
         max_iters: usize,
     ) -> Result<(), RuntimeSolveError> {
-        if guess.len() != self.solver_count {
-            copy_runtime_values_into(guess, &self.model.initial_y, "initial solver guess")?;
-            resize_runtime_values(guess, self.solver_count, 0.0, "initial solver guess")?;
-        }
-        self.populate_solver_y_from_state(guess, state)?;
+        self.update_solver_y_guess_from_state(guess, state)?;
         self.refresh_algebraic_and_output_slots(t, guess, params, tol, max_iters)
     }
 
@@ -262,29 +410,51 @@ impl SolveRuntime {
         plan: &RefreshPlan,
         args: RefreshSlotArgs<'_>,
     ) -> Result<(), RuntimeSolveError> {
-        self.validate_refresh_plan(plan, args.solver_y, args.params)?;
-        if plan.rows.is_empty() {
+        self.validate_refresh_inputs(args.solver_y, args.params)?;
+        if plan.rows.is_empty() && plan.simultaneous_plan.is_empty() {
             return Ok(());
         }
-        if !plan.iterative {
-            self.refresh_slots_once(&plan.rows, args.t, args.solver_y, args.params)?;
+        let incoming = copy_runtime_values(args.solver_y, "algebraic projection snapshot")?;
+        let mut causal_refresh_succeeded = plan.rows.is_empty();
+        if !plan.rows.is_empty() {
+            match self.refresh_slots_once(&plan.rows, args.t, args.solver_y, args.params) {
+                Ok(()) => causal_refresh_succeeded = true,
+                Err(error) => {
+                    restore_after_causal_seed_error(error, args.solver_y, &incoming)?;
+                }
+            }
+        }
+        if causal_refresh_succeeded && plan.causal_solution_certified {
             return Ok(());
         }
-        self.refresh_slots_iterative(&plan.rows, args)
+        let projection_model = RefreshProjectionModel {
+            runtime: self,
+            plan: &plan.simultaneous_plan,
+            jacobian_v: ProjectionJacobian::SolverY(&self.implicit_projection_jacobian_v),
+        };
+        let result = project_algebraics_with_plan(
+            &projection_model,
+            &plan.simultaneous_plan,
+            args.solver_y,
+            rumoca_solver::AlgebraicProjectionArgs {
+                parameters: args.params,
+                time: args.t,
+                state_count: self.state_count,
+                tolerance: args.tol,
+            },
+            args.max_iters,
+        );
+        if result.is_err() {
+            args.solver_y.copy_from_slice(&incoming);
+        }
+        result
     }
 
-    fn validate_refresh_plan(
+    fn validate_refresh_inputs(
         &self,
-        plan: &RefreshPlan,
         solver_y: &[f64],
         params: &[f64],
     ) -> Result<(), RuntimeSolveError> {
-        if !plan.missing_dependencies.is_empty() {
-            return Err(RuntimeSolveError::solve_ir(format!(
-                "refresh plan requires algebraic/output dependencies without producer rows: {}",
-                self.missing_dependency_names(&plan.missing_dependencies)
-            )));
-        }
         if self.implicit_rhs.len() < self.solver_count {
             return Err(RuntimeSolveError::solve_ir(format!(
                 "implicit RHS has {} rows for {} solver variables",
@@ -299,224 +469,6 @@ impl SolveRuntime {
             None,
         )?;
         Ok(())
-    }
-
-    fn refresh_slots_iterative(
-        &self,
-        rows: &[AlgebraicRefreshRow],
-        args: RefreshSlotArgs<'_>,
-    ) -> Result<(), RuntimeSolveError> {
-        let RefreshSlotArgs {
-            t,
-            solver_y,
-            params,
-            tol,
-            max_iters,
-        } = args;
-        // Snapshot the targets: if Gauss-Seidel diverges (coupled loop with
-        // gain > 1, e.g. torque loops through a gear ratio), Newton restarts
-        // from these values rather than the diverged iterates.
-        let snapshot = self.refresh_target_snapshot(rows, solver_y)?;
-        let mut last_max = RefreshIterationMax {
-            delta: 0.0,
-            target: None,
-        };
-        // A coupled cycle with gain > 1 (any geared torque loop) makes the
-        // sweep delta grow monotonically; burning the full iteration budget
-        // before falling back is pure waste, so bail to Newton after a few
-        // consecutive growing sweeps.
-        const MAX_GROWING_SWEEPS: usize = 3;
-        let mut growing_sweeps = 0usize;
-        for iter_idx in 0..max_iters {
-            let previous_delta = last_max.delta;
-            match self.refresh_slots_iteration(rows, t, solver_y, params) {
-                Ok(iteration_max) => last_max = iteration_max,
-                Err(error) => {
-                    // Divergence to non-finite values: retry with Newton from
-                    // the snapshot before giving up.
-                    tracing::debug!(target: "rumoca_eval_solve::refresh", "retrying refresh with Newton after sweep error: {error}");
-                    return self.refresh_slots_newton(rows, &snapshot, t, solver_y, params, tol);
-                }
-            }
-            self.trace_refresh_iteration(iter_idx, &last_max);
-            if last_max.delta <= tol {
-                return Ok(());
-            }
-            let growing = iter_idx > 0 && last_max.delta > previous_delta;
-            growing_sweeps = if growing { growing_sweeps + 1 } else { 0 };
-            if growing_sweeps >= MAX_GROWING_SWEEPS {
-                break;
-            }
-        }
-        self.refresh_slots_newton(rows, &snapshot, t, solver_y, params, tol)
-    }
-
-    fn refresh_target_snapshot(
-        &self,
-        rows: &[AlgebraicRefreshRow],
-        solver_y: &[f64],
-    ) -> Result<Vec<f64>, RuntimeSolveError> {
-        let mut snapshot = Vec::new();
-        reserve_runtime_vec_capacity(&mut snapshot, rows.len(), "Newton snapshot")?;
-        snapshot.extend(rows.iter().map(|row| solver_y[row.target_index]));
-        Ok(snapshot)
-    }
-
-    /// Solve the coupled refresh subsystem `x = F(x)` with damped Newton on
-    /// `G(x) = x - F(x)` using a finite-difference Jacobian. Gauss-Seidel
-    /// sweeps diverge whenever the algebraic dependency cycle has gain > 1
-    /// (any geared torque loop); Newton solves linear cycles exactly in one
-    /// step and handles mildly nonlinear ones.
-    fn refresh_slots_newton(
-        &self,
-        rows: &[AlgebraicRefreshRow],
-        snapshot: &[f64],
-        t: f64,
-        solver_y: &mut [f64],
-        params: &[f64],
-        tol: f64,
-    ) -> Result<(), RuntimeSolveError> {
-        const MAX_NEWTON_REFRESH_ROWS: usize = 256;
-        const MAX_NEWTON_ITERS: usize = 25;
-        let m = rows.len();
-        tracing::debug!(target: "rumoca_eval_solve::refresh", "newton fallback: rows={m}");
-        if m == 0 || m > MAX_NEWTON_REFRESH_ROWS {
-            return Err(self.refresh_convergence_error(
-                0,
-                &RefreshIterationMax {
-                    delta: f64::INFINITY,
-                    target: None,
-                },
-            ));
-        }
-
-        let mut x = Vec::new();
-        reserve_runtime_vec_capacity(&mut x, snapshot.len(), "Newton iterate")?;
-        x.extend(snapshot);
-        for _ in 0..MAX_NEWTON_ITERS {
-            let f_base = self.refresh_newton_sweep(rows, &x, t, solver_y, params)?;
-            let mut residual = Vec::new();
-            reserve_runtime_vec_capacity(&mut residual, x.len(), "Newton residual")?;
-            residual.extend(x.iter().zip(&f_base).map(|(xi, fi)| xi - fi));
-            let max_residual = residual.iter().fold(0.0_f64, |acc, r| acc.max(r.abs()));
-            tracing::debug!(target: "rumoca_eval_solve::refresh", "newton residual={max_residual:e}");
-            if max_residual <= tol {
-                write_refresh_targets(rows, &x, solver_y);
-                return Ok(());
-            }
-            let probe = NewtonProbe {
-                rows,
-                x: &x,
-                f_base: &f_base,
-                residual: &residual,
-                t,
-                params,
-            };
-            let mut augmented = self.refresh_newton_augmented(probe, solver_y)?;
-            if crate::linear_solve::gaussian_eliminate(&mut augmented).is_none() {
-                return Err(self.refresh_newton_failure(rows));
-            }
-            if !apply_newton_steps(&mut x, &augmented) {
-                return Err(self.refresh_newton_failure(rows));
-            }
-        }
-        Err(self.refresh_newton_failure(rows))
-    }
-
-    /// Evaluate the refresh map `F` at `x` (writing `x` into the target slots
-    /// first).
-    fn refresh_newton_sweep(
-        &self,
-        rows: &[AlgebraicRefreshRow],
-        x: &[f64],
-        t: f64,
-        solver_y: &mut [f64],
-        params: &[f64],
-    ) -> Result<Vec<f64>, RuntimeSolveError> {
-        write_refresh_targets(rows, x, solver_y);
-        let mut values = Vec::new();
-        reserve_runtime_vec_capacity(&mut values, rows.len(), "Newton sweep values")?;
-        for row in rows {
-            let value = self.eval_refresh_row_value(row, t, solver_y, params)?;
-            if !value.is_finite() {
-                return Err(self.non_finite_value_error(row.target_index, value));
-            }
-            values.push(value);
-        }
-        Ok(values)
-    }
-
-    /// `J = I - dF/dx` by forward differences, augmented with `-residual`.
-    fn refresh_newton_augmented(
-        &self,
-        probe: NewtonProbe<'_>,
-        solver_y: &mut [f64],
-    ) -> Result<crate::linear_solve::AugmentedMatrix, RuntimeSolveError> {
-        let NewtonProbe {
-            rows,
-            x,
-            f_base,
-            residual,
-            t,
-            params,
-        } = probe;
-        let m = rows.len();
-        let mut augmented =
-            crate::linear_solve::AugmentedMatrix::zeroed(m).map_err(RuntimeSolveError::from)?;
-        for j in 0..m {
-            let eps = 1.0e-8_f64.max(1.0e-8 * x[j].abs());
-            let mut probe_x = Vec::new();
-            reserve_runtime_vec_capacity(&mut probe_x, x.len(), "Newton probe")?;
-            probe_x.extend(x);
-            probe_x[j] += eps;
-            let f_probe = self.refresh_newton_sweep(rows, &probe_x, t, solver_y, params)?;
-            for i in 0..m {
-                let df = (f_probe[i] - f_base[i]) / eps;
-                augmented.set(i, j, f64::from(i == j) - df);
-            }
-        }
-        for (i, value) in residual.iter().enumerate() {
-            augmented.set(i, m, -*value);
-        }
-        Ok(augmented)
-    }
-
-    fn refresh_newton_failure(&self, rows: &[AlgebraicRefreshRow]) -> RuntimeSolveError {
-        let _ = rows;
-        tracing::debug!(target: "rumoca_eval_solve::refresh", "newton fallback FAILED");
-        self.refresh_convergence_error(
-            0,
-            &RefreshIterationMax {
-                delta: f64::INFINITY,
-                target: None,
-            },
-        )
-    }
-
-    fn refresh_slots_iteration(
-        &self,
-        rows: &[AlgebraicRefreshRow],
-        t: f64,
-        solver_y: &mut [f64],
-        params: &[f64],
-    ) -> Result<RefreshIterationMax, RuntimeSolveError> {
-        let mut max_delta: f64 = 0.0;
-        let mut max_target = None;
-        for refresh_row in rows {
-            let row_idx = refresh_row.row_idx;
-            let index = refresh_row.target_index;
-            let value = self.eval_refresh_row(refresh_row, t, solver_y, params)?;
-            let delta = (solver_y[index] - value).abs();
-            if delta > max_delta {
-                max_delta = delta;
-                max_target = Some((index, row_idx, value));
-            }
-            solver_y[index] = value;
-        }
-        Ok(RefreshIterationMax {
-            delta: max_delta,
-            target: max_target,
-        })
     }
 
     fn eval_refresh_row(
@@ -561,14 +513,24 @@ impl SolveRuntime {
             .get(index)
             .cloned()
             .unwrap_or_else(|| format!("y[{index}]"));
-        let span = self
-            .model
-            .variable_meta
-            .iter()
-            .find(|meta| meta.name == name)
-            .map(|meta| meta.source_span);
+        let span = self.solver_source_span(index);
         let kind = if value.is_nan() { "NaN" } else { "inf" };
         RuntimeSolveError::NonFiniteValue { name, kind, span }
+    }
+
+    fn solver_source_span(&self, index: usize) -> Option<rumoca_core::Span> {
+        let name = self
+            .model
+            .problem
+            .solve_layout
+            .solver_maps
+            .names
+            .get(index)?;
+        self.model
+            .variable_meta
+            .iter()
+            .find(|meta| &meta.name == name)
+            .map(|meta| meta.source_span)
     }
 
     fn eval_refresh_row_value(
@@ -599,34 +561,10 @@ impl SolveRuntime {
             return Ok(value);
         }
         let residual = self.refresh_row_residual(row, t, solver_y, params)?;
-        if let Some(value) = self.solve_refresh_residual_row(row, residual, t, solver_y, params)? {
-            return Ok(value);
-        }
-        for candidate in &row.alternatives {
-            if candidate.row_idx == row.row_idx && candidate.output_offset == row.output_offset {
-                continue;
-            }
-            let candidate_row = AlgebraicRefreshRow {
-                row_idx: candidate.row_idx,
-                output_offset: candidate.output_offset,
-                target_index: row.target_index,
-                assignment_target: candidate.assignment_target,
-                alternatives: Vec::new(),
-            };
-            let residual = self.refresh_row_residual(&candidate_row, t, solver_y, params)?;
-            if let Some(value) =
-                self.solve_refresh_residual_row(&candidate_row, residual, t, solver_y, params)?
-            {
-                return Ok(value);
-            }
-        }
-        Err(self.refresh_row_independent_error(row))
+        self.solve_refresh_residual_row(row, residual, t, solver_y, params)
     }
 
-    /// Residual of a refresh row at the current point. Rows lowered with an
-    /// assignment shape evaluate the residual directly; shapeless rows with an
-    /// implicit target evaluate the target value, so the residual is
-    /// `value - current_target`.
+    /// Evaluate one scalar view of the canonical implicit residual system.
     fn refresh_row_residual(
         &self,
         row: &AlgebraicRefreshRow,
@@ -634,8 +572,7 @@ impl SolveRuntime {
         solver_y: &[f64],
         params: &[f64],
     ) -> Result<f64, RuntimeSolveError> {
-        let raw = self
-            .implicit_scalar_rhs
+        self.implicit_scalar_rhs
             .eval_row_output_unchecked_with_context(
                 row.row_idx,
                 row.output_offset,
@@ -643,26 +580,8 @@ impl SolveRuntime {
                 params,
                 t,
                 self.row_eval_context(),
-            )?;
-        match row.assignment_target {
-            // `raw - current_target` is only valid when the row evaluates to the
-            // target's *value* (an expression in the other unknowns). A row that
-            // reads its own target is already a residual in it — e.g. a flow-sum
-            // `... + own + ... = 0` whose `raw` is affine in `own` with a +1
-            // coefficient. Subtracting `own` there cancels that dependence and
-            // leaves a residual with zero slope, so the linear solve reports the
-            // target as undeterminable. Use the bare residual in that case (same
-            // as assignment-shape rows), which Newton-solves correctly.
-            Some(own)
-                if !self
-                    .implicit_scalar_rhs
-                    .row_has_assignment_shape(row.row_idx)
-                    && !self.implicit_scalar_rhs.row_reads_y(row.row_idx, own) =>
-            {
-                Ok(raw - solver_y[own])
-            }
-            _ => Ok(raw),
-        }
+            )
+            .map_err(Into::into)
     }
 
     fn solve_refresh_residual_row(
@@ -672,7 +591,7 @@ impl SolveRuntime {
         t: f64,
         solver_y: &[f64],
         params: &[f64],
-    ) -> Result<Option<f64>, RuntimeSolveError> {
+    ) -> Result<f64, RuntimeSolveError> {
         let index = row.target_index;
         let current = solver_y[index];
         let mut probe_y = self.refresh_probe_scratch.borrow_mut();
@@ -683,70 +602,17 @@ impl SolveRuntime {
         let probe_residual = self.refresh_row_residual(row, t, &probe_y, params)?;
         let slope = probe_residual - residual;
         if slope.is_finite() && slope.abs() > 1.0e-12 {
-            return Ok(Some(current - residual / slope));
+            return Ok(current - residual / slope);
         }
-        Ok(None)
-    }
-
-    fn refresh_row_independent_error(&self, row: &AlgebraicRefreshRow) -> RuntimeSolveError {
         // A residual that does not respond to the paired variable means the
         // refresh plan paired this row with a variable it cannot determine.
         // Nudging the value by the residual (the old fallback) converges to a
         // wrong but stable solution; fail loudly instead.
-        RuntimeSolveError::UnsupportedModel {
-            reason: format!(
-                "algebraic refresh row {} cannot be solved for '{}': the residual does not depend on it",
-                row.row_idx,
-                self.solver_name(row.target_index)
-            ),
-        }
-    }
-
-    fn trace_refresh_iteration(&self, iter_idx: usize, max: &RefreshIterationMax) {
-        // `tracing::debug!` self-gates; the only off-path work is a name lookup.
-        if let Some((index, row_idx, value)) = max.target {
-            let name = self
-                .model
-                .problem
-                .solve_layout
-                .solver_maps
-                .names
-                .get(index)
-                .map_or("<unnamed>", String::as_str);
-            tracing::debug!(
-                target: "rumoca_eval_solve::refresh",
-                "refresh iter {iter_idx}: max_delta={:.6e} target={name} y[{index}] row={row_idx} value={value:.6e}",
-                max.delta
-            );
-        } else {
-            tracing::debug!(target: "rumoca_eval_solve::refresh", "refresh iter {iter_idx}: no targeted algebraics");
-        }
-    }
-
-    fn refresh_convergence_error(
-        &self,
-        max_iters: usize,
-        max: &RefreshIterationMax,
-    ) -> RuntimeSolveError {
-        RuntimeSolveError::UnsupportedModel {
-            reason: match max.target {
-                Some((index, row_idx, _)) => {
-                    let name = self
-                        .model
-                        .problem
-                        .solve_layout
-                        .solver_maps
-                        .names
-                        .get(index)
-                        .map_or("<unnamed>", String::as_str);
-                    format!(
-                        "explicit algebraic/output Solve-IR rows did not converge after {max_iters} iterations; max_delta={:.6e} at {name} from row {row_idx}",
-                        max.delta
-                    )
-                }
-                None => "explicit algebraic/output Solve-IR rows did not converge".to_string(),
-            },
-        }
+        Err(RuntimeSolveError::RefreshTargetUnassignable {
+            row: row.row_idx,
+            target: self.solver_name(index).to_string(),
+            span: self.solver_source_span(index),
+        })
     }
 
     fn refresh_slots_once(
@@ -757,8 +623,7 @@ impl SolveRuntime {
         params: &[f64],
     ) -> Result<(), RuntimeSolveError> {
         if self.can_batch_assignment_refresh(plan) {
-            return self
-                .implicit_scalar_rhs
+            self.implicit_scalar_rhs
                 .apply_target_assignment_rows_unchecked_with_context(
                     plan,
                     solver_y,
@@ -766,11 +631,19 @@ impl SolveRuntime {
                     t,
                     self.row_eval_context(),
                 )
-                .map_err(Into::into);
+                .map_err(RuntimeSolveError::from)?;
+            self.validate_refresh_values(plan, solver_y)?;
+            return Ok(());
         }
         let mut row_outputs = Vec::new();
         let mut row_pos = 0usize;
         while row_pos < plan.len() {
+            if let Some(next_pos) =
+                self.try_refresh_tensor_output_segment(plan, row_pos, t, solver_y, params)?
+            {
+                row_pos = next_pos;
+                continue;
+            }
             if let Some(next_pos) = self.try_refresh_shapeless_output_segment(
                 plan,
                 row_pos,
@@ -791,21 +664,18 @@ impl SolveRuntime {
         Ok(())
     }
 
-    fn missing_dependency_names(&self, dependencies: &[usize]) -> String {
-        dependencies
-            .iter()
-            .map(|index| {
-                self.model
-                    .problem
-                    .solve_layout
-                    .solver_maps
-                    .names
-                    .get(*index)
-                    .cloned()
-                    .unwrap_or_else(|| format!("y[{index}]"))
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+    fn validate_refresh_values(
+        &self,
+        plan: &[AlgebraicRefreshRow],
+        solver_y: &[f64],
+    ) -> Result<(), RuntimeSolveError> {
+        for row in plan {
+            let value = solver_y[row.target_index];
+            if !value.is_finite() {
+                return Err(self.non_finite_value_error(row.target_index, value));
+            }
+        }
+        Ok(())
     }
 
     pub fn eval_state_derivatives(
@@ -832,7 +702,8 @@ impl SolveRuntime {
     ) -> Result<(), RuntimeSolveError> {
         let mut scratch = self.derivative_scratch.borrow_mut();
         let solver_y = &mut scratch.solver_y;
-        self.eval_state_derivatives_with_solver_y(t, state, params, tol, max_iters, solver_y, out)
+        self.populate_solver_y_from_state(solver_y, state)?;
+        self.eval_state_derivatives_at_solver_y(t, params, tol, max_iters, solver_y, out)
     }
 
     pub fn eval_state_derivatives_with_guess(
@@ -840,7 +711,7 @@ impl SolveRuntime {
         t: f64,
         state: &[f64],
         params: &[f64],
-        guess: &mut Vec<f64>,
+        guess: &mut [f64],
         tol: f64,
         max_iters: usize,
     ) -> Result<Vec<f64>, RuntimeSolveError> {
@@ -865,18 +736,12 @@ impl SolveRuntime {
         t: f64,
         state: &[f64],
         params: &[f64],
-        guess: &mut Vec<f64>,
+        guess: &mut [f64],
         tol: f64,
         max_iters: usize,
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
-        if guess.len() != self.solver_count {
-            *guess = self.model.initial_y.clone();
-            guess.resize(self.solver_count, 0.0);
-        }
-        for (dst, src) in guess.iter_mut().zip(state.iter().copied()) {
-            *dst = src;
-        }
+        self.update_solver_y_guess_from_state(guess, state)?;
         self.refresh_derivative_dependencies(t, guess, params, tol, max_iters)?;
         self.eval_derivative_rhs_from_solver_y(t, guess, params, out)
     }
@@ -1407,7 +1272,9 @@ impl SolveRuntime {
                     &mut project_algebraics,
                 )?;
             }
-            changed |= self.update_relation_memory_from_solver_y(t, y, p, tol)?;
+            if root_relation_overrides.is_empty() {
+                changed |= self.update_relation_memory_from_solver_y(t, y, p, tol)?;
+            }
             changed |=
                 self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
             changed |= project_algebraics(y, p)?;
@@ -1456,108 +1323,6 @@ impl SolveRuntime {
         Err(RuntimeSolveError::solve_ir(format!(
             "event runtime assignments did not converge at t={t}"
         )))
-    }
-
-    fn settle_discrete_rows_for_pre_snapshot<P>(
-        &self,
-        snapshot: &DiscretePreSnapshot<'_>,
-        input: &mut DiscreteRowsSettleInput<'_>,
-        project_algebraics: &mut P,
-    ) -> Result<bool, RuntimeSolveError>
-    where
-        P: FnMut(&mut [f64], &mut [f64]) -> Result<bool, RuntimeSolveError>,
-    {
-        let mut changed_any = false;
-        for _ in 0..input.max_iters {
-            let mut pass_changed = self.apply_discrete_rows_for_pre_snapshot(
-                snapshot, input.y, input.p, input.t, input.tol, false,
-            )?;
-            pass_changed |= self.apply_runtime_assignments_until_stable(
-                input.y,
-                input.p,
-                input.t,
-                input.tol,
-                input.max_iters,
-            )?;
-            pass_changed |= project_algebraics(input.y, input.p)?;
-            pass_changed |= self.apply_runtime_assignments_until_stable(
-                input.y,
-                input.p,
-                input.t,
-                input.tol,
-                input.max_iters,
-            )?;
-            if !pass_changed {
-                return Ok(changed_any);
-            }
-            changed_any = true;
-        }
-        Err(RuntimeSolveError::solve_ir(format!(
-            "discrete event equations did not converge at t={}",
-            input.t
-        )))
-    }
-
-    fn apply_constant_discrete_rows_for_pre_snapshot(
-        &self,
-        snapshot: &DiscretePreSnapshot<'_>,
-        y: &mut [f64],
-        p: &mut [f64],
-        t: f64,
-        tol: f64,
-    ) -> Result<bool, RuntimeSolveError> {
-        self.apply_discrete_rows_for_pre_snapshot(snapshot, y, p, t, tol, true)
-    }
-
-    fn apply_discrete_rows_for_pre_snapshot(
-        &self,
-        snapshot: &DiscretePreSnapshot<'_>,
-        y: &mut [f64],
-        p: &mut [f64],
-        t: f64,
-        tol: f64,
-        skip_solver_or_time_rows: bool,
-    ) -> Result<bool, RuntimeSolveError> {
-        let eval_y = copy_runtime_values(y, "discrete row eval y snapshot")?;
-        let eval_p = copy_runtime_values(p, "discrete row eval p snapshot")?;
-        let sources = snapshot.event_pre_sources();
-        let mut eval_p_cache = EventEvalParamCache::default();
-        let mut row_values = Vec::new();
-        reserve_runtime_vec_capacity(
-            &mut row_values,
-            self.model.problem.discrete.rhs.programs.len(),
-            "discrete row values",
-        )?;
-        for (row_idx, row) in self.model.problem.discrete.rhs.programs.iter().enumerate() {
-            if skip_solver_or_time_rows && row_reads_solver_or_time(row) {
-                continue;
-            }
-            let row_pre_mode = discrete_row_pre_mode(&self.model, row_idx);
-            if !snapshot.row_filter.accepts(row_pre_mode) {
-                continue;
-            }
-            let row_p = eval_p_cache.params(&self.model, &eval_p, row_pre_mode, &sources, tol);
-            let row_p_with_root_overrides;
-            let row_p = if snapshot.root_relation_overrides.is_empty() {
-                row_p
-            } else {
-                row_p_with_root_overrides = event_eval_params_with_relation_overrides(
-                    &self.model.problem.events.root_relation_memory_targets,
-                    snapshot.root_relation_overrides,
-                    row_p,
-                )?;
-                &row_p_with_root_overrides
-            };
-            let value =
-                solve_eval::eval_row_with_context(row, &eval_y, row_p, t, self.row_eval_context())?;
-            row_values.push((self.model.problem.discrete.update_targets[row_idx], value));
-        }
-        self.override_relation_memory_row_values(snapshot.root_relation_overrides, &mut row_values);
-        let mut changed = false;
-        for (target, value) in row_values {
-            changed |= solve_eval::apply_scalar_slot_value(target, value, y, p, tol)?;
-        }
-        Ok(changed)
     }
 
     fn override_relation_memory_row_values(
@@ -1849,20 +1614,33 @@ impl SolveRuntime {
         Ok(())
     }
 
-    // SPEC_0021: Exception - private derivative helper shares the public solver
-    // callback shape while threading caller-owned scratch/output buffers.
-    #[allow(clippy::too_many_arguments)]
-    fn eval_state_derivatives_with_solver_y(
+    fn update_solver_y_guess_from_state(
+        &self,
+        solver_y: &mut [f64],
+        state: &[f64],
+    ) -> Result<(), RuntimeSolveError> {
+        if solver_y.len() != self.solver_count {
+            return Err(RuntimeSolveError::solve_ir(format!(
+                "algebraic warm-start length mismatch: expected {}, got {}",
+                self.solver_count,
+                solver_y.len()
+            )));
+        }
+        for (dst, src) in solver_y.iter_mut().zip(state.iter().copied()) {
+            *dst = src;
+        }
+        Ok(())
+    }
+
+    fn eval_state_derivatives_at_solver_y(
         &self,
         t: f64,
-        state: &[f64],
         params: &[f64],
         tol: f64,
         max_iters: usize,
-        solver_y: &mut Vec<f64>,
+        solver_y: &mut [f64],
         out: &mut [f64],
     ) -> Result<(), RuntimeSolveError> {
-        self.populate_solver_y_from_state(solver_y, state)?;
         self.refresh_derivative_dependencies(t, solver_y, params, tol, max_iters)?;
         // `eval_derivative_rhs_from_solver_y` fills `out` and *then* rejects
         // non-finite derivatives, so trace before propagating: on failure `out`
@@ -1901,6 +1679,22 @@ impl SolveRuntime {
     }
 }
 
+fn restore_after_causal_seed_error(
+    error: RuntimeSolveError,
+    solver_y: &mut [f64],
+    incoming: &[f64],
+) -> Result<(), RuntimeSolveError> {
+    solver_y.copy_from_slice(incoming);
+    if !seed_error_allows_projection(&error) {
+        return Err(error);
+    }
+    tracing::debug!(
+        target: "rumoca_eval_solve::refresh",
+        "causal algebraic seed was unavailable; projecting the preserved residual system: {error}"
+    );
+    Ok(())
+}
+
 #[derive(Clone, Default)]
 struct StateDerivativeScratch {
     /// Full solver vector reconstructed from the state slots, reused across
@@ -1935,10 +1729,8 @@ pub struct AlgebraicLinearization<'a> {
     pub settle: AlgebraicSettle,
 }
 
-/// Diagonal magnitude below which a residual row is treated as not constraining
-/// its own target slot (a structural zero on the seed diagonal).
-const SEED_DIAGONAL_EPS: f64 = 1.0e-12;
-
+/// Diagonal magnitude below which a seed residual row is treated as singular for
+/// its paired target slot, matching the value refresh's residual-slope check.
 fn validate_derivative_output_len(
     out: &[f64],
     state_count: usize,

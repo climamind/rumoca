@@ -1,5 +1,7 @@
 use super::*;
-use rumoca_core::{ClassType, Literal, Span, VarName};
+use rumoca_core::{ClassType, ComponentRefPart, ComponentReference, DefId, Literal, Span, VarName};
+
+const RECORD_DEF_ID: DefId = DefId(8101);
 
 fn test_span(start: usize) -> Span {
     Span::from_offsets(
@@ -29,6 +31,7 @@ fn structured_var_ref(name: &str, span: Span) -> rumoca_core::Expression {
 
 fn record_constructor() -> rumoca_core::Function {
     let mut constructor = rumoca_core::Function::new("Pkg.Record", test_span(1));
+    constructor.def_id = Some(RECORD_DEF_ID);
     constructor.is_constructor = true;
     constructor.add_input(rumoca_core::FunctionParam::new("a", "Real", test_span(1)));
     constructor.add_input(rumoca_core::FunctionParam::new("b", "Real", test_span(1)));
@@ -39,7 +42,8 @@ fn function_with_record_input() -> rumoca_core::Function {
     let mut function = rumoca_core::Function::new("Pkg.f", test_span(1));
     function.add_input(
         rumoca_core::FunctionParam::new("r", "Pkg.Record", test_span(1))
-            .with_type_class(ClassType::Record),
+            .with_type_class(ClassType::Record)
+            .with_type_def_id(RECORD_DEF_ID),
     );
     function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span(1)));
     function
@@ -312,7 +316,71 @@ fn insert_array_size_args_rejects_unspanned_generated_size_call() {
 }
 
 #[test]
-fn dae_record_param_lowering_leaves_unknown_record_metadata_unexpanded() {
+fn insert_array_size_args_handles_projected_function_calls() {
+    let span = test_span(13);
+    let function_id = DefId::new(42);
+    let mut dae = Dae::default();
+    let mut function = function_with_array_input();
+    function.def_id = Some(function_id);
+    function.outputs[0].dims = vec![2];
+    dae.symbols
+        .functions
+        .insert(VarName::new("Pkg.g"), function);
+    dae.continuous.equations.push(rumoca_ir_dae::Equation {
+        lhs: Some(VarName::new("x").into()),
+        rhs: rumoca_core::Expression::FunctionCall {
+            name: rumoca_core::Reference::with_component_reference(
+                "Pkg.g.y[1]",
+                ComponentReference {
+                    local: false,
+                    span,
+                    parts: vec![
+                        ComponentRefPart {
+                            ident: "Pkg".to_string(),
+                            span,
+                            subs: Vec::new(),
+                        },
+                        ComponentRefPart {
+                            ident: "g".to_string(),
+                            span,
+                            subs: Vec::new(),
+                        },
+                        ComponentRefPart {
+                            ident: "y".to_string(),
+                            span,
+                            subs: vec![rumoca_core::Subscript::index(1, span)],
+                        },
+                    ],
+                    def_id: Some(function_id),
+                },
+            ),
+            args: vec![var_ref("u", span)],
+            is_constructor: false,
+            span,
+        },
+        span,
+        origin: "test".to_string(),
+        scalar_count: 1,
+    });
+
+    insert_array_size_args_dae(&mut dae).expect("projected call should use base function ABI");
+
+    let rumoca_core::Expression::FunctionCall { args, .. } = &dae.continuous.equations[0].rhs
+    else {
+        panic!("expected function call");
+    };
+    assert_eq!(args.len(), 2);
+    assert!(matches!(
+        &args[1],
+        rumoca_core::Expression::BuiltinCall {
+            function: rumoca_core::BuiltinFunction::Size,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn dae_record_param_lowering_rejects_unknown_record_metadata() {
     let mut dae = Dae::default();
     dae.symbols
         .functions
@@ -333,19 +401,9 @@ fn dae_record_param_lowering_leaves_unknown_record_metadata_unexpanded() {
         scalar_count: 1,
     });
 
-    lower_record_function_params_dae(&mut dae).expect("unknown metadata should not rewrite calls");
-
-    let function = dae
-        .symbols
-        .functions
-        .get(&VarName::new("Pkg.f"))
-        .expect("function remains");
-    assert_eq!(function.inputs.len(), 1);
-    let rumoca_core::Expression::FunctionCall { args, .. } = &dae.continuous.equations[0].rhs
-    else {
-        panic!("expected function call");
-    };
-    assert_eq!(args.len(), 1);
+    let err = lower_record_function_params_dae(&mut dae)
+        .expect_err("unknown constructor metadata must be rejected");
+    assert!(matches!(err, ToDaeError::RuntimeContractViolation { .. }));
 }
 
 #[test]

@@ -66,7 +66,7 @@ pub(super) fn apply_substitutions_to_remaining_once(
         }
         let original_lhs = eq.lhs.clone();
         let original_rhs = eq.rhs.clone();
-        let rhs = apply_substitutions_in_order_with_derivatives_and_dae(
+        let rhs = apply_substitutions_in_order_with_derivatives(
             &eq.rhs,
             substitutions,
             &derivative_source,
@@ -159,6 +159,9 @@ fn simplify_after_substitution(expr: Expression, dae_context: &Dae) -> Expressio
                     }
                 }
                 OpBinary::Sub => {
+                    if lhs == rhs && identity_operand_is_total(&lhs) {
+                        return zero_literal(span);
+                    }
                     if is_numeric_zero(&rhs) {
                         return lhs;
                     }
@@ -263,6 +266,21 @@ fn simplify_subscript_after_substitution(
             }
         }
         other => other,
+    }
+}
+
+fn identity_operand_is_total(expr: &Expression) -> bool {
+    match expr {
+        Expression::Literal { .. } | Expression::VarRef { .. } => true,
+        Expression::Unary { op, rhs, .. } => {
+            matches!(op, OpUnary::Plus | OpUnary::Minus) && identity_operand_is_total(rhs)
+        }
+        Expression::Binary { op, lhs, rhs, .. } => {
+            matches!(op, OpBinary::Add | OpBinary::Sub)
+                && identity_operand_is_total(lhs)
+                && identity_operand_is_total(rhs)
+        }
+        _ => false,
     }
 }
 
@@ -478,5 +496,80 @@ fn subtraction(lhs: Expression, rhs: Expression, span: rumoca_core::Span) -> Exp
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
         span,
+    }
+}
+
+pub(super) fn simplify_arithmetic_identities(expr: Expression) -> Expression {
+    match expr {
+        Expression::Binary { op, lhs, rhs, span } => {
+            let lhs = simplify_arithmetic_identities(*lhs);
+            let rhs = simplify_arithmetic_identities(*rhs);
+            match op {
+                OpBinary::Add => {
+                    if is_numeric_zero(&lhs) {
+                        return rhs;
+                    }
+                    if is_numeric_zero(&rhs) {
+                        return lhs;
+                    }
+                }
+                OpBinary::Sub => {
+                    if lhs == rhs && identity_operand_is_total(&lhs) {
+                        return zero_literal(span);
+                    }
+                    if is_numeric_zero(&rhs) {
+                        return lhs;
+                    }
+                    if is_numeric_zero(&lhs) {
+                        return negate(rhs, span);
+                    }
+                }
+                OpBinary::Mul => {
+                    if is_numeric_zero(&lhs) || is_numeric_zero(&rhs) {
+                        return zero_literal(span);
+                    }
+                    if is_numeric_one(&lhs) {
+                        return rhs;
+                    }
+                    if is_numeric_one(&rhs) {
+                        return lhs;
+                    }
+                }
+                OpBinary::Div if is_numeric_one(&rhs) => {
+                    return lhs;
+                }
+                _ => {}
+            }
+            Expression::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            }
+        }
+        Expression::Unary { op, rhs, span } => {
+            let inner = simplify_arithmetic_identities(*rhs);
+            if matches!(op, OpUnary::Minus) {
+                // -(-x) → x
+                if let Expression::Unary {
+                    op: OpUnary::Minus,
+                    rhs: inner_inner,
+                    ..
+                } = inner
+                {
+                    return *inner_inner;
+                }
+                // -0 → 0
+                if is_numeric_zero(&inner) {
+                    return inner;
+                }
+            }
+            Expression::Unary {
+                op,
+                rhs: Box::new(inner),
+                span,
+            }
+        }
+        _ => expr,
     }
 }

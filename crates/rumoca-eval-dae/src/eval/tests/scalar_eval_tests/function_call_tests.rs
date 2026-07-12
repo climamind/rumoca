@@ -536,7 +536,7 @@ fn test_eval_user_function_binds_record_input_fields_from_constructor_argument()
 }
 
 #[test]
-fn test_eval_user_function_binds_omitted_record_constructor_fields_from_start_exprs() {
+fn test_eval_user_function_binds_omitted_record_constructor_fields_from_metadata() {
     let mut env = VarEnv::<f64>::new();
     let mut funcs = IndexMap::new();
     let mut f = rumoca_core::Function::new("Pkg.brushVoltageDrop", rumoca_core::Span::DUMMY);
@@ -569,12 +569,19 @@ fn test_eval_user_function_binds_omitted_record_constructor_fields_from_start_ex
         span: rumoca_core::Span::DUMMY,
     }];
     funcs.insert("Pkg.brushVoltageDrop".to_string(), f);
+    let mut constructor =
+        rumoca_core::Function::new("Pkg.BrushParameters", rumoca_core::Span::DUMMY);
+    constructor.is_constructor = true;
+    constructor.add_input(
+        rumoca_core::FunctionParam::new("V", "Real", rumoca_core::Span::DUMMY)
+            .with_default(lit(0.5)),
+    );
+    constructor.add_input(
+        rumoca_core::FunctionParam::new("ILinear", "Real", rumoca_core::Span::DUMMY)
+            .with_default(lit(0.0)),
+    );
+    funcs.insert("Pkg.BrushParameters".to_string(), constructor);
     env.functions = Arc::new(funcs);
-
-    let mut starts = IndexMap::new();
-    starts.insert("dcpm.brushParameters.V".to_string(), lit(0.5));
-    starts.insert("dcpm.brushParameters.ILinear".to_string(), lit(1.0));
-    env.start_exprs = Arc::new(starts);
 
     let brush_parameters = rumoca_core::Expression::FunctionCall {
         name: rumoca_core::Reference::new("Pkg.BrushParameters"),
@@ -593,6 +600,7 @@ fn test_eval_user_function_binds_record_input_fields_from_record_function_output
     let mut funcs = IndexMap::new();
 
     let mut state = rumoca_core::Function::new("Pkg.State", rumoca_core::Span::DUMMY);
+    state.def_id = Some(rumoca_core::DefId::new(300));
     state.is_constructor = true;
     state.add_input(rumoca_core::FunctionParam::new(
         "p",
@@ -613,7 +621,8 @@ fn test_eval_user_function_binds_record_input_fields_from_record_function_output
             "State",
             rumoca_core::Span::source_free_serde_default(),
         )
-        .with_type_class(rumoca_core::ClassType::Record),
+        .with_type_class(rumoca_core::ClassType::Record)
+        .with_type_def_id(rumoca_core::DefId::new(300)),
     );
     make_state.body = vec![rumoca_core::Statement::Assignment {
         comp: comp_ref("out"),
@@ -637,7 +646,8 @@ fn test_eval_user_function_binds_record_input_fields_from_record_function_output
             "State",
             rumoca_core::Span::source_free_serde_default(),
         )
-        .with_type_class(rumoca_core::ClassType::Record),
+        .with_type_class(rumoca_core::ClassType::Record)
+        .with_type_def_id(rumoca_core::DefId::new(300)),
     );
     metric.add_output(
         rumoca_core::FunctionParam::new(
@@ -701,6 +711,7 @@ fn test_eval_function_record_field_array_uses_first_element_in_scalar_context() 
     let mut funcs = IndexMap::new();
 
     let mut state = rumoca_core::Function::new("Pkg.State", rumoca_core::Span::DUMMY);
+    state.def_id = Some(rumoca_core::DefId::new(301));
     state.is_constructor = true;
     state.add_input(rumoca_core::FunctionParam::new(
         "p",
@@ -724,7 +735,8 @@ fn test_eval_function_record_field_array_uses_first_element_in_scalar_context() 
             "State",
             rumoca_core::Span::source_free_serde_default(),
         )
-        .with_type_class(rumoca_core::ClassType::Record),
+        .with_type_class(rumoca_core::ClassType::Record)
+        .with_type_def_id(rumoca_core::DefId::new(301)),
     );
     make_state.body = vec![rumoca_core::Statement::Assignment {
         comp: comp_ref("out"),
@@ -984,4 +996,42 @@ fn test_runtime_special_function_precedence_over_user_body() {
     };
 
     assert_eq!(eval_expr_value::<f64>(&expr, &env), 1.0);
+}
+
+#[test]
+fn test_resolved_modelica_body_precedes_string_intrinsic_short_name() {
+    let mut env = VarEnv::<f64>::new();
+    let mut function = rumoca_core::Function::new("Pkg.vectorNorm", rumoca_core::Span::DUMMY);
+    set_test_function_instance(&mut function, 42);
+    function.add_input(
+        rumoca_core::FunctionParam::new("v", "Real", rumoca_core::Span::DUMMY)
+            .with_dims(vec![0])
+            .with_shape_expr(vec![rumoca_core::Subscript::Colon {
+                span: rumoca_core::Span::DUMMY,
+            }]),
+    );
+    function.add_output(rumoca_core::FunctionParam::new(
+        "result",
+        "Real",
+        rumoca_core::Span::DUMMY,
+    ));
+    function.body = vec![rumoca_core::Statement::Assignment {
+        comp: comp_ref("result"),
+        value: builtin(
+            rumoca_core::BuiltinFunction::Sqrt,
+            vec![binop(rumoca_core::OpBinary::Mul, var("v"), var("v"))],
+        ),
+        span: rumoca_core::Span::DUMMY,
+    }];
+    env.functions = Arc::new(IndexMap::from([("Pkg.vectorNorm".to_string(), function)]));
+
+    let call = resolved_fn_call(
+        "length",
+        "length",
+        42,
+        vec![arr(vec![lit(3.0), lit(4.0)], false)],
+    );
+
+    assert_eq!(eval_expr::<f64>(&call, &env), Ok(5.0));
+    assert_eq!(eval_array_values::<f64>(&call, &env), Ok(vec![5.0]));
 }

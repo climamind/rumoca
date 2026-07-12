@@ -683,6 +683,13 @@ pub(super) fn binding_base_key(expr: &rumoca_core::Expression) -> Result<String,
         rumoca_core::Expression::FieldAccess { base, field, .. } => {
             field_access_binding_key(base, field)
         }
+        rumoca_core::Expression::FunctionCall { name, .. } => Err(unsupported_at(
+            format!(
+                "function call `{}` cannot be used directly as a binding path",
+                name.as_str()
+            ),
+            required_index_expr_span(expr, "binding path expression")?,
+        )),
         _ => Err(unsupported_at(
             format!(
                 "unsupported base expression for binding path: {}",
@@ -1274,6 +1281,22 @@ fn literal_array_shape(expr: &rumoca_core::Expression) -> Option<Vec<usize>> {
 pub(super) struct AssignmentTarget {
     pub base: String,
     pub indices: Option<Vec<usize>>,
+}
+
+pub(super) fn component_reference_has_slice_subscript(
+    comp: &rumoca_core::ComponentReference,
+) -> bool {
+    comp.parts
+        .iter()
+        .flat_map(|part| &part.subs)
+        .any(|subscript| {
+            matches!(subscript, rumoca_core::Subscript::Colon { .. })
+                || matches!(
+                    subscript,
+                    rumoca_core::Subscript::Expr { expr, .. }
+                        if matches!(expr.as_ref(), rumoca_core::Expression::Range { .. })
+                )
+        })
 }
 
 pub(super) fn assignment_target(

@@ -256,7 +256,7 @@ fn collect_one_based_index_tuples(
     }
 }
 
-pub(super) fn index_choice_tuples(
+pub(in crate::lower) fn index_choice_tuples(
     choices: &[Vec<usize>],
     span: rumoca_core::Span,
 ) -> Result<Vec<Vec<usize>>, LowerError> {
@@ -329,6 +329,16 @@ pub(super) fn inferred_subscripted_dims(
         dims.push(dim);
     }
     Ok(dims)
+}
+
+pub(super) fn subscript_preserves_array_rank(subscript: &rumoca_core::Subscript) -> bool {
+    match subscript {
+        rumoca_core::Subscript::Colon { .. } => true,
+        rumoca_core::Subscript::Expr { expr, .. } => {
+            matches!(expr.as_ref(), rumoca_core::Expression::Range { .. })
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn infer_array_literal_dims(

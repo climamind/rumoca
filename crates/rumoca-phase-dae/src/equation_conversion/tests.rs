@@ -36,8 +36,17 @@ fn residual(lhs: rumoca_core::Expression, rhs: rumoca_core::Expression) -> rumoc
 }
 
 fn call(name: &str) -> rumoca_core::Expression {
+    let component_ref = rumoca_core::component_reference_from_flat_name(
+        &rumoca_core::VarName::new(name),
+        fixture_span(),
+    )
+    .expect("structured function reference");
     rumoca_core::Expression::FunctionCall {
-        name: rumoca_core::VarName::new(name).into(),
+        name: rumoca_core::Reference::from_component_reference(component_ref)
+            .with_resolved_function(rumoca_core::ResolvedFunctionReference {
+                instance_id: rumoca_core::FunctionInstanceId::new(1),
+                base_part_count: rumoca_core::VarName::new(name).segments().len(),
+            }),
         args: Vec::new(),
         is_constructor: false,
         span: fixture_span(),
@@ -161,6 +170,7 @@ fn primitive_variable_with_parts(
 
 fn add_pair_constructor(flat_model: &mut flat::Model) {
     let mut constructor = rumoca_core::Function::new("PairRecord", fixture_span());
+    constructor.def_id = Some(rumoca_core::DefId::new(100));
     constructor.is_constructor = true;
     constructor.add_input(
         rumoca_core::FunctionParam::new("alpha", "Real", fixture_span())
@@ -170,17 +180,88 @@ fn add_pair_constructor(flat_model: &mut flat::Model) {
         rumoca_core::FunctionParam::new("beta", "Real", fixture_span())
             .with_def_id(rumoca_core::DefId::new(102)),
     );
-    flat_model
-        .functions
-        .insert(constructor.name.clone(), constructor);
+    flat_model.add_function(constructor);
 }
 
 fn add_pair_record_function(flat_model: &mut flat::Model, name: &str) {
     let mut function = rumoca_core::Function::new(name, fixture_span());
     let mut output = rumoca_core::FunctionParam::new("y", "PairRecord", fixture_span());
     output.type_class = Some(rumoca_core::ClassType::Record);
+    output.type_def_id = Some(rumoca_core::DefId::new(100));
     function.add_output(output);
-    flat_model.functions.insert(function.name.clone(), function);
+    flat_model.add_function(function);
+}
+
+fn record_reference_equation_fixture() -> (flat::Model, flat::Equation) {
+    let mut flat_model = flat::Model::new();
+    let record_type = rumoca_core::TypeId::new(20);
+    let record_def = rumoca_core::DefId::new(10);
+    flat_model.record_types.insert(
+        record_def,
+        flat::RecordType {
+            name: "Frames.Orientation".to_string(),
+            fields: vec![
+                flat::RecordField {
+                    name: "T".to_string(),
+                    def_id: rumoca_core::DefId::new(11),
+                    dims: vec![3, 3],
+                },
+                flat::RecordField {
+                    name: "w".to_string(),
+                    def_id: rumoca_core::DefId::new(12),
+                    dims: vec![3],
+                },
+            ],
+        },
+    );
+    for (owner, owner_root, actual_defs) in [
+        ("a.R", "a", [111_u32, 112_u32]),
+        ("b.R", "b", [211_u32, 212_u32]),
+    ] {
+        let owner_def = rumoca_core::DefId::new(actual_defs[0] - 1);
+        flat_model.record_instances.insert(
+            rumoca_core::VarName::new(owner),
+            flat::RecordInstance {
+                component_ref: component_ref_with_def_id(
+                    vec![(owner_root, vec![]), ("R", vec![])],
+                    Some(owner_def),
+                ),
+                source_span: fixture_span(),
+                canonical_type_id: record_type,
+                type_name: "Frames.Orientation".to_string(),
+                type_def_id: record_def,
+                dims: Vec::new(),
+            },
+        );
+        for (field, dims, actual, declared) in [
+            ("T", vec![3, 3], actual_defs[0], 11_u32),
+            ("w", vec![3], actual_defs[1], 12_u32),
+        ] {
+            let actual = rumoca_core::DefId::new(actual);
+            let variable = primitive_variable_with_dims_and_parts(
+                &format!("{owner}.{field}"),
+                dims,
+                vec![(owner_root, vec![]), ("R", vec![]), (field, vec![])],
+                actual,
+            );
+            flat_model.variables.insert(variable.name.clone(), variable);
+            flat_model
+                .symbol_ancestry
+                .insert(actual, vec![rumoca_core::DefId::new(declared)].into());
+        }
+    }
+
+    let equation = flat::Equation::new(
+        residual(
+            var_ref_with_parts("a.R", vec![("a", vec![]), ("R", vec![])]),
+            var_ref_with_parts("b.R", vec![("b", vec![]), ("R", vec![])]),
+        ),
+        fixture_span(),
+        flat::EquationOrigin::ComponentEquation {
+            component: "body".to_string(),
+        },
+    );
+    (flat_model, equation)
 }
 
 fn add_complex_constructor(flat_model: &mut flat::Model) {
@@ -295,6 +376,7 @@ fn test_record_function_equation_expands_to_declared_fields() {
     }
 
     let mut constructor = rumoca_core::Function::new("Frames.Orientation", fixture_span());
+    constructor.def_id = Some(rumoca_core::DefId::new(10));
     constructor.is_constructor = true;
     constructor.add_input(
         rumoca_core::FunctionParam::new("T", "Real", fixture_span())
@@ -306,17 +388,14 @@ fn test_record_function_equation_expands_to_declared_fields() {
             .with_dims(vec![3])
             .with_def_id(rumoca_core::DefId::new(12)),
     );
-    flat_model
-        .functions
-        .insert(constructor.name.clone(), constructor);
+    flat_model.add_function(constructor);
 
     let mut null_rotation = rumoca_core::Function::new("Frames.nullRotation", fixture_span());
     let mut output = rumoca_core::FunctionParam::new("R", "Orientation", fixture_span());
     output.type_class = Some(rumoca_core::ClassType::Record);
+    output.type_def_id = Some(rumoca_core::DefId::new(10));
     null_rotation.add_output(output);
-    flat_model
-        .functions
-        .insert(null_rotation.name.clone(), null_rotation);
+    flat_model.add_function(null_rotation);
 
     let equation = flat::Equation::new(
         residual(
@@ -338,6 +417,144 @@ fn test_record_function_equation_expands_to_declared_fields() {
     assert!(format!("{:?}", expanded[0].residual).contains("R.T"));
     assert!(format!("{:?}", expanded[0].residual).contains("FieldAccess"));
     assert!(format!("{:?}", expanded[1].residual).contains("R.w"));
+}
+
+#[test]
+fn test_record_reference_equation_expands_to_resolved_tensor_fields() {
+    let (flat_model, equation) = record_reference_equation_fixture();
+
+    let expanded = expand_record_field_equation(&equation, &flat_model)
+        .unwrap()
+        .expect("record reference equation should expand");
+
+    assert_eq!(expanded.len(), 2);
+    assert_eq!(expanded[0].scalar_count, 9);
+    assert_eq!(expanded[1].scalar_count, 3);
+    let matrix = format!("{:?}", expanded[0].residual);
+    assert!(matrix.contains("a.R.T"));
+    assert!(matrix.contains("b.R.T"));
+    assert!(!matrix.contains("FieldAccess"));
+    let vector = format!("{:?}", expanded[1].residual);
+    assert!(vector.contains("a.R.w"));
+    assert!(vector.contains("b.R.w"));
+    assert!(!vector.contains("FieldAccess"));
+}
+
+#[test]
+fn test_record_reference_equation_rejects_mismatched_resolved_types() {
+    let (mut flat_model, equation) = record_reference_equation_fixture();
+    flat_model
+        .record_instances
+        .get_mut(&rumoca_core::VarName::new("b.R"))
+        .expect("rhs record metadata")
+        .canonical_type_id = rumoca_core::TypeId::new(21);
+
+    let error = expand_record_field_equation(&equation, &flat_model)
+        .expect_err("record reference expansion requires compatible resolved types");
+
+    assert!(matches!(error, ToDaeError::RuntimeContractViolation { .. }));
+}
+
+#[test]
+fn test_record_function_equation_skips_zero_sized_fields() {
+    let mut flat_model = flat::Model::new();
+    let alpha = primitive_variable_with_parts(
+        "R.alpha",
+        vec![("R", vec![]), ("alpha", vec![])],
+        rumoca_core::DefId::new(101),
+    );
+    flat_model.variables.insert(alpha.name.clone(), alpha);
+
+    let mut constructor = rumoca_core::Function::new("MarkerRecord", fixture_span());
+    constructor.def_id = Some(rumoca_core::DefId::new(100));
+    constructor.is_constructor = true;
+    constructor.add_input(
+        rumoca_core::FunctionParam::new("alpha", "Real", fixture_span())
+            .with_def_id(rumoca_core::DefId::new(101)),
+    );
+    constructor.add_input(
+        rumoca_core::FunctionParam::new("interfaceMarker", "Real", fixture_span())
+            .with_dims(vec![0])
+            .with_def_id(rumoca_core::DefId::new(102)),
+    );
+    flat_model.add_function(constructor);
+
+    let mut function = rumoca_core::Function::new("markerIdentity", fixture_span());
+    let mut output = rumoca_core::FunctionParam::new("result", "MarkerRecord", fixture_span());
+    output.type_class = Some(rumoca_core::ClassType::Record);
+    output.type_def_id = Some(rumoca_core::DefId::new(100));
+    function.add_output(output);
+    flat_model.add_function(function);
+
+    let equation = flat::Equation::new(
+        residual(
+            var_ref_with_parts("R", vec![("R", vec![])]),
+            call("markerIdentity"),
+        ),
+        fixture_span(),
+        flat::EquationOrigin::ComponentEquation {
+            component: "body".to_string(),
+        },
+    );
+
+    let expanded = expand_record_field_equation(&equation, &flat_model)
+        .unwrap()
+        .expect("non-empty record fields should still expand");
+    assert_eq!(expanded.len(), 1);
+    assert!(format!("{:?}", expanded[0].residual).contains("R.alpha"));
+}
+
+#[test]
+fn test_record_function_equation_expands_nested_flattened_record_fields() {
+    let mut flat_model = flat::Model::new();
+    let q_def = rumoca_core::DefId::new(303);
+    let q = primitive_variable_with_dims_and_parts(
+        "R.rotation.q",
+        vec![4],
+        vec![("R", vec![]), ("rotation", vec![]), ("q", vec![])],
+        q_def,
+    );
+    flat_model.variables.insert(q.name.clone(), q);
+    flat_model
+        .symbol_ancestry
+        .insert(q_def, vec![rumoca_core::DefId::new(203)].into());
+
+    let mut constructor = rumoca_core::Function::new("PoseRecord", fixture_span());
+    constructor.def_id = Some(rumoca_core::DefId::new(200));
+    constructor.is_constructor = true;
+    constructor.add_input(
+        rumoca_core::FunctionParam::new("rotation_q", "Real", fixture_span())
+            .with_dims(vec![4])
+            .with_def_id(rumoca_core::DefId::new(203)),
+    );
+    flat_model.add_function(constructor);
+
+    let mut function = rumoca_core::Function::new("poseIdentity", fixture_span());
+    let mut output = rumoca_core::FunctionParam::new("result", "PoseRecord", fixture_span());
+    output.type_class = Some(rumoca_core::ClassType::Record);
+    output.type_def_id = Some(rumoca_core::DefId::new(200));
+    function.add_output(output);
+    flat_model.add_function(function);
+
+    let equation = flat::Equation::new(
+        residual(
+            var_ref_with_parts("R", vec![("R", vec![])]),
+            call("poseIdentity"),
+        ),
+        fixture_span(),
+        flat::EquationOrigin::ComponentEquation {
+            component: "body".to_string(),
+        },
+    );
+
+    let expanded = expand_record_field_equation(&equation, &flat_model)
+        .unwrap()
+        .expect("nested primitive record field should expand");
+    assert_eq!(expanded.len(), 1);
+    assert_eq!(expanded[0].scalar_count, 4);
+    let rendered = format!("{:?}", expanded[0].residual);
+    assert!(rendered.contains("rotation"));
+    assert!(rendered.contains("field: \"q\""));
 }
 
 #[test]
@@ -748,6 +965,7 @@ fn test_classify_record_function_equation_routes_expanded_fields() {
     }
 
     let mut constructor = rumoca_core::Function::new("Frames.Orientation", fixture_span());
+    constructor.def_id = Some(rumoca_core::DefId::new(10));
     constructor.is_constructor = true;
     constructor.add_input(
         rumoca_core::FunctionParam::new("T", "Real", fixture_span())
@@ -759,17 +977,14 @@ fn test_classify_record_function_equation_routes_expanded_fields() {
             .with_dims(vec![3])
             .with_def_id(rumoca_core::DefId::new(12)),
     );
-    flat_model
-        .functions
-        .insert(constructor.name.clone(), constructor);
+    flat_model.add_function(constructor);
 
     let mut null_rotation = rumoca_core::Function::new("Frames.nullRotation", fixture_span());
     let mut output = rumoca_core::FunctionParam::new("R", "Orientation", fixture_span());
     output.type_class = Some(rumoca_core::ClassType::Record);
+    output.type_def_id = Some(rumoca_core::DefId::new(10));
     null_rotation.add_output(output);
-    flat_model
-        .functions
-        .insert(null_rotation.name.clone(), null_rotation);
+    flat_model.add_function(null_rotation);
 
     flat_model.equations.push(flat::Equation::new(
         residual(

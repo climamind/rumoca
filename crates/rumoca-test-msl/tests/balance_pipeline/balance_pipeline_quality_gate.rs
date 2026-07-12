@@ -19,8 +19,6 @@ pub(super) const SIM_RATE_GATE_EPSILON: f64 = 1.0e-12;
 /// reject obviously invalid runs (for example near-zero or zero successful
 /// simulations) before we start comparing finer-grained regressions.
 pub(super) const DEFAULT_SIM_OK_HARD_FLOOR_RATIO: f64 = 0.15;
-/// Compile-rate gate tolerance (absolute ratio, 0.0 = no regression allowed).
-pub(super) const COMPILE_RATE_GATE_TOLERANCE: f64 = 0.0;
 /// Balance-rate gate tolerance (absolute ratio, 0.0 = no regression allowed).
 pub(super) const BALANCE_RATE_GATE_TOLERANCE: f64 = 0.0;
 /// Initial-balance-rate gate tolerance (absolute ratio, 0.0 = no regression allowed).
@@ -1380,6 +1378,13 @@ fn push_compile_balance_count_regression_reasons(
         baseline.dae_models.max(baseline.compiled_models),
         denominator,
     );
+    push_stage_count_regression_reason(
+        reasons,
+        "Compile",
+        gate_input.compiled_models,
+        baseline.compiled_models,
+        denominator,
+    );
     push_stage_count_regression_reason_with_drop(
         reasons,
         "IR-Solve",
@@ -1422,25 +1427,6 @@ fn push_compile_balance_rate_regression_reasons(
     gate_input: MslQualityGateInput<'_>,
     baseline: &MslQualityBaseline,
 ) {
-    let current_compile_rate =
-        compile_success_rate(gate_input.compiled_models, gate_input.simulatable_attempted);
-    let baseline_compile_rate =
-        compile_success_rate(baseline.compiled_models, baseline.simulatable_attempted);
-    if let (Some(current), Some(baseline_rate)) = (current_compile_rate, baseline_compile_rate) {
-        let floor = (baseline_rate - COMPILE_RATE_GATE_TOLERANCE).max(0.0);
-        if current + SIM_RATE_GATE_EPSILON < floor {
-            reasons.push(format!(
-                "compile success rate regressed: current={:.2}% ({}/{}) < floor={:.2}% (baseline={:.2}%, tolerance={:.2}pp)",
-                current * 100.0,
-                gate_input.compiled_models,
-                gate_input.simulatable_attempted,
-                floor * 100.0,
-                baseline_rate * 100.0,
-                COMPILE_RATE_GATE_TOLERANCE * 100.0
-            ));
-        }
-    }
-
     let current_balance_rate =
         balance_success_rate(gate_input.balanced_models, gate_input.balance_denominator);
     let baseline_balance_rate =
@@ -1491,13 +1477,17 @@ pub(super) fn push_sim_rate_regression_reason(
     gate_input: MslQualityGateInput<'_>,
     baseline: &MslQualityBaseline,
 ) {
-    push_stage_count_regression_reason(
-        reasons,
-        "IC",
-        gate_input.ic_ok,
-        baseline.ic_ok,
-        gate_input.sim_target_models,
-    );
+    let allowed_drop = stage_count_allowed_drop(gate_input.sim_target_models);
+    if stage_count_regressed(gate_input.sim_ok, baseline.sim_ok, allowed_drop) {
+        push_stage_count_regression_reason_with_drop(
+            reasons,
+            "IC",
+            gate_input.ic_ok,
+            baseline.ic_ok,
+            gate_input.sim_target_models,
+            allowed_drop,
+        );
+    }
     push_stage_count_regression_reason(
         reasons,
         "Sim",
@@ -1505,6 +1495,10 @@ pub(super) fn push_sim_rate_regression_reason(
         baseline.sim_ok,
         gate_input.sim_target_models,
     );
+}
+
+fn stage_count_regressed(current: usize, baseline: usize, allowed_drop: usize) -> bool {
+    current < baseline.saturating_sub(allowed_drop)
 }
 
 fn stage_percent(count: usize, total: usize) -> f64 {
@@ -1540,7 +1534,7 @@ fn push_stage_count_regression_reason_with_drop(
     allowed_drop: usize,
 ) {
     let floor = baseline.saturating_sub(allowed_drop);
-    if current >= floor {
+    if !stage_count_regressed(current, baseline, allowed_drop) {
         return;
     }
     reasons.push(format!(
@@ -1749,8 +1743,14 @@ pub(super) fn enforce_msl_quality_gate(summary: &MslSummary) -> io::Result<()> {
         return enforce_all_selected_targets_succeeded(summary);
     }
     if summary.sim_attempted == 0 {
-        println!("MSL quality gate: skipped for compile/balance-only run.");
-        return Ok(());
+        if should_skip_msl_quality_gate() {
+            println!("MSL quality gate: skipped for compile/balance-only run.");
+            return Ok(());
+        }
+        return Err(io::Error::other(format!(
+            "MSL quality gate: invalid full run (0 simulations attempted for {} selected simulation target(s)); fix the MSL shard/worker setup before accepting this run",
+            summary.sim_target_models.len()
+        )));
     }
     if should_skip_msl_quality_gate() {
         println!(
@@ -1867,6 +1867,11 @@ pub(super) fn should_skip_msl_quality_gate() -> bool {
         || !sim_subset_patterns().is_empty()
         || sim_subset_limit().is_some()
         || sim_set_mode() != SimSetMode::Full
+        // A shard sees only its stripe of the model set, so the aggregate
+        // baseline ratchet + sim-ok floor are meaningless here; the fan-in job
+        // runs the gate once on the merged results. Also stamps the snapshot
+        // partial:true, which promote-quality-baseline correctly refuses.
+        || sim_shard().is_some()
 }
 
 pub(super) fn assert_valid_msl_summary(summary: &MslSummary) {

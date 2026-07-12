@@ -176,7 +176,7 @@ fn lower_derivative_rhs_keeps_structured_map_through_direct_assignment() {
                 }],
             },
             first_equation_index: 0,
-            equation_counts: vec![1; 3],
+            equations_per_point: 1,
             span: lower_test_span(),
             origin: "for i in 1:3".to_string(),
             regular: None,
@@ -249,7 +249,7 @@ fn lower_derivative_rhs_keeps_structured_map_through_guarded_direct_assignment()
                 }],
             },
             first_equation_index: 0,
-            equation_counts: vec![1; 3],
+            equations_per_point: 1,
             span: lower_test_span(),
             origin: "for i in 1:3".to_string(),
             regular: None,
@@ -337,7 +337,7 @@ fn lower_derivative_rhs_keeps_structured_map_through_direct_coefficient_assignme
                 }],
             },
             first_equation_index: 0,
-            equation_counts: vec![1; 3],
+            equations_per_point: 1,
             span: lower_test_span(),
             origin: "for i in 1:3".to_string(),
             regular: None,
@@ -439,7 +439,7 @@ fn lower_derivative_rhs_keeps_structured_stencil_through_chained_flux_assignment
                 }],
             },
             first_equation_index: 1,
-            equation_counts: vec![1; 3],
+            equations_per_point: 1,
             span: lower_test_span(),
             origin: "for i in 2:4".to_string(),
             regular: None,
@@ -570,7 +570,7 @@ fn lower_derivative_rhs_keeps_structured_stencil_through_turkey_geometry_chain()
                 }],
             },
             first_equation_index: 1,
-            equation_counts: vec![1; 3],
+            equations_per_point: 1,
             span: lower_test_span(),
             origin: "for i in 2:4".to_string(),
             regular: None,
@@ -918,7 +918,7 @@ fn scalarized_vector_function_alias_fixture() -> dae::Dae {
 }
 
 fn add_quat_derivative_function(dae_model: &mut dae::Dae) {
-    let mut quat_derivative = rumoca_core::Function::new("Pkg.quatDerivative", lower_test_span());
+    let mut quat_derivative = test_function("Pkg.quatDerivative", lower_test_span());
     quat_derivative
         .inputs
         .push(function_param_with_dims("q", &[4]));
@@ -956,7 +956,9 @@ fn add_scalarized_vector_alias_projection_equations(dae_model: &mut dae::Dae) {
         rhs: sub(
             der(indexed_var("q", 1)),
             rumoca_core::Expression::FunctionCall {
-                name: rumoca_core::Reference::new("Pkg.quatDerivative.q_dot[1]"),
+                name: rumoca_core::Reference::from_component_reference(
+                    test_component_ref_from_name("Pkg.quatDerivative.q_dot[1]"),
+                ),
                 args: vec![var("q"), var("alias_omega")],
                 is_constructor: false,
                 span: lower_test_span(),

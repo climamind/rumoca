@@ -22,12 +22,14 @@
 use indexmap::IndexMap;
 use rumoca_core::{
     ComponentReference, DefId, Expression, Function, FunctionShapeContractError, Reference, Span,
-    Statement, VarName, extract_algorithm_outputs,
+    Statement, SymbolAncestry, VarName, extract_algorithm_outputs,
 };
 use serde::ser::{SerializeStruct, SerializeTuple};
 use serde::{Deserialize, Serialize};
 
-pub const DAE_SCHEMA_VERSION: u16 = 5;
+pub const DAE_SCHEMA_VERSION: u16 = 8;
+
+pub type SymbolAncestryMap = IndexMap<DefId, SymbolAncestry, rustc_hash::FxBuildHasher>;
 
 mod event_threshold;
 mod expr_query;
@@ -37,8 +39,8 @@ pub use event_threshold::{is_event_constant_threshold, is_event_constant_time_th
 pub use expr_query::{
     DerivativeNameMatcher, complex_base_alias_match, embedded_subscripts_all_one,
     expr_contains_der_of, expr_contains_der_of_any, expr_contains_var, expr_refers_to_var,
-    parse_embedded_subscripts, split_complex_field_suffix, subscripts_all_one,
-    subscripts_match_indices, var_ref_matches_unknown,
+    indexed_field_var_ref, parse_embedded_subscripts, split_complex_field_suffix,
+    subscripts_all_one, subscripts_match_indices, var_ref_matches_unknown,
 };
 pub use types::{
     StructuredEquationFamily, StructuredEquationSlot, component_base_name,
@@ -143,6 +145,7 @@ struct DaeWire {
     relations: Vec<Expression>,
     synthetic_root_conditions: Vec<Expression>,
     scheduled_time_events: Vec<f64>,
+    scheduled_root_conditions: Vec<DaeScheduledRootCondition>,
     event_actions: Vec<DaeEventAction>,
     constructor_exprs: Vec<Expression>,
     schedules: Vec<ClockSchedule>,
@@ -181,7 +184,7 @@ impl Serialize for Dae {
         S: serde::Serializer,
     {
         if !serializer.is_human_readable() {
-            let mut tuple = serializer.serialize_tuple(28)?;
+            let mut tuple = serializer.serialize_tuple(29)?;
             tuple.serialize_element(&self.schema_version)?;
             tuple.serialize_element(&self.variables.states)?;
             tuple.serialize_element(&self.variables.algebraics)?;
@@ -201,6 +204,7 @@ impl Serialize for Dae {
             tuple.serialize_element(&self.conditions.relations)?;
             tuple.serialize_element(&self.events.synthetic_root_conditions)?;
             tuple.serialize_element(&self.events.scheduled_time_events)?;
+            tuple.serialize_element(&self.events.scheduled_root_conditions)?;
             tuple.serialize_element(&self.events.event_actions)?;
             tuple.serialize_element(&self.clocks.constructor_exprs)?;
             tuple.serialize_element(&self.clocks.schedules)?;
@@ -213,7 +217,7 @@ impl Serialize for Dae {
             return tuple.end();
         }
 
-        let mut state = serializer.serialize_struct("Dae", 28)?;
+        let mut state = serializer.serialize_struct("Dae", 29)?;
         state.serialize_field("schema_version", &self.schema_version)?;
         state.serialize_field("x", &self.variables.states)?;
         state.serialize_field("y", &self.variables.algebraics)?;
@@ -242,6 +246,10 @@ impl Serialize for Dae {
             &self.events.synthetic_root_conditions,
         )?;
         state.serialize_field("scheduled_time_events", &self.events.scheduled_time_events)?;
+        state.serialize_field(
+            "scheduled_root_conditions",
+            &self.events.scheduled_root_conditions,
+        )?;
         state.serialize_field("event_actions", &self.events.event_actions)?;
         state.serialize_field("constructor_exprs", &self.clocks.constructor_exprs)?;
         state.serialize_field("schedules", &self.clocks.schedules)?;
@@ -299,6 +307,7 @@ impl<'de> Deserialize<'de> for Dae {
             events: DaeEventPartition {
                 synthetic_root_conditions: wire.synthetic_root_conditions,
                 scheduled_time_events: wire.scheduled_time_events,
+                scheduled_root_conditions: wire.scheduled_root_conditions,
                 event_actions: wire.event_actions,
             },
             clocks: DaeClockPartition {
@@ -527,12 +536,26 @@ pub struct DaeEventPartition {
     /// Scheduled discontinuity instants derived at compile time.
     /// This is canonical runtime metadata (always present in DAE schema).
     pub scheduled_time_events: Vec<f64>,
+    /// Root rows that correspond to periodic sample schedules.
+    ///
+    /// `root_index` is in Solve root-condition order:
+    /// `conditions.relations`, followed by `events.synthetic_root_conditions`,
+    /// followed by triggered clock conditions. The schedule fields identify
+    /// which periodic tick may activate the root at runtime.
+    pub scheduled_root_conditions: Vec<DaeScheduledRootCondition>,
     /// Runtime actions evaluated at event instants.
     ///
     /// `assert` and `terminate` are integration-flow constructs, not numeric
     /// residual expressions. `reinit` is lowered earlier into guarded discrete
     /// state-update equations and must not appear here.
     pub event_actions: Vec<DaeEventAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaeScheduledRootCondition {
+    pub root_index: usize,
+    pub period_seconds: f64,
+    pub phase_seconds: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -675,7 +698,7 @@ pub struct DaeMetadata {
     /// DefId ancestry for resolved source symbols, ordered from outermost owner
     /// to the symbol itself. Used for structured balance and lowering queries.
     #[serde(default)]
-    pub symbol_ancestry: IndexMap<DefId, Vec<DefId>>,
+    pub symbol_ancestry: SymbolAncestryMap,
 }
 
 impl Dae {
@@ -1443,11 +1466,13 @@ mod tests {
             "DAE JSON must carry an explicit schema_version"
         );
 
-        let mut unsupported = value;
-        unsupported["schema_version"] = serde_json::json!(DAE_SCHEMA_VERSION + 1);
-        let err = serde_json::from_value::<Dae>(unsupported)
-            .expect_err("unsupported DAE schema version must fail");
-        assert!(err.to_string().contains("unsupported DAE schema_version"));
+        for unsupported_version in [DAE_SCHEMA_VERSION - 1, DAE_SCHEMA_VERSION + 1] {
+            let mut unsupported = value.clone();
+            unsupported["schema_version"] = serde_json::json!(unsupported_version);
+            let err = serde_json::from_value::<Dae>(unsupported)
+                .expect_err("unsupported DAE schema version must fail");
+            assert!(err.to_string().contains("unsupported DAE schema_version"));
+        }
     }
 
     #[test]
@@ -1483,6 +1508,31 @@ mod tests {
         let decoded: Dae =
             bincode::deserialize(&bytes).expect("deserialize representative DAE from bincode");
         assert_same_json_shape(&decoded, &dae);
+    }
+
+    #[test]
+    fn resolved_function_reference_survives_json_and_bincode_roundtrips() {
+        let reference = Reference::new("Pkg.f").with_resolved_function(
+            rumoca_core::ResolvedFunctionReference {
+                instance_id: rumoca_core::FunctionInstanceId::new(42),
+                base_part_count: 2,
+            },
+        );
+
+        let json = serde_json::to_value(&reference).expect("serialize resolved reference as JSON");
+        assert!(
+            json.is_object(),
+            "resolved identity must not use the bare-name wire form"
+        );
+        let decoded_json: Reference =
+            serde_json::from_value(json).expect("deserialize resolved reference from JSON");
+        assert_eq!(decoded_json, reference);
+
+        let bytes =
+            bincode::serialize(&reference).expect("serialize resolved reference as bincode");
+        let decoded_binary: Reference =
+            bincode::deserialize(&bytes).expect("deserialize resolved reference from bincode");
+        assert_eq!(decoded_binary, reference);
     }
 
     #[test]

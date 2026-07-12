@@ -5,10 +5,9 @@ use super::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rumoca_core::EvalLookup;
     use rumoca_core::{ClassType, DefId};
     use rumoca_ir_ast as ast;
-    use rumoca_ir_ast::{ClassDef, ClassTree, Component, InstanceData, InstanceId};
+    use rumoca_ir_ast::{ClassDef, ClassTree, InstanceData, InstanceId};
     use rumoca_ir_flat as flat;
     use std::sync::Arc;
     const TEST_FILE: &str = "context_tests.mo";
@@ -120,6 +119,13 @@ mod tests {
             reference.def_id = Some(def_id);
         }
         expr
+    }
+
+    fn token(name: &str) -> rumoca_core::Token {
+        rumoca_core::Token {
+            text: Arc::from(name.to_string()),
+            ..rumoca_core::Token::default()
+        }
     }
 
     fn int_lit(value: i64) -> Expression {
@@ -629,6 +635,24 @@ mod tests {
 
         field.name = rumoca_core::VarName::new("world.cylinders.r_shape");
         field.dims = vec![3];
+        field.binding = Some(Expression::Array {
+            elements: vec![
+                Expression::Literal {
+                    value: rumoca_core::Literal::Integer(0),
+                    span: test_span(),
+                },
+                Expression::Literal {
+                    value: rumoca_core::Literal::Integer(0),
+                    span: test_span(),
+                },
+                Expression::Literal {
+                    value: rumoca_core::Literal::Integer(0),
+                    span: test_span(),
+                },
+            ],
+            is_matrix: false,
+            span: test_span(),
+        });
         flat.add_variable(field.name.clone(), field);
 
         let mut overlay = InstanceOverlay::default();
@@ -659,6 +683,16 @@ mod tests {
                 .dims,
             vec![2, 3]
         );
+        let binding = flat
+            .variables
+            .get(&rumoca_core::VarName::new("world.cylinders.r_shape"))
+            .and_then(|variable| variable.binding.as_ref())
+            .expect("missing field r_shape binding");
+        let Expression::ArrayComprehension { expr, indices, .. } = binding else {
+            panic!("declaration binding should repeat over the parent component dimensions");
+        };
+        assert_eq!(indices.len(), 1);
+        assert!(matches!(expr.as_ref(), Expression::Array { elements, .. } if elements.len() == 3));
     }
 
     #[test]
@@ -733,6 +767,171 @@ mod tests {
                 .dims,
             vec![2, 3, 3]
         );
+    }
+
+    #[test]
+    fn test_propagate_unexpanded_record_array_dims_repeats_each_modifier_binding() {
+        let mut flat = flat::Model::default();
+        let var_name = rumoca_core::VarName::new("world.cylinders.widthDirection");
+        let component_ref = rumoca_core::component_reference_from_flat_name(&var_name, test_span())
+            .expect("test variable should have a structured component reference");
+        flat.add_variable(
+            var_name.clone(),
+            flat::Variable {
+                name: var_name.clone(),
+                component_ref: Some(component_ref.clone()),
+                dims: vec![3],
+                binding: Some(Expression::Array {
+                    elements: vec![
+                        Expression::Literal {
+                            value: rumoca_core::Literal::Integer(0),
+                            span: test_span(),
+                        },
+                        Expression::Literal {
+                            value: rumoca_core::Literal::Integer(1),
+                            span: test_span(),
+                        },
+                        Expression::Literal {
+                            value: rumoca_core::Literal::Integer(0),
+                            span: test_span(),
+                        },
+                    ],
+                    is_matrix: false,
+                    span: test_span(),
+                }),
+                binding_from_modification: true,
+                is_primitive: true,
+                ..flat::Variable::empty_with_span(test_span())
+            },
+        );
+        let mut overlay = InstanceOverlay::default();
+        overlay.components.insert(
+            InstanceId::new(1),
+            InstanceData {
+                instance_id: InstanceId::new(1),
+                qualified_name: QualifiedName::from_dotted("world.cylinders"),
+                dims: vec![2],
+                is_primitive: false,
+                ..Default::default()
+            },
+        );
+        overlay.each_modifier_bindings.insert(
+            rumoca_core::ComponentPath::from_component_reference(&component_ref),
+        );
+
+        propagate_unexpanded_record_array_dims(&mut flat, &overlay);
+
+        let variable = flat.variables.get(&var_name).expect("missing field");
+        assert_eq!(variable.dims, vec![2, 3]);
+        assert!(matches!(
+            variable.binding,
+            Some(Expression::ArrayComprehension { ref indices, .. }) if indices.len() == 1
+        ));
+    }
+
+    #[test]
+    fn test_propagate_unexpanded_record_array_dims_repeats_record_alias_binding() {
+        let mut flat = flat::Model::default();
+        let source_name = rumoca_core::VarName::new("world.x_label.R.T");
+        flat.add_variable(
+            source_name.clone(),
+            flat::Variable {
+                name: source_name,
+                dims: vec![3, 3],
+                is_primitive: true,
+                ..flat::Variable::empty_with_span(test_span())
+            },
+        );
+        let target_name = rumoca_core::VarName::new("world.x_label.cylinders.R.T");
+        let component_ref =
+            rumoca_core::component_reference_from_flat_name(&target_name, test_span())
+                .expect("test variable should have a structured component reference");
+        flat.add_variable(
+            target_name.clone(),
+            flat::Variable {
+                name: target_name.clone(),
+                component_ref: Some(component_ref.clone()),
+                dims: vec![3, 3],
+                binding: Some(Expression::FieldAccess {
+                    base: Box::new(Expression::VarRef {
+                        name: rumoca_core::Reference::new("world.x_label.R"),
+                        subscripts: Vec::new(),
+                        span: test_span(),
+                    }),
+                    field: "T".to_string(),
+                    span: test_span(),
+                }),
+                binding_from_modification: true,
+                is_primitive: true,
+                ..flat::Variable::empty_with_span(test_span())
+            },
+        );
+        let mut overlay = InstanceOverlay::default();
+        overlay.components.insert(
+            InstanceId::new(1),
+            InstanceData {
+                instance_id: InstanceId::new(1),
+                qualified_name: QualifiedName::from_dotted("world.x_label.cylinders"),
+                dims: vec![2],
+                is_primitive: false,
+                ..Default::default()
+            },
+        );
+        overlay.each_modifier_bindings.insert(
+            rumoca_core::ComponentPath::from_component_reference(&component_ref),
+        );
+
+        propagate_unexpanded_record_array_dims(&mut flat, &overlay);
+
+        let variable = flat.variables.get(&target_name).expect("missing field");
+        assert_eq!(variable.dims, vec![2, 3, 3]);
+        assert!(matches!(
+            variable.binding,
+            Some(Expression::ArrayComprehension { ref indices, .. }) if indices.len() == 1
+        ));
+    }
+
+    #[test]
+    fn test_propagate_unexpanded_record_array_dims_does_not_repeat_non_each_modifier() {
+        let mut flat = flat::Model::default();
+        let target_name = rumoca_core::VarName::new("world.cylinders.R.T");
+        let binding = Expression::VarRef {
+            name: rumoca_core::Reference::new("world.R.T"),
+            subscripts: Vec::new(),
+            span: test_span(),
+        };
+        flat.add_variable(
+            target_name.clone(),
+            flat::Variable {
+                name: target_name.clone(),
+                component_ref: rumoca_core::component_reference_from_flat_name(
+                    &target_name,
+                    test_span(),
+                ),
+                dims: vec![3, 3],
+                binding: Some(binding.clone()),
+                binding_from_modification: true,
+                is_primitive: true,
+                ..flat::Variable::empty_with_span(test_span())
+            },
+        );
+        let mut overlay = InstanceOverlay::default();
+        overlay.components.insert(
+            InstanceId::new(1),
+            InstanceData {
+                instance_id: InstanceId::new(1),
+                qualified_name: QualifiedName::from_dotted("world.cylinders"),
+                dims: vec![2],
+                is_primitive: false,
+                ..Default::default()
+            },
+        );
+
+        propagate_unexpanded_record_array_dims(&mut flat, &overlay);
+
+        let variable = flat.variables.get(&target_name).expect("missing field");
+        assert_eq!(variable.dims, vec![2, 3, 3]);
+        assert_eq!(variable.binding.as_ref(), Some(&binding));
     }
 
     #[test]

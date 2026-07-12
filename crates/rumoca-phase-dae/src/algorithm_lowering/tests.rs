@@ -50,6 +50,33 @@ fn reaches_source_alias_chain(
     false
 }
 
+fn range_subscript(end_name: &str) -> Subscript {
+    Subscript::generated_expr(
+        Box::new(Expression::Range {
+            start: Box::new(Expression::Literal {
+                value: Literal::Integer(1),
+                span: test_span(),
+            }),
+            step: None,
+            end: Box::new(Expression::VarRef {
+                name: VarName::new(end_name).into(),
+                subscripts: vec![],
+                span: test_span(),
+            }),
+            span: test_span(),
+        }),
+        test_span(),
+    )
+}
+
+fn target_range_ref(target: &str) -> Expression {
+    Expression::VarRef {
+        name: VarName::new(target).into(),
+        subscripts: vec![range_subscript("n")],
+        span: test_span(),
+    }
+}
+
 #[test]
 fn lower_algorithm_uses_statement_span_for_main_assignment_equations() {
     let algorithm_span = Span::new(
@@ -533,6 +560,78 @@ fn lower_for_statement_assignments_rejects_dummy_owner_span() {
 }
 
 #[test]
+fn rewrite_discrete_self_refs_to_pre_preserves_subscripted_target_slice() -> Result<(), ToDaeError>
+{
+    let rewritten = rewrite_discrete_self_refs_to_pre(
+        &target_range_ref("buffer"),
+        &VarName::new("buffer"),
+        test_span(),
+    )?;
+
+    match rewritten {
+        Expression::BuiltinCall {
+            function: BuiltinFunction::Pre,
+            args,
+            ..
+        } => match args.as_slice() {
+            [
+                Expression::VarRef {
+                    name, subscripts, ..
+                },
+            ] => {
+                assert_eq!(name.as_str(), "buffer");
+                assert!(matches!(
+                    subscripts.as_slice(),
+                    [Subscript::Expr { expr, .. }]
+                        if matches!(
+                            expr.as_ref(),
+                            Expression::Range { end, .. }
+                                if matches!(
+                                    end.as_ref(),
+                                    Expression::VarRef { name, .. }
+                                        if name.as_str() == "n"
+                                )
+                        )
+                ));
+            }
+            other => panic!("expected pre(buffer[1:n]) argument, got {other:?}"),
+        },
+        other => panic!("expected pre(buffer[1:n]), got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn rewrite_discrete_self_refs_to_pre_keeps_previous_operand_unchanged() -> Result<(), ToDaeError> {
+    let previous_slice = Expression::FunctionCall {
+        name: VarName::new("previous").into(),
+        args: vec![target_range_ref("buffer")],
+        is_constructor: false,
+        span: test_span(),
+    };
+
+    let rewritten =
+        rewrite_discrete_self_refs_to_pre(&previous_slice, &VarName::new("buffer"), test_span())?;
+
+    match rewritten {
+        Expression::FunctionCall { name, args, .. } => {
+            assert_eq!(name.as_str(), "previous");
+            assert!(matches!(
+                args.as_slice(),
+                [Expression::VarRef {
+                    name, subscripts, ..
+                }] if name.as_str() == "buffer" && matches!(
+                    subscripts.as_slice(),
+                    [Subscript::Expr { .. }]
+                )
+            ));
+        }
+        other => panic!("expected previous(buffer[1:n]), got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
 fn canonicalize_discrete_assignments_reroutes_connection_aliases_for_defined_target() {
     let mut dae = Dae::new();
     for name in ["y", "u", "v"] {
@@ -857,5 +956,69 @@ fn canonicalize_discrete_assignments_preserves_conflicting_same_target_rows() {
         dae.discrete.valued_updates.len(),
         2,
         "canonicalization should not hide repeated non-connection assignments; validation owns the error"
+    );
+}
+
+/// MLS §10.5: a subscript expression is evaluated, so an array element is
+/// identified by its subscript's *value*. Names built for the same element must
+/// therefore agree no matter how the subscript was spelled.
+///
+/// Regression guard: `Subscript::Expr` used to render as `format!("{expr:?}")`,
+/// which embeds the AST including each node's `Span`. Two references to the
+/// same element at different source positions produced different names, so the
+/// current-value lookup during algorithm lowering never matched. That emitted
+/// self-referential equations such as `a[1] = a[1] + 1.0` for `a[i]`, and for
+/// index *expressions* like `a[i + 1]` it diverted lowering into the dynamic
+/// -subscript path, where the expression grew without bound.
+#[test]
+fn constant_subscripts_render_by_value_regardless_of_spelling() {
+    let name = VarName::new("a".to_string());
+    let literal_one = varname_with_subscripts(&name, &[Subscript::index(1, test_span())]);
+
+    // A loop iterator is substituted as an *expression*, not a Subscript::Index.
+    let expr_one = varname_with_subscripts(
+        &name,
+        &[Subscript::expr(Box::new(integer_literal(1)), test_span())],
+    );
+    assert_eq!(
+        expr_one, literal_one,
+        "`a[<expr 1>]` must name the same element as `a[1]`"
+    );
+
+    // Constant arithmetic in the subscript: `a[i + 1]` with `i = 1`.
+    let expr_sum = varname_with_subscripts(
+        &name,
+        &[Subscript::expr(
+            Box::new(Expression::Binary {
+                op: rumoca_core::OpBinary::Add,
+                lhs: Box::new(integer_literal(1)),
+                rhs: Box::new(integer_literal(1)),
+                span: test_span(),
+            }),
+            test_span(),
+        )],
+    );
+    let literal_two = varname_with_subscripts(&name, &[Subscript::index(2, test_span())]);
+    assert_eq!(
+        expr_sum, literal_two,
+        "`a[1 + 1]` must name the same element as `a[2]`"
+    );
+
+    // A genuinely non-constant subscript keeps the previous behaviour: it is
+    // not a constant, so it must not be folded into some arbitrary index.
+    let dynamic = varname_with_subscripts(
+        &name,
+        &[Subscript::expr(
+            Box::new(Expression::VarRef {
+                name: VarName::new("k".to_string()).into(),
+                subscripts: vec![],
+                span: test_span(),
+            }),
+            test_span(),
+        )],
+    );
+    assert_ne!(
+        dynamic, literal_one,
+        "a run-time subscript must not collapse onto a constant index"
     );
 }

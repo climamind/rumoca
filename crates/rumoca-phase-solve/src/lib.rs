@@ -45,6 +45,7 @@ mod runtime_assignments;
 pub mod solve_model;
 mod stencil;
 mod subscript_indices;
+mod tensor_report;
 #[cfg(test)]
 #[path = "tests/test_support.rs"]
 mod test_support;
@@ -104,6 +105,9 @@ pub use solve_model::{
     propagate_parameter_overrides, visible_expressions_for_dae,
 };
 pub(crate) use subscript_indices::{checked_literal_positive_indices, subscript_source_span};
+pub use tensor_report::{
+    TensorFallback, TensorFallbackReason, TensorPreservationReport, tensor_preservation_report,
+};
 /// Reset DAE evaluator state used while lowering DAE into Solve IR.
 ///
 /// Solve lowering now creates and threads an explicit `EvalRuntimeState` for
@@ -185,7 +189,7 @@ fn checked_layout_remainder(
 fn build_pre_param_bindings(layout: &solve::VarLayout) -> Vec<solve::PreParamBinding> {
     let mut bindings = Vec::new();
     for (name, &slot) in layout.bindings() {
-        let Some(source_name) = name.strip_prefix("__pre__.") else {
+        let Some(source_name) = rumoca_core::pre_slot_base(name) else {
             continue;
         };
         let solve::ScalarSlot::P {
@@ -308,6 +312,7 @@ pub(crate) fn lower_solve_problem_with_solver_len_and_model_span_and_profile(
     let timer = timing::stage_start();
     let solve_layout = lower_solve_layout_with_var_layout(dae_model, solver_len, &layout)?;
     timing::log_stage("problem.lower_solve_layout", timer);
+
     let timer = timing::stage_start();
     let runtime_tail_updates = runtime_tail_update_names(dae_model)?;
     let runtime_assignment_equations =
@@ -343,7 +348,6 @@ pub(crate) fn lower_solve_problem_with_solver_len_and_model_span_and_profile(
         },
     )
     .map_err(|err| lower_problem_context(err, "lower continuous residual rows and targets"))?;
-    dedupe_continuous_y_targets(&mut residual_targets);
     timing::log_stage("problem.lower_residual_rows", timer);
     // Derivative lowering must LOAD retained algebraic unknowns from their projected
     // slot rather than inline their definitions (roadmap 4b): inlining a boundary cell
@@ -579,6 +583,10 @@ fn lower_event_partition_for_profile(
         )?,
         root_relation_memory_targets: lower::lower_root_relation_memory_targets(dae_model, layout)
             .map_err(|err| lower_problem_context(err, "lower root relation memory targets"))?,
+        root_zero_domains: lower::lower_root_zero_domains(dae_model)
+            .map_err(|err| lower_problem_context(err, "lower root zero domains"))?,
+        scheduled_root_conditions: lower::lower_scheduled_root_conditions(dae_model)
+            .map_err(|err| lower_problem_context(err, "lower scheduled root conditions"))?,
         scheduled_time_events: dae_model.events.scheduled_time_events.clone(),
         dynamic_time_event_names: dynamic_events::collect_dynamic_time_event_names(dae_model),
         dynamic_time_event_rhs: solve::ScalarProgramBlock::with_program_spans(
@@ -773,21 +781,48 @@ fn lower_initialization_updates_only(
     })
 }
 
+fn lower_initialization_updates_only(
+    dae_model: &dae::Dae,
+    layout: &solve::VarLayout,
+) -> Result<solve::InitializationSolveSystem, LowerError> {
+    let update_equations = lower::initial_condition_update_equations(dae_model)
+        .map_err(|err| lower_problem_context(err, "collect initial condition updates"))?;
+    Ok(solve::InitializationSolveSystem {
+        update_rhs: solve::ScalarProgramBlock::with_program_spans(
+            lower_initial_update_rhs(dae_model, layout)
+                .map_err(|err| lower_problem_context(err, "lower initial update rows"))?,
+            program_spans_for_owned_equations(&update_equations)?,
+        )?,
+        update_targets: lower_update_targets_from_equations(dae_model, layout, &update_equations)
+            .map_err(|err| {
+            lower_problem_context(err, "lower initial update targets")
+        })?,
+        ..Default::default()
+    })
+}
+
 fn initial_projection_indices_for_layout(
     dae_model: &dae::Dae,
     solve_layout: &solve::SolveLayout,
 ) -> Result<Vec<usize>, LowerError> {
     let span = dae_model_span(dae_model)?;
     let state_count = solve_layout.state_scalar_count();
-    let algebraic_count = solve_layout.algebraic_scalar_count();
-    let algebraic_end = state_count.checked_add(algebraic_count).ok_or_else(|| {
+    let solver_count = solve_layout.solver_scalar_count();
+    let non_state_count = solver_count.checked_sub(state_count).ok_or_else(|| {
         lower_contract_violation(
-            "initial projection algebraic range overflows host index range".to_string(),
+            "initial projection non-state range starts after solver scalar count".to_string(),
             span,
         )
     })?;
     let mut indices =
-        lower_vec_with_capacity(algebraic_count, "initial projection index count", span)?;
+        lower_vec_with_capacity(solver_count, "initial projection index count", span)?;
+    reserve_lower_capacity(
+        &mut indices,
+        non_state_count,
+        "initial projection non-state index count",
+        span,
+    )?;
+    indices.extend(state_count..solver_count);
     for (name, var) in dae_model
         .variables
         .states
@@ -807,15 +842,6 @@ fn initial_projection_indices_for_layout(
             }
         }
     }
-    reserve_lower_capacity(
-        &mut indices,
-        algebraic_count,
-        "initial projection algebraic index count",
-        span,
-    )?;
-    indices.extend(state_count..algebraic_end);
-    indices.sort_unstable();
-    indices.dedup();
     Ok(indices)
 }
 
@@ -831,6 +857,12 @@ pub fn lower_solve_artifacts_with_mass_matrix(
 ) -> Result<solve::SolveArtifacts, LowerError> {
     let artifacts = solve::SolveArtifacts {
         continuous: lower_continuous_solve_artifacts(problem, mass_matrix)?,
+        initialization: solve::InitializationSolveArtifacts {
+            residual_jacobian_v: lower_compute_block_jvp(&problem.initialization.residual)
+                .map_err(|err| {
+                    lower_problem_context(err, "lower initial residual Jacobian rows")
+                })?,
+        },
     };
     appendix_b_validation::validate_solve_artifacts_appendix_b_invariants(&artifacts)?;
     Ok(artifacts)
@@ -1082,15 +1114,15 @@ fn lower_projection_plan(
         row_to_vars.insert(row_idx, y_indices);
     }
 
-    let projection_incidence = algebraic_projection_incidence(&row_to_vars, context_span)?;
-    let blocks = projection_blt_blocks(&projection_incidence)?;
+    let projection_incidence = algebraic_projection_incidence(
+        &row_to_vars,
+        row_targets,
+        projection_indices,
+        context_span,
+    )?;
+    let blocks = projection_blt_blocks(&projection_incidence, context_span)?;
     Ok(solve::AlgebraicProjectionPlan {
-        blocks: lower_blt_projection_blocks(
-            &blocks,
-            row_targets,
-            &projection_incidence,
-            context_span,
-        )?,
+        blocks: lower_blt_projection_blocks(&blocks, &projection_incidence, context_span)?,
     })
 }
 
@@ -1123,20 +1155,22 @@ fn identity_projection_y_index(
 
 fn projection_blt_blocks(
     projection_incidence: &ProjectionIncidence,
+    context_span: rumoca_core::Span,
 ) -> Result<Vec<BltBlock>, LowerError> {
     if projection_incidence.incidence.n_eq == 0 && projection_incidence.incidence.n_var == 0 {
         return Ok(Vec::new());
     }
-    let regular =
-        rumoca_phase_structural::maximum_regular_subsystem(&projection_incidence.incidence)
-            .map_err(|err| LowerError::Unsupported {
-                reason: format!("lower algebraic projection BLT: {err}"),
-            })?;
-    rumoca_phase_structural::build_blt_from_incidence(&regular.incidence).map_err(|err| {
-        LowerError::Unsupported {
-            reason: format!("lower algebraic projection BLT: {err}"),
-        }
-    })
+    let regular = rumoca_phase_structural::maximum_regular_subsystem(
+        &projection_incidence.incidence,
+        &projection_incidence.preferred_unknowns,
+    )
+    .map_err(|err| {
+        lower_contract_violation(
+            format!("failed to select algebraic projection subsystem: {err}"),
+            context_span,
+        )
+    })?;
+    Ok(regular.blocks)
 }
 
 fn collect_algebraic_y_indices_for_row(
@@ -1287,13 +1321,16 @@ fn reg_range(start: solve::Reg, len: usize) -> impl Iterator<Item = solve::Reg> 
 struct ProjectionIncidence {
     incidence: Incidence,
     unknown_y_indices: Vec<usize>,
+    preferred_unknowns: Vec<Option<usize>>,
 }
 
 fn algebraic_projection_incidence(
     row_to_vars: &BTreeMap<usize, BTreeSet<usize>>,
+    row_targets: &[Option<solve::ScalarSlot>],
+    projection_indices: &[usize],
     context_span: rumoca_core::Span,
 ) -> Result<ProjectionIncidence, LowerError> {
-    let unknown_y_set = row_to_vars
+    let mut unknown_y_set = row_to_vars
         .values()
         .flat_map(|vars| vars.iter().copied())
         .collect::<BTreeSet<_>>();
@@ -1302,6 +1339,11 @@ fn algebraic_projection_incidence(
         "projection unknown index count",
         context_span,
     )?;
+    for y_idx in projection_indices {
+        if unknown_y_set.remove(y_idx) {
+            unknown_y_indices.push(*y_idx);
+        }
+    }
     unknown_y_indices.extend(unknown_y_set);
 
     let mut unknown_names = lower_vec_with_capacity(
@@ -1330,6 +1372,11 @@ fn algebraic_projection_incidence(
         "projection equation unknown count",
         context_span,
     )?;
+    let mut preferred_unknowns = lower_vec_with_capacity(
+        row_to_vars.len(),
+        "projection preferred unknown count",
+        context_span,
+    )?;
     for (row_idx, vars) in row_to_vars {
         equation_refs.push(EquationRef(*row_idx));
         let mut unknowns =
@@ -1340,11 +1387,23 @@ fn algebraic_projection_incidence(
             }
         }
         eq_unknowns.push(unknowns);
+        preferred_unknowns.push(
+            row_targets
+                .get(*row_idx)
+                .copied()
+                .flatten()
+                .and_then(|target| match target {
+                    solve::ScalarSlot::Y { index, .. } => unknown_positions.get(&index).copied(),
+                    _ => None,
+                })
+                .filter(|local_idx| vars.contains(&unknown_y_indices[*local_idx])),
+        );
     }
 
     Ok(ProjectionIncidence {
         incidence: Incidence::new(eq_unknowns, equation_refs, unknown_names),
         unknown_y_indices,
+        preferred_unknowns,
     })
 }
 
@@ -1366,7 +1425,6 @@ fn projection_y_index(
 
 fn lower_blt_projection_blocks(
     blocks: &[BltBlock],
-    row_targets: &[Option<solve::ScalarSlot>],
     projection_incidence: &ProjectionIncidence,
     context_span: rumoca_core::Span,
 ) -> Result<Vec<solve::AlgebraicProjectionBlock>, LowerError> {
@@ -1378,9 +1436,14 @@ fn lower_blt_projection_blocks(
     for block in blocks {
         let block = match block {
             BltBlock::Scalar { equation, unknown } => {
-                projection_y_index(unknown, projection_incidence)
-                    .map(|y_index| scalar_projection_block(equation.0, y_index, context_span))
-                    .transpose()?
+                let y_index =
+                    projection_y_index(unknown, projection_incidence).ok_or_else(|| {
+                        lower_contract_violation(
+                            format!("projection BLT unknown `{unknown}` has no solver-y index"),
+                            context_span,
+                        )
+                    })?;
+                scalar_projection_block(equation.0, y_index, context_span)?
             }
             BltBlock::AlgebraicLoop {
                 equations,
@@ -1388,119 +1451,13 @@ fn lower_blt_projection_blocks(
             } => lower_algebraic_loop_projection_block(
                 equations,
                 unknowns,
-                row_targets,
                 projection_incidence,
                 context_span,
             )?,
         };
-        if let Some(block) = block {
-            lowered.push(block);
-        }
+        lowered.push(block);
     }
-    merge_overlapping_projection_blocks(lowered, context_span)
-}
-
-fn merge_overlapping_projection_blocks(
-    blocks: Vec<solve::AlgebraicProjectionBlock>,
-    context_span: rumoca_core::Span,
-) -> Result<Vec<solve::AlgebraicProjectionBlock>, LowerError> {
-    let mut merged = lower_vec_with_capacity(
-        blocks.len(),
-        "merged algebraic projection block count",
-        context_span,
-    )?;
-    for block in blocks {
-        merge_projection_block(&mut merged, block, context_span)?;
-    }
-    Ok(merged)
-}
-
-fn merge_projection_block(
-    merged: &mut Vec<solve::AlgebraicProjectionBlock>,
-    mut block: solve::AlgebraicProjectionBlock,
-    context_span: rumoca_core::Span,
-) -> Result<(), LowerError> {
-    let mut idx = 0;
-    while idx < merged.len() {
-        if projection_blocks_overlap(&merged[idx], &block) {
-            let previous = merged.remove(idx);
-            block = combine_projection_blocks(previous, block, context_span)?;
-            idx = 0;
-        } else {
-            idx += 1;
-        }
-    }
-    merged.push(block);
-    Ok(())
-}
-
-fn projection_blocks_overlap(
-    lhs: &solve::AlgebraicProjectionBlock,
-    rhs: &solve::AlgebraicProjectionBlock,
-) -> bool {
-    lhs.y_indices
-        .iter()
-        .any(|index| rhs.y_indices.binary_search(index).is_ok())
-}
-
-fn combine_projection_blocks(
-    lhs: solve::AlgebraicProjectionBlock,
-    rhs: solve::AlgebraicProjectionBlock,
-    context_span: rumoca_core::Span,
-) -> Result<solve::AlgebraicProjectionBlock, LowerError> {
-    let causal_step_count = lhs
-        .causal_steps
-        .len()
-        .checked_add(rhs.causal_steps.len())
-        .ok_or_else(|| {
-            lower_contract_violation(
-                "merged algebraic projection causal-step count overflows host index range"
-                    .to_string(),
-                context_span,
-            )
-        })?;
-    let mut causal_steps = lower_vec_with_capacity(
-        causal_step_count,
-        "merged algebraic projection causal-step count",
-        context_span,
-    )?;
-    causal_steps.extend(lhs.causal_steps);
-    causal_steps.extend(rhs.causal_steps);
-    Ok(solve::AlgebraicProjectionBlock {
-        rows: merge_unique(
-            lhs.rows,
-            rhs.rows,
-            "merged algebraic projection row count",
-            context_span,
-        )?,
-        y_indices: merge_unique(
-            lhs.y_indices,
-            rhs.y_indices,
-            "merged algebraic projection target count",
-            context_span,
-        )?,
-        causal_steps,
-    })
-}
-
-fn merge_unique(
-    lhs: Vec<usize>,
-    rhs: Vec<usize>,
-    context: &'static str,
-    context_span: rumoca_core::Span,
-) -> Result<Vec<usize>, LowerError> {
-    let capacity = lhs.len().checked_add(rhs.len()).ok_or_else(|| {
-        lower_contract_violation(
-            format!("{context} overflows host index range"),
-            context_span,
-        )
-    })?;
-    let mut merged = lower_vec_with_capacity(capacity, context, context_span)?;
-    merged.extend(lhs);
-    merged.extend(rhs);
-    merged.sort_unstable();
-    merged.dedup();
-    Ok(merged)
+    Ok(lowered)
 }
 
 fn scalar_projection_block(
@@ -1523,7 +1480,7 @@ fn scalar_projection_block(
     Ok(solve::AlgebraicProjectionBlock {
         rows,
         y_indices,
-        causal_steps: Vec::new(),
+        causal_steps: vec![solve::AlgebraicProjectionStep { row, y_index }],
     })
 }
 
@@ -1555,26 +1512,42 @@ fn collect_equation_rows(
 fn lower_algebraic_loop_projection_block(
     equations: &[EquationRef],
     unknowns: &[UnknownId],
-    row_targets: &[Option<solve::ScalarSlot>],
     projection_incidence: &ProjectionIncidence,
     context_span: rumoca_core::Span,
-) -> Result<Option<solve::AlgebraicProjectionBlock>, LowerError> {
+) -> Result<solve::AlgebraicProjectionBlock, LowerError> {
     let rows = collect_equation_rows(equations, context_span)?;
+    let mut unknown_indices = BTreeSet::new();
+    for unknown in unknowns {
+        let y_index = projection_y_index(unknown, projection_incidence).ok_or_else(|| {
+            lower_contract_violation(
+                format!("projection BLT unknown `{unknown}` has no solver-y index"),
+                context_span,
+            )
+        })?;
+        unknown_indices.insert(y_index);
+    }
     let y_indices = sorted_set_values(
-        loop_projection_target_set(unknowns, row_targets, &rows, projection_incidence),
+        unknown_indices,
         "algebraic loop projection target count",
         context_span,
     )?;
-    if rows.is_empty() || y_indices.is_empty() {
-        return Ok(None);
+    if rows.len() != y_indices.len() {
+        return Err(lower_contract_violation(
+            format!(
+                "projection BLT block has {} equations but {} solver-y unknowns",
+                rows.len(),
+                y_indices.len()
+            ),
+            context_span,
+        ));
     }
     let causal_steps =
         matched_projection_steps(equations, unknowns, projection_incidence, context_span)?;
-    Ok(Some(solve::AlgebraicProjectionBlock {
+    Ok(solve::AlgebraicProjectionBlock {
         rows,
         y_indices,
         causal_steps,
-    }))
+    })
 }
 
 fn matched_projection_steps(

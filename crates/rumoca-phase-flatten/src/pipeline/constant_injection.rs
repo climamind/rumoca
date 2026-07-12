@@ -842,7 +842,7 @@ pub(crate) fn try_extract_named_record_constructor_constant(
     scope: &str,
     full_name: &str,
 ) -> Option<rumoca_core::Expression> {
-    let (ctor_name, named_fields) = extract_named_record_constructor_fields(expr)?;
+    let (constructor, named_fields) = extract_named_record_constructor_fields(expr)?;
 
     if named_fields.is_empty() {
         return None;
@@ -889,7 +889,7 @@ pub(crate) fn try_extract_named_record_constructor_constant(
         .map(|field| named_record_constructor_arg(field, expr.span()))
         .collect::<Option<Vec<_>>>()?;
     Some(rumoca_core::Expression::FunctionCall {
-        name: rumoca_core::Reference::new(ctor_name),
+        name: constructor,
         args: ctor_args,
         is_constructor: true,
         span: expr.span(),
@@ -913,13 +913,17 @@ fn named_record_constructor_arg(
 
 fn extract_named_record_constructor_fields(
     expr: &ast::Expression,
-) -> Option<(String, Vec<(String, ast::Expression)>)> {
+) -> Option<(rumoca_core::Reference, Vec<(String, ast::Expression)>)> {
     match expr {
         ast::Expression::FunctionCall { comp, args, .. } => {
             if args.is_empty() {
                 return None;
             }
             let ctor_name = QualifiedName::from_component_reference(comp).to_flat_string();
+            let constructor = rumoca_core::Reference::with_component_reference(
+                ctor_name,
+                core_component_reference_from_ast(comp),
+            );
             let mut named_fields = Vec::new();
             for arg in args {
                 let ast::Expression::NamedArgument { name, value, .. } = arg else {
@@ -927,7 +931,7 @@ fn extract_named_record_constructor_fields(
                 };
                 named_fields.push((name.text.to_string(), value.as_ref().clone()));
             }
-            Some((ctor_name, named_fields))
+            Some((constructor, named_fields))
         }
         ast::Expression::ClassModification {
             target,
@@ -938,6 +942,10 @@ fn extract_named_record_constructor_fields(
                 return None;
             }
             let ctor_name = target.to_string();
+            let constructor = rumoca_core::Reference::with_component_reference(
+                ctor_name,
+                core_component_reference_from_ast(target),
+            );
             let mut named_fields = Vec::new();
             for modification in modifications {
                 match modification {
@@ -951,7 +959,7 @@ fn extract_named_record_constructor_fields(
                     _ => return None,
                 }
             }
-            Some((ctor_name, named_fields))
+            Some((constructor, named_fields))
         }
         _ => None,
     }

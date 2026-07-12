@@ -2,6 +2,7 @@ use indexmap::IndexMap;
 use rumoca_ir_solve as solve;
 use rumoca_solver::SimOptions;
 
+use super::unit_integrator_model;
 use crate::simulate;
 
 macro_rules! fixture_span {
@@ -46,6 +47,83 @@ fn root_reinit_does_not_interpolate_from_mutated_diffsol_state() {
 }
 
 #[test]
+fn state_only_root_event_is_independent_of_output_grid() {
+    let model = rising_state_with_root_reinit();
+    let simulate_with_dt = |dt| {
+        simulate(
+            &model,
+            &SimOptions {
+                t_end: 0.2,
+                dt: Some(dt),
+                ..Default::default()
+            },
+        )
+        .expect("root-triggered reinit should integrate on any output grid")
+        .data[0]
+            .last()
+            .copied()
+            .expect("the final state should be recorded")
+    };
+
+    let coarse = simulate_with_dt(0.1);
+    let fine = simulate_with_dt(0.001);
+    assert!(
+        (coarse - fine).abs() <= 2.0e-6,
+        "output sampling changed the event trajectory: coarse={coarse}, fine={fine}"
+    );
+}
+
+#[test]
+fn root_at_scheduled_stop_resumes_to_simulation_horizon() {
+    let mut model = rising_state_with_root_reinit();
+    model.problem.clocks.periodic_event_schedules = vec![
+        solve::PeriodicEventSchedule {
+            phase_seconds: 0.05,
+            period_seconds: 10.0,
+        },
+        solve::PeriodicEventSchedule {
+            phase_seconds: 0.075,
+            period_seconds: 10.0,
+        },
+    ];
+
+    let result = simulate(
+        &model,
+        &SimOptions {
+            t_end: 0.1,
+            dt: Some(0.1),
+            ..Default::default()
+        },
+    )
+    .expect("a root at a scheduled stop must resume continuous integration");
+
+    assert_eq!(result.times.last().copied(), Some(0.1));
+    assert!(
+        result
+            .times
+            .iter()
+            .any(|time| (*time - 0.075).abs() < 1.0e-12)
+    );
+    assert!(result.data[0].last().copied().unwrap() > 2.0);
+}
+
+#[test]
+fn root_at_simulation_horizon_finishes_event_iteration() {
+    let result = simulate(
+        &rising_state_with_root_reinit(),
+        &SimOptions {
+            t_end: 0.05,
+            dt: Some(0.05),
+            ..Default::default()
+        },
+    )
+    .expect("a root at the simulation horizon must not install a current-time stop");
+
+    assert_eq!(result.times.last().copied(), Some(0.05));
+    assert!(result.data[0].last().copied().unwrap() >= 2.0);
+}
+
+#[test]
 fn strict_post_crossing_reinit_evaluates_on_event_right_limit() {
     let model = falling_ball_with_strict_reinit_guard();
 
@@ -74,6 +152,65 @@ fn strict_post_crossing_reinit_evaluates_on_event_right_limit() {
         result.times,
         result.data[0],
         result.data[1]
+    );
+}
+
+#[test]
+fn state_only_bdf_uses_search_values_for_parameter_static_roots() {
+    let mut model = unit_integrator_model();
+    model.problem.solve_layout.parameter_count = 1;
+    model.problem.solve_layout.compiled_parameter_len = 1;
+    model.parameters = vec![0.0];
+    model.problem.events.root_conditions = solve::ScalarProgramBlock::with_source_span(
+        vec![vec![
+            solve::LinearOp::LoadP { dst: 0, index: 0 },
+            solve::LinearOp::StoreOutput { src: 0 },
+        ]],
+        fixture_span!(),
+    );
+    model.problem.discrete.update_targets = vec![solve::scalar_slot_y(0)];
+    model.problem.discrete.rhs = solve::ScalarProgramBlock::with_source_span(
+        vec![vec![
+            solve::LinearOp::LoadY { dst: 0, index: 0 },
+            solve::LinearOp::Const { dst: 1, value: 0.0 },
+            solve::LinearOp::Compare {
+                dst: 2,
+                op: solve::CompareOp::Gt,
+                lhs: 0,
+                rhs: 1,
+            },
+            solve::LinearOp::Const {
+                dst: 3,
+                value: 100.0,
+            },
+            solve::LinearOp::Select {
+                dst: 4,
+                cond: 2,
+                if_true: 3,
+                if_false: 0,
+            },
+            solve::LinearOp::StoreOutput { src: 4 },
+        ]],
+        fixture_span!(),
+    );
+
+    let result = simulate(
+        &model,
+        &SimOptions {
+            t_end: 0.001,
+            dt: Some(0.001),
+            ..Default::default()
+        },
+    )
+    .expect("a parameter-static root should not retrigger the BDF solver");
+
+    let final_x = result.data[0]
+        .last()
+        .copied()
+        .expect("x should be recorded");
+    assert!(
+        (final_x - 0.001).abs() <= 1.0e-8,
+        "a static zero root incorrectly fired a state reinit: x={final_x}"
     );
 }
 

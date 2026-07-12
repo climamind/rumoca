@@ -766,6 +766,7 @@ pub(crate) fn process_component_instances_for_flatten(
 ) -> Result<(), FlattenError> {
     let mut import_cache = ImportCaches::default();
     let scope_index = OverlayScopeIndex::new(overlay);
+    let identity_space = InstanceIdentitySpace::from_tree(tree);
     for instance_data in overlay.components.values() {
         if is_in_disabled_component(&instance_data.qualified_name, &overlay.disabled_components) {
             continue;
@@ -774,12 +775,18 @@ pub(crate) fn process_component_instances_for_flatten(
             flat,
             instance_data,
             simulated_root_name,
+            canonical_type_id: overlay
+                .type_roots
+                .get(&instance_data.type_id)
+                .copied()
+                .unwrap_or(instance_data.type_id),
             component_override_map,
             tree,
             class_index,
             import_cache: &mut import_cache,
             scope_index: &scope_index,
             component_members,
+            identity_space,
         })?;
         track_top_level_component_markers(flat, instance_data);
     }
@@ -1001,7 +1008,11 @@ pub(crate) fn finalize_flat_model(
     mark_record_constructor_calls(flat, tree);
     collapse_index_refs_to_known_varrefs(flat);
     canonicalize_varrefs_via_instantiated_def_ids(flat);
-    functions::canonicalize_collected_function_calls(flat);
+    // Re-run constant substitution after late function collection and DefId
+    // canonicalization: both can expose inherited constant aliases in model
+    // equations (for example `nX = nS` in a redeclared Medium package).
+    substitute_known_constants_in_flat(flat, ctx)?;
+    functions::canonicalize_collected_function_calls(flat)?;
     functions::lower_record_function_params(flat)?;
     mark_record_constructor_calls(flat, tree);
     substitute_known_constants_in_flat(flat, ctx)?;

@@ -7,7 +7,7 @@ pub(super) type FieldUseMap = BTreeMap<String, BTreeMap<String, Vec<i64>>>;
 
 pub(super) fn infer_record_fields_by_function(
     functions: &IndexMap<rumoca_core::VarName, rumoca_core::Function>,
-    record_fields_by_type: &HashMap<String, Vec<String>>,
+    record_fields_by_type: &HashMap<rumoca_core::DefId, Vec<String>>,
 ) -> HashMap<String, FieldUseMap> {
     let mut fields = HashMap::new();
     for (name, function) in functions {
@@ -33,7 +33,7 @@ pub(super) fn infer_record_fields_by_function(
 
 fn collect_local_record_field_uses(
     function: &rumoca_core::Function,
-    record_fields_by_type: &HashMap<String, Vec<String>>,
+    record_fields_by_type: &HashMap<rumoca_core::DefId, Vec<String>>,
 ) -> FieldUseMap {
     let prefixes = record_field_prefixes(function, record_fields_by_type);
     let mut collector = RecordFieldUseCollector {
@@ -48,12 +48,14 @@ fn collect_local_record_field_uses(
 
 fn record_field_prefixes(
     function: &rumoca_core::Function,
-    record_fields_by_type: &HashMap<String, Vec<String>>,
+    record_fields_by_type: &HashMap<rumoca_core::DefId, Vec<String>>,
 ) -> HashSet<String> {
     let mut prefixes = HashSet::new();
     for input in &function.inputs {
         if input.type_class == Some(rumoca_core::ClassType::Record)
-            || record_fields_by_type.contains_key(&input.type_name)
+            || input
+                .type_def_id
+                .is_some_and(|id| record_fields_by_type.contains_key(&id))
         {
             prefixes.insert(input.name.clone());
         }
@@ -365,7 +367,7 @@ mod tests {
         functions.insert(caller.name.clone(), caller);
 
         let record_fields_by_type =
-            HashMap::from([("Pkg.State".to_string(), vec!["phase".to_string()])]);
+            HashMap::from([(rumoca_core::DefId::new(1), vec!["phase".to_string()])]);
         let inferred = infer_record_fields_by_function(&functions, &record_fields_by_type);
         let caller_fields = inferred.get("Pkg.caller").expect("caller fields");
 

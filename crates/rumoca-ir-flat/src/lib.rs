@@ -28,9 +28,9 @@ use convert_from_ast::{
 use indexmap::{IndexMap, IndexSet};
 use rumoca_core::{
     BuiltinFunction, Causality, ClassType, ComponentReference, ComprehensionTemplate, DefId,
-    Expression, ForIndex, Function, FunctionShapeContractError, Reference, RegularForFamily, Span,
-    StateSelect, Statement, StatementBlock, StructuredIndexDomain, Subscript, TypeId, VarName,
-    Variability,
+    Expression, ForIndex, Function, FunctionInstanceId, FunctionShapeContractError, Reference,
+    RegularForFamily, Span, StateSelect, Statement, StatementBlock, StructuredIndexDomain,
+    Subscript, SymbolAncestry, TypeId, VarName, Variability,
 };
 #[cfg(test)]
 use rumoca_core::{ComprehensionIndex, Literal};
@@ -39,6 +39,7 @@ use rumoca_ir_ast as ast;
 use serde::{Deserialize, Serialize};
 
 pub type VarNameIndexMap<V> = IndexMap<VarName, V, rustc_hash::FxBuildHasher>;
+pub type SymbolAncestryMap = IndexMap<DefId, SymbolAncestry, rustc_hash::FxBuildHasher>;
 
 #[cfg(test)]
 use component_ref_helpers::from_component_ref_with_def_map_impl;
@@ -73,6 +74,17 @@ pub use when_equations::{WhenClause, WhenEquation};
 pub struct Model {
     /// All variables with globally unique names.
     pub variables: VarNameIndexMap<Variable>,
+    /// Resolved record containers retained for record-equation lowering.
+    ///
+    /// Record fields remain the authoritative Flat variables. This table only
+    /// preserves the compact type identity discarded when containers expand.
+    #[serde(default)]
+    pub record_instances: VarNameIndexMap<RecordInstance>,
+    /// Resolved field layout for each record declaration used by an instance.
+    ///
+    /// This is type metadata, not callable-function reachability. Record
+    /// equations use it to preserve one tensor equation per declared field.
+    pub record_types: IndexMap<DefId, RecordType, rustc_hash::FxBuildHasher>,
     /// Declared flat-output type name for each variable (e.g., Boolean, Integer, MyEnum).
     ///
     /// Keys match `variables` and values preserve resolved type identity for rendering.
@@ -173,7 +185,33 @@ pub struct Model {
     /// to the symbol itself. Used by downstream phases for child/descendant
     /// checks without rendered-name prefix matching.
     #[serde(default)]
-    pub symbol_ancestry: IndexMap<DefId, Vec<DefId>>,
+    pub symbol_ancestry: SymbolAncestryMap,
+}
+
+/// Compact resolved identity for a record container expanded into Flat fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordInstance {
+    pub component_ref: ComponentReference,
+    pub source_span: Span,
+    pub canonical_type_id: TypeId,
+    pub type_name: String,
+    pub type_def_id: DefId,
+    pub dims: Vec<i64>,
+}
+
+/// Resolved field layout of one record declaration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordType {
+    pub name: String,
+    pub fields: Vec<RecordField>,
+}
+
+/// One declared record field retained for exact Flat-to-DAE expansion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordField {
+    pub name: String,
+    pub def_id: DefId,
+    pub dims: Vec<i64>,
 }
 
 impl Model {
@@ -208,7 +246,13 @@ impl Model {
     }
 
     /// Add a function definition to the model.
-    pub fn add_function(&mut self, func: Function) {
+    pub fn add_function(&mut self, mut func: Function) {
+        let instance_id = self
+            .functions
+            .get(&func.name)
+            .and_then(|existing| existing.instance_id)
+            .unwrap_or_else(|| next_function_instance_id(&self.functions));
+        func.instance_id = Some(instance_id);
         self.functions.insert(func.name.clone(), func);
     }
 
@@ -274,6 +318,7 @@ impl Model {
                 .validate_shape_contract()
                 .map_err(ModelShapeContractError::Variable)?;
         }
+        let mut function_instances = IndexMap::new();
         for (key, function) in &self.functions {
             if key != &function.name {
                 return Err(ModelShapeContractError::FunctionKeyNameMismatch {
@@ -285,9 +330,38 @@ impl Model {
             function
                 .validate_shape_contract()
                 .map_err(ModelShapeContractError::Function)?;
+            let instance_id = function.instance_id.ok_or_else(|| {
+                ModelShapeContractError::MissingFunctionInstanceId {
+                    function: function.name.clone(),
+                    span: function.span,
+                }
+            })?;
+            if let Some(first) = function_instances.insert(instance_id, function.name.clone()) {
+                return Err(ModelShapeContractError::DuplicateFunctionInstanceId {
+                    instance_id,
+                    first,
+                    second: function.name.clone(),
+                    span: function.span,
+                });
+            }
         }
         Ok(())
     }
+}
+
+fn next_function_instance_id(functions: &VarNameIndexMap<Function>) -> FunctionInstanceId {
+    let Some(last) = functions
+        .values()
+        .filter_map(|function| function.instance_id)
+        .map(FunctionInstanceId::index)
+        .max()
+    else {
+        return FunctionInstanceId::new(0);
+    };
+    FunctionInstanceId::new(
+        last.checked_add(1)
+            .expect("Flat function instance identity space exhausted"),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,6 +378,16 @@ pub enum ModelShapeContractError {
         name: VarName,
         span: Span,
     },
+    MissingFunctionInstanceId {
+        function: VarName,
+        span: Span,
+    },
+    DuplicateFunctionInstanceId {
+        instance_id: FunctionInstanceId,
+        first: VarName,
+        second: VarName,
+        span: Span,
+    },
 }
 
 impl ModelShapeContractError {
@@ -312,7 +396,9 @@ impl ModelShapeContractError {
             Self::Variable(error) => error.span(),
             Self::Function(error) => error.span(),
             Self::VariableKeyNameMismatch { span, .. }
-            | Self::FunctionKeyNameMismatch { span, .. } => *span,
+            | Self::FunctionKeyNameMismatch { span, .. }
+            | Self::MissingFunctionInstanceId { span, .. }
+            | Self::DuplicateFunctionInstanceId { span, .. } => *span,
         }
     }
 }
@@ -569,6 +655,67 @@ mod variable_shape_contract_tests {
     }
 
     #[test]
+    fn add_function_assigns_stable_distinct_exposure_identities() {
+        let mut model = Model::new();
+        let mut a = Function::new("Pkg.A.f", test_span());
+        a.instance_id = Some(FunctionInstanceId::new(99));
+        let mut b = Function::new("Pkg.B.f", test_span());
+        b.instance_id = Some(FunctionInstanceId::new(99));
+        model.add_function(a);
+        model.add_function(b);
+
+        let a_id = model.functions[&VarName::new("Pkg.A.f")]
+            .instance_id
+            .expect("first exposure identity");
+        let b_id = model.functions[&VarName::new("Pkg.B.f")]
+            .instance_id
+            .expect("second exposure identity");
+        assert_ne!(a_id, b_id);
+
+        model.add_function(Function::new("Pkg.A.f", test_span()));
+        assert_eq!(
+            model.functions[&VarName::new("Pkg.A.f")].instance_id,
+            Some(a_id),
+            "replacing an exposed definition must preserve its identity"
+        );
+    }
+
+    #[test]
+    fn flat_model_shape_contract_rejects_missing_function_instance_identity() {
+        let mut model = Model::new();
+        let function = Function::new("Pkg.f", test_span());
+        model.functions.insert(function.name.clone(), function);
+
+        assert_eq!(
+            model.validate_shape_contract(),
+            Err(ModelShapeContractError::MissingFunctionInstanceId {
+                function: VarName::new("Pkg.f"),
+                span: test_span(),
+            })
+        );
+    }
+
+    #[test]
+    fn flat_model_shape_contract_rejects_duplicate_function_instance_identity() {
+        let mut model = Model::new();
+        for name in ["Pkg.A.f", "Pkg.B.f"] {
+            let mut function = Function::new(name, test_span());
+            function.instance_id = Some(FunctionInstanceId::new(7));
+            model.functions.insert(function.name.clone(), function);
+        }
+
+        assert_eq!(
+            model.validate_shape_contract(),
+            Err(ModelShapeContractError::DuplicateFunctionInstanceId {
+                instance_id: FunctionInstanceId::new(7),
+                first: VarName::new("Pkg.A.f"),
+                second: VarName::new("Pkg.B.f"),
+                span: test_span(),
+            })
+        );
+    }
+
+    #[test]
     fn flat_model_shape_contract_rejects_function_param_negative_dims() {
         let mut model = Model::new();
         let mut function = Function::new("Pkg.f", Span::DUMMY);
@@ -711,8 +858,11 @@ pub struct StructuredEquationFamily {
     /// First equation index in the corresponding flat equation vector.
     #[serde(default)]
     pub first_equation_index: usize,
-    /// Scalar-view equation count for each domain point in deterministic order.
-    pub equation_counts: Vec<usize>,
+    /// Uniform scalar-view equation count emitted by each domain point.
+    ///
+    /// A structured family is retained only when this count is uniform, keeping
+    /// its metadata independent of domain cardinality.
+    pub equations_per_point: usize,
     /// Source span for diagnostics.
     pub span: Span,
     /// Typed origin for traceability.

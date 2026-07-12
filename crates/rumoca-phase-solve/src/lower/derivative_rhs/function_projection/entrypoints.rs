@@ -101,26 +101,21 @@ pub(in crate::lower) fn function_call_projected_scalars_with_owner(
         else {
             return Ok(None);
         };
-        let output_expr = outputs
-            .get(scalar_index)
-            .ok_or_else(|| {
-                LowerError::contract_violation(
-                    format!(
-                        "selected function output index {} is out of bounds for {} projected outputs",
-                        scalar_index + 1,
-                        outputs.len()
-                    ),
-                    owner_span,
-                )
-            })?
-            .expr
-            .clone();
-        let span = owner_span;
-        let mut values =
-            projection_vec_with_capacity(1, "selected function output scalar count", span)?;
-        values.push(output_expr);
-        return Ok(Some(values));
+        let Some(output_expr) = take_selected_projected_output(outputs, &scalar_index) else {
+            return Ok(None);
+        };
+        Ok(Some(vec![output_expr]))
+    } else {
+        function_call_unselected_projected_scalars(expr, dae_model, &analysis, owner_span)
     }
+}
+
+fn function_call_unselected_projected_scalars(
+    expr: &rumoca_core::Expression,
+    dae_model: &dae::Dae,
+    analysis: &FunctionProjectionAnalysis<'_>,
+    owner_span: rumoca_core::Span,
+) -> Result<Option<Vec<rumoca_core::Expression>>, LowerError> {
     if let Some((call, field)) = function_field_access(expr)
         && let Some(outputs) = analysis.top_level_function_call_outputs(
             call,
@@ -218,10 +213,7 @@ pub(in crate::lower) fn function_call_projected_output_groups_with_owner(
                 outputs
                     .iter()
                     .filter(|output| {
-                        output
-                            .field_path
-                            .first()
-                            .is_some_and(|field| field == &output_param.name)
+                        output.output_name.as_deref() == Some(output_param.name.as_str())
                     })
                     .map(|output| output.expr.clone()),
             );
@@ -333,6 +325,20 @@ pub(in crate::lower) fn project_array_like_scalar_with_owner(
     analysis.project_value(expr, &dims, flat_index, &scope, 0, owner_span)
 }
 
+pub(super) fn take_selected_projected_output(
+    outputs: Vec<ProjectedFunctionOutput>,
+    projection: &crate::projection_suffix::OutputProjectionSuffix,
+) -> Option<rumoca_core::Expression> {
+    outputs
+        .into_iter()
+        .find(|output| {
+            output.output_name.as_deref() == Some(projection.output_name.as_str())
+                && output.field_path == projection.output_fields
+                && output.selector_indices == projection.indices
+        })
+        .map(|output| output.expr)
+}
+
 pub(in crate::lower::derivative_rhs) fn projected_output_expressions(
     outputs: Vec<ProjectedFunctionOutput>,
     span: rumoca_core::Span,
@@ -375,6 +381,7 @@ pub(in crate::lower::derivative_rhs) fn project_target_scalar_outputs(
             .with_fallback_span(span));
         }
         outputs.push(ProjectedFunctionOutput {
+            output_name: None,
             field_path: Vec::new(),
             selector_indices: required_flat_index_to_subscripts(
                 dims,

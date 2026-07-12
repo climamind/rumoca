@@ -4,11 +4,19 @@ use rumoca_core::ExpressionRewriter;
 use rumoca_ir_dae as dae;
 
 use crate::projection_maps::{
-    build_component_index_projection_map, build_function_output_projection_map, output_scalar_count,
+    FunctionOutputProjectionMap, RecordFieldProjectionMap, build_component_index_projection_map,
+    build_function_output_projection_map, build_record_field_projection_map,
+    checked_projection_subscript, output_scalar_count,
 };
 
+mod function_maps;
+mod index_projection;
 mod projection;
 mod shape;
+use function_maps::{
+    ConstructorInputMap, build_constructor_input_map, build_dynamic_function_output_map,
+    build_function_output_dims_map, project_wrapped_dynamic_function_output,
+};
 #[cfg(test)]
 use projection::is_complex_field_scalar_name;
 use projection::{
@@ -28,6 +36,86 @@ type Span = rumoca_core::Span;
 type Subscript = rumoca_core::Subscript;
 type VarName = rumoca_core::VarName;
 type StructuralError = crate::StructuralError;
+
+struct StaticComprehensionSubstituter {
+    values: HashMap<String, i64>,
+}
+
+impl ExpressionRewriter for StaticComprehensionSubstituter {
+    fn rewrite_var_ref_expression(
+        &mut self,
+        name: &Reference,
+        subscripts: &[Subscript],
+        span: Span,
+    ) -> Expression {
+        if subscripts.is_empty()
+            && let Some(value) = self.values.get(name.as_str())
+        {
+            return Expression::Literal {
+                value: Literal::Integer(*value),
+                span,
+            };
+        }
+        self.walk_var_ref_expression(name, subscripts, span)
+    }
+
+    fn walk_array_comprehension_expression(
+        &mut self,
+        expr: &Expression,
+        indices: &[rumoca_core::ComprehensionIndex],
+        filter: Option<&Expression>,
+        span: Span,
+    ) -> Expression {
+        let rewritten_indices = self.rewrite_comprehension_indices(indices);
+        let mut nested_values = self.values.clone();
+        for index in indices {
+            nested_values.remove(&index.name);
+        }
+        let mut nested = Self {
+            values: nested_values,
+        };
+        Expression::ArrayComprehension {
+            expr: Box::new(nested.rewrite_expression(expr)),
+            indices: rewritten_indices,
+            filter: filter.map(|filter| Box::new(nested.rewrite_expression(filter))),
+            span,
+        }
+    }
+}
+
+fn constructor_inputs_for_call<'a>(
+    name: &Reference,
+    constructors: &'a ConstructorInputMap,
+) -> Option<&'a [rumoca_core::FunctionParam]> {
+    let instance_id = name.resolved_function()?.instance_id;
+    constructors.get(&instance_id).map(Vec::as_slice)
+}
+
+fn bind_constructor_fields(
+    name: &Reference,
+    args: &[Expression],
+    span: Span,
+    constructors: &ConstructorInputMap,
+) -> Result<Vec<Expression>, StructuralError> {
+    let inputs = constructor_inputs_for_call(name, constructors).ok_or_else(|| {
+        structural_contract_violation(
+            format!(
+                "record constructor `{}` lacks a resolved constructor signature",
+                name.as_str()
+            ),
+            span,
+        )
+    })?;
+    crate::function_arguments::bind_function_arguments(inputs, args).ok_or_else(|| {
+        structural_contract_violation(
+            format!(
+                "record constructor `{}` arguments do not fill its declared input slots",
+                name.as_str()
+            ),
+            span,
+        )
+    })
+}
 
 /// Build output variable names in solver-vector order (states, algebraics, outputs).
 ///
@@ -68,6 +156,8 @@ pub fn build_var_dims_map(dae: &Dae) -> HashMap<String, Vec<i64>> {
         .iter()
         .chain(dae.variables.algebraics.iter())
         .chain(dae.variables.outputs.iter())
+        .chain(dae.variables.discrete_reals.iter())
+        .chain(dae.variables.discrete_valued.iter())
         .chain(dae.variables.parameters.iter())
         .chain(dae.variables.constants.iter())
         .chain(dae.variables.inputs.iter())
@@ -87,6 +177,8 @@ pub fn build_var_spans_map(dae: &Dae) -> HashMap<String, Span> {
         .iter()
         .chain(dae.variables.algebraics.iter())
         .chain(dae.variables.outputs.iter())
+        .chain(dae.variables.discrete_reals.iter())
+        .chain(dae.variables.discrete_valued.iter())
         .chain(dae.variables.parameters.iter())
         .chain(dae.variables.constants.iter())
         .chain(dae.variables.inputs.iter())
@@ -240,844 +332,6 @@ pub fn build_complex_field_map(dae: &Dae) -> HashMap<String, [Option<String>; 2]
         map.entry(base.to_string()).or_insert([None, None])[slot] = Some(raw.to_string());
     }
     map
-}
-
-/// Recursively index into an expression tree at 1-based Modelica index `i`.
-///
-/// - `Array { elements }` → return `elements[i-1]`
-/// - `VarRef { name, subscripts: [] }` for array vars → add `Subscript::generated_index(i, rumoca_core::Span::DUMMY)`
-/// - `FunctionCall { is_constructor: true }` → project positional constructor arg `i`
-/// - `Binary/Unary/BuiltinCall/If/FunctionCall/Index` → recurse into children
-/// - Scalars (Literal, etc.) → broadcast unchanged
-fn comprehension_index_value_for_scalar(range: &Expression, one_based_index: usize) -> Option<i64> {
-    let Expression::Range {
-        start, step, end, ..
-    } = range
-    else {
-        return None;
-    };
-    let start = integer_literal_value(start)?;
-    let step = match step.as_deref() {
-        Some(step) => integer_literal_value(step)?,
-        None => 1,
-    };
-    let offset = i64::try_from(one_based_index.checked_sub(1)?).ok()?;
-    let value = start.checked_add(offset.checked_mul(step)?)?;
-    let end = integer_literal_value(end)?;
-    ((step > 0 && value <= end) || (step < 0 && value >= end) || (step == 0 && value == start))
-        .then_some(value)
-}
-
-struct ComprehensionIndexSubstitution<'a> {
-    name: &'a str,
-    value: i64,
-    span: Span,
-}
-
-impl ExpressionRewriter for ComprehensionIndexSubstitution<'_> {
-    fn walk_var_ref_expression(
-        &mut self,
-        name: &Reference,
-        subscripts: &[Subscript],
-        span: Span,
-    ) -> Expression {
-        if name.as_str() == self.name && subscripts.is_empty() {
-            return Expression::Literal {
-                value: Literal::Integer(self.value),
-                span: self.span,
-            };
-        }
-        Expression::VarRef {
-            name: name.clone(),
-            subscripts: self.rewrite_subscripts(subscripts),
-            span,
-        }
-    }
-
-    fn walk_array_comprehension_expression(
-        &mut self,
-        expr: &Expression,
-        indices: &[rumoca_core::ComprehensionIndex],
-        filter: Option<&Expression>,
-        span: Span,
-    ) -> Expression {
-        if indices.iter().any(|index| index.name == self.name) {
-            return Expression::ArrayComprehension {
-                expr: Box::new(expr.clone()),
-                indices: indices.to_vec(),
-                filter: filter.cloned().map(Box::new),
-                span,
-            };
-        }
-        ExpressionRewriter::walk_array_comprehension_expression(self, expr, indices, filter, span)
-    }
-}
-
-pub struct IndexProjectionContext<'a> {
-    i: usize,
-    context_span: Option<Span>,
-    var_dims: &'a HashMap<String, Vec<i64>>,
-    var_spans: &'a HashMap<String, Span>,
-    structural_values: &'a HashMap<String, i64>,
-    complex_fields: &'a HashMap<String, [Option<String>; 2]>,
-    component_index_map: &'a HashMap<String, HashMap<usize, String>>,
-    function_output_index_map: &'a HashMap<String, HashMap<usize, String>>,
-}
-
-impl<'a> IndexProjectionContext<'a> {
-    fn with_index(&self, i: usize) -> IndexProjectionContext<'a> {
-        IndexProjectionContext {
-            i,
-            context_span: self.context_span,
-            var_dims: self.var_dims,
-            var_spans: self.var_spans,
-            structural_values: self.structural_values,
-            complex_fields: self.complex_fields,
-            component_index_map: self.component_index_map,
-            function_output_index_map: self.function_output_index_map,
-        }
-    }
-
-    fn project_at(&self, expr: &Expression, i: usize) -> Result<Expression, StructuralError> {
-        self.with_index(i).project(expr)
-    }
-
-    fn map_exprs(&self, exprs: &[Expression]) -> Result<Vec<Expression>, StructuralError> {
-        exprs.iter().map(|expr| self.project(expr)).collect()
-    }
-
-    fn project_var_ref(
-        &self,
-        name: &Reference,
-        subscripts: &[Subscript],
-        fallback: &Expression,
-    ) -> Result<Expression, StructuralError> {
-        if let Some(dims) = self.var_dims.get(name.as_str()) {
-            return project_dimmed_var_ref(name, dims, subscripts, fallback, self);
-        }
-
-        if !subscripts.is_empty() {
-            return Ok(fallback.clone());
-        }
-
-        if let Some(fields) = self.complex_fields.get(name.as_str()) {
-            let projected = match self.i {
-                1 => fields[0].as_ref(),
-                2 => fields[1].as_ref(),
-                _ => None,
-            };
-            if let Some(projected_name) = projected {
-                let span =
-                    projection_source_span(name, fallback, self.var_spans, self.context_span)?;
-                return Ok(Expression::VarRef {
-                    name: rumoca_core::Reference::new(projected_name.clone()),
-                    subscripts: vec![],
-                    span,
-                });
-            }
-        }
-
-        if let Some(by_index) = self.component_index_map.get(name.as_str())
-            && let Some(projected_name) = by_index.get(&self.i)
-        {
-            let span = projection_source_span(name, fallback, self.var_spans, self.context_span)?;
-            return Ok(Expression::VarRef {
-                name: rumoca_core::Reference::new(projected_name.clone()),
-                subscripts: vec![],
-                span,
-            });
-        }
-
-        Ok(fallback.clone())
-    }
-
-    fn expression_shape(&self, expr: &Expression) -> ExpressionShape {
-        match expr {
-            Expression::Literal { value: _, .. } => ExpressionShape::Scalar,
-            Expression::VarRef {
-                name, subscripts, ..
-            } => self.var_ref_shape(name, subscripts),
-            Expression::Array {
-                elements,
-                is_matrix,
-                ..
-            } => array_literal_shape(elements, *is_matrix),
-            Expression::Unary { rhs, .. } => self.expression_shape(rhs),
-            Expression::Binary { op, lhs, rhs, .. } => {
-                let lhs_shape = self.expression_shape(lhs);
-                let rhs_shape = self.expression_shape(rhs);
-                if matches!(op, OpBinary::Mul) {
-                    combine_matrix_mul_shapes(lhs_shape, rhs_shape)
-                } else if matches!(op, OpBinary::MulElem) {
-                    combine_elementwise_shapes(lhs_shape, rhs_shape)
-                } else if matches!(
-                    op,
-                    OpBinary::Add | OpBinary::AddElem | OpBinary::Sub | OpBinary::SubElem
-                ) {
-                    combine_additive_shapes(lhs_shape, rhs_shape)
-                } else if matches!(op, OpBinary::Div | OpBinary::DivElem) {
-                    combine_division_shapes(lhs_shape, rhs_shape)
-                } else {
-                    ExpressionShape::Scalar
-                }
-            }
-            Expression::If { else_branch, .. } => self.expression_shape(else_branch),
-            Expression::BuiltinCall { function, args, .. } => self.builtin_shape(*function, args),
-            Expression::FunctionCall {
-                args,
-                is_constructor,
-                ..
-            } if *is_constructor => {
-                if args.len() > 1 {
-                    ExpressionShape::Vector(args.len())
-                } else {
-                    ExpressionShape::Scalar
-                }
-            }
-            Expression::Index {
-                base, subscripts, ..
-            } => self
-                .expression_dims(base)
-                .and_then(|dims| {
-                    apply_subscripts_to_dims(&dims, subscripts, self.structural_values)
-                })
-                .map(|dims| shape_from_dims(&dims))
-                .unwrap_or(ExpressionShape::Other),
-            _ => ExpressionShape::Other,
-        }
-    }
-
-    fn expression_dims(&self, expr: &Expression) -> Option<Vec<i64>> {
-        match self.expression_shape(expr) {
-            ExpressionShape::Scalar => Some(Vec::new()),
-            ExpressionShape::Vector(n) => Some(vec![n as i64]),
-            ExpressionShape::Matrix(r, c) => Some(vec![r as i64, c as i64]),
-            ExpressionShape::Other => None,
-        }
-    }
-
-    fn var_ref_shape(&self, name: &Reference, subscripts: &[Subscript]) -> ExpressionShape {
-        if let Some(dims) = self.var_dims.get(name.as_str()) {
-            return apply_subscripts_to_dims(dims, subscripts, self.structural_values)
-                .map(|dims| shape_from_dims(&dims))
-                .unwrap_or(ExpressionShape::Other);
-        }
-        if self.complex_fields.contains_key(name.as_str()) {
-            return ExpressionShape::Vector(2);
-        }
-        if let Some(by_index) = self.component_index_map.get(name.as_str()) {
-            return ExpressionShape::Vector(by_index.len());
-        }
-        ExpressionShape::Scalar
-    }
-
-    fn builtin_shape(
-        &self,
-        function: rumoca_core::BuiltinFunction,
-        args: &[Expression],
-    ) -> ExpressionShape {
-        match function {
-            rumoca_core::BuiltinFunction::Der
-            | rumoca_core::BuiltinFunction::Pre
-            | rumoca_core::BuiltinFunction::NoEvent => args
-                .first()
-                .map(|arg| self.expression_shape(arg))
-                .unwrap_or(ExpressionShape::Scalar),
-            rumoca_core::BuiltinFunction::Transpose => {
-                match args.first().map(|arg| self.expression_shape(arg)) {
-                    Some(ExpressionShape::Matrix(r, c)) => ExpressionShape::Matrix(c, r),
-                    Some(ExpressionShape::Vector(n)) => ExpressionShape::Vector(n),
-                    Some(shape) => shape,
-                    None => ExpressionShape::Other,
-                }
-            }
-            rumoca_core::BuiltinFunction::Cross => ExpressionShape::Vector(3),
-            rumoca_core::BuiltinFunction::Skew => ExpressionShape::Matrix(3, 3),
-            rumoca_core::BuiltinFunction::Identity => args
-                .first()
-                .and_then(integer_literal_value)
-                .and_then(|n| (n > 0).then_some(ExpressionShape::Matrix(n as usize, n as usize)))
-                .unwrap_or(ExpressionShape::Other),
-            rumoca_core::BuiltinFunction::Diagonal => {
-                match args.first().map(|arg| self.expression_shape(arg)) {
-                    Some(ExpressionShape::Vector(n)) => ExpressionShape::Matrix(n, n),
-                    _ => ExpressionShape::Other,
-                }
-            }
-            rumoca_core::BuiltinFunction::Vector => args
-                .first()
-                .map(|arg| match self.expression_shape(arg) {
-                    ExpressionShape::Scalar => ExpressionShape::Vector(1),
-                    ExpressionShape::Vector(n) => ExpressionShape::Vector(n),
-                    ExpressionShape::Matrix(r, c) => ExpressionShape::Vector(r * c),
-                    ExpressionShape::Other => ExpressionShape::Other,
-                })
-                .unwrap_or(ExpressionShape::Other),
-            rumoca_core::BuiltinFunction::Matrix => args
-                .first()
-                .map(|arg| match self.expression_shape(arg) {
-                    ExpressionShape::Scalar => ExpressionShape::Matrix(1, 1),
-                    ExpressionShape::Vector(n) => ExpressionShape::Matrix(n, 1),
-                    shape => shape,
-                })
-                .unwrap_or(ExpressionShape::Other),
-            rumoca_core::BuiltinFunction::Scalar
-            | rumoca_core::BuiltinFunction::Sum
-            | rumoca_core::BuiltinFunction::Product
-            | rumoca_core::BuiltinFunction::Size
-            | rumoca_core::BuiltinFunction::Ndims => ExpressionShape::Scalar,
-            _ => ExpressionShape::Scalar,
-        }
-    }
-
-    fn project_matrix_mul(
-        &self,
-        lhs: &Expression,
-        rhs: &Expression,
-        span: Span,
-    ) -> Result<Option<Expression>, StructuralError> {
-        let lhs_shape = self.expression_shape(lhs);
-        let rhs_shape = self.expression_shape(rhs);
-        match (lhs_shape, rhs_shape) {
-            (ExpressionShape::Vector(n), ExpressionShape::Vector(m)) if n == m => {
-                let mut terms = Vec::with_capacity(n);
-                for k in 1..=n {
-                    terms.push(mul_expr_with_span(
-                        self.project_at(lhs, k)?,
-                        self.project_at(rhs, k)?,
-                        span,
-                    ));
-                }
-                Ok(Some(sum_terms_with_span(terms, span)))
-            }
-            (ExpressionShape::Matrix(rows, cols), ExpressionShape::Vector(n)) if cols == n => {
-                if self.i < 1 || self.i > rows {
-                    return Ok(None);
-                }
-                let row = self.i;
-                let mut terms = Vec::with_capacity(cols);
-                for k in 1..=cols {
-                    terms.push(mul_expr_with_span(
-                        self.project_at(lhs, matrix_linear_index(row, k, cols))?,
-                        self.project_at(rhs, k)?,
-                        span,
-                    ));
-                }
-                Ok(Some(sum_terms_with_span(terms, span)))
-            }
-            (ExpressionShape::Vector(n), ExpressionShape::Matrix(rows, cols)) if n == rows => {
-                if self.i < 1 || self.i > cols {
-                    return Ok(None);
-                }
-                let col = self.i;
-                let mut terms = Vec::with_capacity(n);
-                for k in 1..=n {
-                    terms.push(mul_expr_with_span(
-                        self.project_at(lhs, k)?,
-                        self.project_at(rhs, matrix_linear_index(k, col, cols))?,
-                        span,
-                    ));
-                }
-                Ok(Some(sum_terms_with_span(terms, span)))
-            }
-            (
-                ExpressionShape::Matrix(lhs_rows, lhs_cols),
-                ExpressionShape::Matrix(rhs_rows, rhs_cols),
-            ) if lhs_cols == rhs_rows => {
-                let result_count = lhs_rows * rhs_cols;
-                if self.i < 1 || self.i > result_count {
-                    return Ok(None);
-                }
-                let (row, col) = row_major_subscripts_2d(self.i, rhs_cols);
-                let mut terms = Vec::with_capacity(lhs_cols);
-                for k in 1..=lhs_cols {
-                    terms.push(mul_expr_with_span(
-                        self.project_at(lhs, matrix_linear_index(row, k, lhs_cols))?,
-                        self.project_at(rhs, matrix_linear_index(k, col, rhs_cols))?,
-                        span,
-                    ));
-                }
-                Ok(Some(sum_terms_with_span(terms, span)))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    fn project_transpose(
-        &self,
-        args: &[Expression],
-    ) -> Result<Option<Expression>, StructuralError> {
-        let Some(arg) = args.first() else {
-            return Ok(None);
-        };
-        match self.expression_shape(arg) {
-            ExpressionShape::Matrix(rows, cols) => {
-                let result_count = rows * cols;
-                if self.i < 1 || self.i > result_count {
-                    return Ok(None);
-                }
-                let (row, col) = row_major_subscripts_2d(self.i, rows);
-                Ok(Some(
-                    self.project_at(arg, matrix_linear_index(col, row, cols))?,
-                ))
-            }
-            ExpressionShape::Vector(n) if self.i >= 1 && self.i <= n => {
-                Ok(Some(self.project_at(arg, self.i)?))
-            }
-            ExpressionShape::Scalar if self.i == 1 => Ok(Some(self.project_at(arg, 1)?)),
-            _ => Ok(None),
-        }
-    }
-
-    fn project_cross(
-        &self,
-        args: &[Expression],
-        span: Span,
-    ) -> Result<Option<Expression>, StructuralError> {
-        let Some(lhs) = args.first() else {
-            return Ok(None);
-        };
-        let Some(rhs) = args.get(1) else {
-            return Ok(None);
-        };
-        if self.expression_shape(lhs) != ExpressionShape::Vector(3)
-            || self.expression_shape(rhs) != ExpressionShape::Vector(3)
-        {
-            return Ok(None);
-        }
-
-        let component = match self.i {
-            1 => sub_expr_with_span(
-                mul_expr_with_span(self.project_at(lhs, 2)?, self.project_at(rhs, 3)?, span),
-                mul_expr_with_span(self.project_at(lhs, 3)?, self.project_at(rhs, 2)?, span),
-                span,
-            ),
-            2 => sub_expr_with_span(
-                mul_expr_with_span(self.project_at(lhs, 3)?, self.project_at(rhs, 1)?, span),
-                mul_expr_with_span(self.project_at(lhs, 1)?, self.project_at(rhs, 3)?, span),
-                span,
-            ),
-            3 => sub_expr_with_span(
-                mul_expr_with_span(self.project_at(lhs, 1)?, self.project_at(rhs, 2)?, span),
-                mul_expr_with_span(self.project_at(lhs, 2)?, self.project_at(rhs, 1)?, span),
-                span,
-            ),
-            _ => return Ok(None),
-        };
-        Ok(Some(component))
-    }
-
-    // SPEC_0021: Exception - cohesive lowering of scalarized linear-algebra Expression forms.
-    #[allow(clippy::too_many_lines)]
-    fn lower_scalar_linear_algebra(
-        &self,
-        expr: &Expression,
-    ) -> Result<Expression, StructuralError> {
-        match expr {
-            Expression::Binary { op, lhs, rhs, span } => {
-                let lowered_lhs = self.lower_scalar_linear_algebra(lhs)?;
-                let lowered_rhs = self.lower_scalar_linear_algebra(rhs)?;
-                if matches!(op, OpBinary::Mul)
-                    && self.expression_shape(expr) == ExpressionShape::Scalar
-                    && let Some(projected) =
-                        self.with_index(1)
-                            .project_matrix_mul(&lowered_lhs, &lowered_rhs, *span)?
-                {
-                    return Ok(projected);
-                }
-                Ok(Expression::Binary {
-                    op: op.clone(),
-                    lhs: Box::new(lowered_lhs),
-                    rhs: Box::new(lowered_rhs),
-                    span: *span,
-                })
-            }
-            Expression::Unary { op, rhs, span } => Ok(Expression::Unary {
-                op: op.clone(),
-                rhs: Box::new(self.lower_scalar_linear_algebra(rhs)?),
-                span: *span,
-            }),
-            Expression::BuiltinCall {
-                function,
-                args,
-                span,
-            } => Ok(Expression::BuiltinCall {
-                function: *function,
-                args: args
-                    .iter()
-                    .map(|arg| self.lower_scalar_linear_algebra(arg))
-                    .collect::<Result<Vec<_>, _>>()?,
-                span: *span,
-            }),
-            Expression::If {
-                branches,
-                else_branch,
-                span,
-            } => Ok(Expression::If {
-                branches: branches
-                    .iter()
-                    .map(|(condition, value)| {
-                        Ok((condition.clone(), self.lower_scalar_linear_algebra(value)?))
-                    })
-                    .collect::<Result<Vec<_>, StructuralError>>()?,
-                else_branch: Box::new(self.lower_scalar_linear_algebra(else_branch)?),
-                span: *span,
-            }),
-            Expression::FunctionCall {
-                name,
-                args,
-                is_constructor,
-                span,
-            } => Ok(Expression::FunctionCall {
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|arg| self.lower_scalar_linear_algebra(arg))
-                    .collect::<Result<Vec<_>, _>>()?,
-                is_constructor: *is_constructor,
-                span: *span,
-            }),
-            Expression::Array {
-                elements,
-                is_matrix,
-                span,
-            } => Ok(Expression::Array {
-                elements: elements
-                    .iter()
-                    .map(|element| self.lower_scalar_linear_algebra(element))
-                    .collect::<Result<Vec<_>, _>>()?,
-                is_matrix: *is_matrix,
-                span: *span,
-            }),
-            Expression::Tuple { elements, span } => Ok(Expression::Tuple {
-                elements: elements
-                    .iter()
-                    .map(|element| self.lower_scalar_linear_algebra(element))
-                    .collect::<Result<Vec<_>, _>>()?,
-                span: *span,
-            }),
-            Expression::Index {
-                base,
-                subscripts,
-                span,
-            } => {
-                if let Some(dims) = self.expression_dims(base)
-                    && apply_subscripts_to_dims(&dims, subscripts, self.structural_values)
-                        .is_some_and(|dims| dims.is_empty())
-                    && let Some(index) = linear_index_for_static_subscripts(
-                        &dims,
-                        subscripts,
-                        self.structural_values,
-                    )
-                {
-                    return self.project_at(base, index);
-                }
-                Ok(Expression::Index {
-                    base: Box::new(self.lower_scalar_linear_algebra(base)?),
-                    subscripts: subscripts.clone(),
-                    span: *span,
-                })
-            }
-            Expression::ArrayComprehension {
-                expr,
-                indices,
-                filter,
-                span,
-            } => Ok(Expression::ArrayComprehension {
-                expr: Box::new(self.lower_scalar_linear_algebra(expr)?),
-                indices: indices.clone(),
-                filter: filter
-                    .as_ref()
-                    .map(|value| self.lower_scalar_linear_algebra(value).map(Box::new))
-                    .transpose()?,
-                span: *span,
-            }),
-            _ => Ok(expr.clone()),
-        }
-    }
-
-    fn project(&self, expr: &Expression) -> Result<Expression, StructuralError> {
-        match expr {
-            Expression::Array {
-                elements,
-                is_matrix,
-                ..
-            } => Ok(project_array_literal_scalar(elements, *is_matrix, self.i)
-                .unwrap_or_else(|| expr.clone())),
-            Expression::ArrayComprehension {
-                expr: inner,
-                indices,
-                filter,
-                span,
-            } => self.project_array_comprehension(inner, indices, filter.as_deref(), *span),
-            Expression::VarRef {
-                name, subscripts, ..
-            } => self.project_var_ref(name, subscripts, expr),
-            Expression::Binary { op, lhs, rhs, span } => self.project_binary(op, lhs, rhs, *span),
-            Expression::Unary { op, rhs, span } => Ok(Expression::Unary {
-                op: op.clone(),
-                rhs: Box::new(self.project(rhs)?),
-                span: *span,
-            }),
-            Expression::BuiltinCall {
-                function,
-                args,
-                span,
-            } => {
-                if matches!(function, rumoca_core::BuiltinFunction::Transpose)
-                    && let Some(projected) = self.project_transpose(args)?
-                {
-                    return Ok(projected);
-                }
-                if matches!(function, rumoca_core::BuiltinFunction::Cross)
-                    && let Some(projected) = self.project_cross(args, *span)?
-                {
-                    return Ok(projected);
-                }
-                Ok(Expression::BuiltinCall {
-                    function: *function,
-                    args: self.map_exprs(args)?,
-                    span: *span,
-                })
-            }
-            Expression::If {
-                branches,
-                else_branch,
-                span,
-            } => Ok(Expression::If {
-                branches: branches
-                    .iter()
-                    .map(|(cond, val)| Ok((cond.clone(), self.project(val)?)))
-                    .collect::<Result<Vec<_>, StructuralError>>()?,
-                else_branch: Box::new(self.project(else_branch)?),
-                span: *span,
-            }),
-            Expression::FunctionCall {
-                name,
-                args,
-                is_constructor,
-                span,
-            } => self.project_function_call(name, args, *is_constructor, *span),
-            Expression::Index {
-                base,
-                subscripts,
-                span,
-            } => {
-                if let Expression::VarRef {
-                    name,
-                    subscripts: base_subscripts,
-                    ..
-                } = base.as_ref()
-                    && base_subscripts.is_empty()
-                    && let Some(dims) = self.var_dims.get(name.as_str())
-                {
-                    return project_dimmed_var_ref(name, dims, subscripts, expr, self);
-                }
-                Ok(Expression::Index {
-                    base: Box::new(self.project(base)?),
-                    subscripts: subscripts.clone(),
-                    span: *span,
-                })
-            }
-            Expression::FieldAccess { base, field, .. } => {
-                if let Some(projected) = self.project_record_array_member_slice(base, field)? {
-                    return Ok(projected);
-                }
-                Ok(expr.clone())
-            }
-            _ => Ok(expr.clone()),
-        }
-    }
-
-    fn project_binary(
-        &self,
-        op: &OpBinary,
-        lhs: &Expression,
-        rhs: &Expression,
-        span: Span,
-    ) -> Result<Expression, StructuralError> {
-        if matches!(op, OpBinary::Mul)
-            && let Some(projected) = self.project_matrix_mul(lhs, rhs, span)?
-        {
-            return Ok(projected);
-        }
-        Ok(Expression::Binary {
-            op: op.clone(),
-            lhs: Box::new(self.project(lhs)?),
-            rhs: Box::new(self.project(rhs)?),
-            span,
-        })
-    }
-
-    fn project_array_comprehension(
-        &self,
-        inner: &Expression,
-        indices: &[rumoca_core::ComprehensionIndex],
-        filter: Option<&Expression>,
-        span: Span,
-    ) -> Result<Expression, StructuralError> {
-        if filter.is_some() || indices.len() != 1 {
-            return Ok(Expression::ArrayComprehension {
-                expr: Box::new(inner.clone()),
-                indices: indices.to_vec(),
-                filter: filter.cloned().map(Box::new),
-                span,
-            });
-        }
-        let Some(value) = comprehension_index_value_for_scalar(&indices[0].range, self.i) else {
-            return Ok(Expression::ArrayComprehension {
-                expr: Box::new(inner.clone()),
-                indices: indices.to_vec(),
-                filter: None,
-                span,
-            });
-        };
-        let mut substitution = ComprehensionIndexSubstitution {
-            name: &indices[0].name,
-            value,
-            span: indices[0].range.span().unwrap_or(span),
-        };
-        let selected = substitution.rewrite_expression(inner);
-        self.project(&selected)
-    }
-
-    fn project_function_call(
-        &self,
-        name: &Reference,
-        args: &[Expression],
-        is_constructor: bool,
-        span: rumoca_core::Span,
-    ) -> Result<Expression, StructuralError> {
-        if is_constructor && self.i >= 1 && self.i <= args.len() {
-            return self.project(&args[self.i - 1]);
-        }
-        if let Some(by_index) = self.function_output_index_map.get(name.as_str())
-            && let Some(projected_output) = by_index.get(&self.i)
-        {
-            return Ok(Expression::FunctionCall {
-                name: rumoca_core::Reference::new(format!(
-                    "{}.{}",
-                    name.as_str(),
-                    projected_output
-                )),
-                args: args.to_vec(),
-                is_constructor: false,
-                span,
-            });
-        }
-        Ok(Expression::FunctionCall {
-            name: name.clone(),
-            args: self.map_exprs(args)?,
-            is_constructor,
-            span,
-        })
-    }
-
-    /// Projects element `i` of a record-array member slice such as
-    /// `ac.pin[:].v` into the scalarized component variable `ac.pin[i].v`.
-    /// Declines when the selection is not a full one-dimensional colon slice
-    /// over a structured base or the element variable is unknown.
-    fn project_record_array_member_slice(
-        &self,
-        base: &Expression,
-        field: &str,
-    ) -> Result<Option<Expression>, StructuralError> {
-        let Expression::Index {
-            base: inner,
-            subscripts,
-            span,
-        } = base
-        else {
-            return Ok(None);
-        };
-        let Expression::VarRef {
-            name,
-            subscripts: ref_subscripts,
-            ..
-        } = inner.as_ref()
-        else {
-            return Ok(None);
-        };
-        if !ref_subscripts.is_empty()
-            || subscripts.len() != 1
-            || !matches!(subscripts[0], Subscript::Colon { .. })
-            || self.i == 0
-        {
-            return Ok(None);
-        }
-        let Some(component_ref) = name.component_ref() else {
-            return Ok(None);
-        };
-        let mut element_ref = component_ref.clone();
-        let Some(part) = element_ref.parts.last_mut() else {
-            return Ok(None);
-        };
-        part.subs = vec![generated_index_subscript(
-            self.i,
-            *span,
-            "structural record-array member slice subscript",
-        )?];
-        element_ref.parts.push(rumoca_core::ComponentRefPart {
-            ident: field.to_string(),
-            span: *span,
-            subs: Vec::new(),
-        });
-        // Existence of the element variable is enforced by the Solve
-        // reference resolver, which fails loudly on unknown references.
-        let reference = rumoca_core::Reference::from_component_reference(element_ref);
-        Ok(Some(Expression::VarRef {
-            name: reference,
-            subscripts: vec![],
-            span: *span,
-        }))
-    }
-}
-
-fn project_dimmed_var_ref(
-    name: &Reference,
-    dims: &[i64],
-    subscripts: &[Subscript],
-    fallback: &Expression,
-    projection: &IndexProjectionContext<'_>,
-) -> Result<Expression, StructuralError> {
-    if !subscripts.is_empty() {
-        let span = projection_source_span(
-            name,
-            fallback,
-            projection.var_spans,
-            projection.context_span,
-        )?;
-        return Ok(project_subscripted_dims(
-            dims,
-            subscripts,
-            projection.i,
-            span,
-            projection.structural_values,
-        )?
-        .map(|projected_subscripts| Expression::VarRef {
-            name: name.clone(),
-            subscripts: projected_subscripts,
-            span,
-        })
-        .unwrap_or_else(|| fallback.clone()));
-    }
-
-    let span = projection_source_span(
-        name,
-        fallback,
-        projection.var_spans,
-        projection.context_span,
-    )?;
-    let scalar_count = output_scalar_count(dims, span)?;
-    if scalar_count > 1 && projection.i <= scalar_count {
-        return Ok(Expression::VarRef {
-            name: name.clone(),
-            subscripts: linear_subscripts_for_dims_with_span(dims, projection.i, span)?,
-            span,
-        });
-    }
-
-    Ok(fallback.clone())
 }
 
 fn integer_literal_value(expr: &Expression) -> Option<i64> {
@@ -1301,58 +555,21 @@ fn sum_terms_with_span(terms: impl IntoIterator<Item = Expression>, span: Span) 
     iter.fold(first, |lhs, rhs| add_expr_with_span(lhs, rhs, span))
 }
 
-fn project_array_literal_scalar(
-    elements: &[Expression],
-    is_matrix: bool,
-    scalar_index: usize,
-) -> Option<Expression> {
-    if scalar_index == 0 {
-        return None;
-    }
-
-    let first = elements.first()?;
-    let Expression::Array {
-        elements: first_row,
-        ..
-    } = first
-    else {
-        if !is_matrix {
-            return elements.get(scalar_index - 1).cloned();
-        }
-        // MLS §10.4: a single-row matrix literal is encoded as `is_matrix=true`
-        // with scalar elements. Preserve the written row order on the compiled
-        // scalarization path so it matches interpreted array evaluation.
-        return elements.get(scalar_index - 1).cloned();
-    };
-    let cols = first_row.len();
-    if cols == 0 {
-        return None;
-    }
-
-    let flat = scalar_index - 1;
-    let row = flat / cols;
-    let col = flat % cols;
-    let Expression::Array {
-        elements: row_elements,
-        ..
-    } = elements.get(row)?
-    else {
-        return None;
-    };
-    row_elements.get(col).cloned()
-}
-
 pub fn index_into_expr(
     expr: &Expression,
     i: usize,
     var_dims: &HashMap<String, Vec<i64>>,
     complex_fields: &HashMap<String, [Option<String>; 2]>,
     component_index_map: &HashMap<String, HashMap<usize, String>>,
-    function_output_index_map: &HashMap<String, HashMap<usize, String>>,
+    function_output_index_map: &FunctionOutputProjectionMap,
 ) -> Result<Expression, StructuralError> {
     let structural_values = HashMap::new();
     let var_spans = HashMap::new();
-    IndexProjectionContext {
+    let dynamic_function_output_map = HashMap::new();
+    let function_output_dims_map = HashMap::new();
+    let record_field_projection_map = HashMap::new();
+    let constructor_input_map = HashMap::new();
+    index_projection::IndexProjectionContext {
         i,
         context_span: expr.span().filter(|span| !span.is_dummy()),
         var_dims,
@@ -1361,6 +578,12 @@ pub fn index_into_expr(
         complex_fields,
         component_index_map,
         function_output_index_map,
+        function_output_dims_map: &function_output_dims_map,
+        dynamic_function_output_map: &dynamic_function_output_map,
+        record_field_projection_map: &record_field_projection_map,
+        constructor_input_map: &constructor_input_map,
+        expected_dims: None,
+        allow_dynamic_function_projection: true,
     }
     .project(expr)
 }
@@ -1371,7 +594,11 @@ pub struct ExpressionScalarizationContext {
     structural_values: HashMap<String, i64>,
     complex_fields: HashMap<String, [Option<String>; 2]>,
     component_index_map: HashMap<String, HashMap<usize, String>>,
-    function_output_index_map: HashMap<String, HashMap<usize, String>>,
+    function_output_index_map: FunctionOutputProjectionMap,
+    function_output_dims_map: HashMap<rumoca_core::FunctionInstanceId, Vec<i64>>,
+    dynamic_function_output_map: HashMap<rumoca_core::FunctionInstanceId, String>,
+    record_field_projection_map: RecordFieldProjectionMap,
+    constructor_input_map: ConstructorInputMap,
 }
 
 pub fn build_expression_scalarization_context(
@@ -1386,6 +613,10 @@ pub fn build_expression_scalarization_context(
         complex_fields: build_complex_field_map(dae),
         component_index_map: build_component_index_projection_map(dae),
         function_output_index_map: build_function_output_projection_map(dae)?,
+        function_output_dims_map: build_function_output_dims_map(dae)?,
+        dynamic_function_output_map: build_dynamic_function_output_map(dae)?,
+        record_field_projection_map: build_record_field_projection_map(dae)?,
+        constructor_input_map: build_constructor_input_map(dae)?,
     })
 }
 
@@ -1400,7 +631,7 @@ pub fn scalarize_expression_rows(
 
     (1..=output_len)
         .map(|index| {
-            IndexProjectionContext {
+            index_projection::IndexProjectionContext {
                 i: index,
                 context_span: expr.span().filter(|span| !span.is_dummy()),
                 var_dims: &ctx.var_dims,
@@ -1409,6 +640,12 @@ pub fn scalarize_expression_rows(
                 complex_fields: &ctx.complex_fields,
                 component_index_map: &ctx.component_index_map,
                 function_output_index_map: &ctx.function_output_index_map,
+                function_output_dims_map: &ctx.function_output_dims_map,
+                dynamic_function_output_map: &ctx.dynamic_function_output_map,
+                record_field_projection_map: &ctx.record_field_projection_map,
+                constructor_input_map: &ctx.constructor_input_map,
+                expected_dims: None,
+                allow_dynamic_function_projection: true,
             }
             .project(expr)
         })
@@ -1808,6 +1045,10 @@ pub fn scalarize_equations(dae: &mut Dae) -> Result<(), StructuralError> {
     let complex_fields = build_complex_field_map(dae);
     let component_index_map = build_component_index_projection_map(dae);
     let function_output_index_map = build_function_output_projection_map(dae)?;
+    let function_output_dims_map = build_function_output_dims_map(dae)?;
+    let dynamic_function_output_map = build_dynamic_function_output_map(dae)?;
+    let record_field_projection_map = build_record_field_projection_map(dae)?;
+    let constructor_input_map = build_constructor_input_map(dae)?;
     let projection = ScalarProjectionContext {
         context_span: None,
         var_dims: &var_dims,
@@ -1816,6 +1057,11 @@ pub fn scalarize_equations(dae: &mut Dae) -> Result<(), StructuralError> {
         complex_fields: &complex_fields,
         component_index_map: &component_index_map,
         function_output_index_map: &function_output_index_map,
+        function_output_dims_map: &function_output_dims_map,
+        dynamic_function_output_map: &dynamic_function_output_map,
+        record_field_projection_map: &record_field_projection_map,
+        constructor_input_map: &constructor_input_map,
+        expected_dims: None,
     };
     let scalar_names = build_output_names(dae)?;
     let mut expanded = Vec::new();
@@ -1841,10 +1087,7 @@ pub fn scalarize_equations(dae: &mut Dae) -> Result<(), StructuralError> {
         &spans,
     );
 
-    lower_scalar_linear_algebra_exprs(&mut dae.conditions.relations, &projection)?;
-    lower_scalar_linear_algebra_exprs(&mut dae.events.synthetic_root_conditions, &projection)?;
-    lower_scalar_linear_algebra_exprs(&mut dae.clocks.triggered_conditions, &projection)?;
-    lower_scalar_linear_algebra_exprs(&mut dae.clocks.constructor_exprs, &projection)?;
+    lower_event_scalar_linear_algebra(dae, &projection)?;
     Ok(())
 }
 
@@ -1857,12 +1100,18 @@ fn expand_scalarized_equation(
     structural_values: &HashMap<String, i64>,
     expanded: &mut Vec<Equation>,
 ) -> Result<(), StructuralError> {
-    let eq_projection = projection.with_context_span(eq.span);
     let scalarization_target = eq
         .lhs
         .as_ref()
         .map(|lhs| lhs.as_str().to_string())
         .or_else(|| residual_lhs_target_name(&eq.rhs));
+    let expected_dims = scalarization_target
+        .as_deref()
+        .and_then(|target| var_dims.get(target))
+        .map(Vec::as_slice);
+    let eq_projection = projection
+        .with_context_span(eq.span)
+        .with_expected_dims(expected_dims);
     let residual_lhs_targets =
         residual_lhs_scalar_targets(&eq.rhs, eq.span, var_dims, structural_values)?;
     let (lhs_targets, has_residual_lhs_targets) = scalar_lhs_targets_for_equation(
@@ -1980,6 +1229,16 @@ fn expand_multi_scalar_equation(
         });
     }
     Ok(())
+}
+
+fn lower_event_scalar_linear_algebra(
+    dae: &mut Dae,
+    projection: &ScalarProjectionContext<'_>,
+) -> Result<(), StructuralError> {
+    lower_scalar_linear_algebra_exprs(&mut dae.conditions.relations, projection)?;
+    lower_scalar_linear_algebra_exprs(&mut dae.events.synthetic_root_conditions, projection)?;
+    lower_scalar_linear_algebra_exprs(&mut dae.clocks.triggered_conditions, projection)?;
+    lower_scalar_linear_algebra_exprs(&mut dae.clocks.constructor_exprs, projection)
 }
 
 #[cfg(test)]

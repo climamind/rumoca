@@ -303,14 +303,18 @@ pub(super) fn assignment_projection_dims(
 ) -> Result<Option<Vec<i64>>, LowerError> {
     match (value_dims, declared) {
         (Some(value_dims), Some(declared)) if value_dims != declared => {
-            Err(dimension_mismatch_error(
-                &format!("function `{function_name}` assignment to `{target}`"),
-                &declared,
-                &value_dims,
-                span,
-            ))
+            let context = format!("function `{function_name}` assignment to `{target}`");
+            match resolve_formal_projection_dims(&declared, &value_dims, &context, span)? {
+                Some(resolved) => Ok(Some(resolved)),
+                None => Err(dimension_mismatch_error(
+                    &context,
+                    &declared,
+                    &value_dims,
+                    span,
+                )),
+            }
         }
-        (Some(value_dims), _) if value_dims.is_empty() => Ok(None),
+        (Some(value_dims), _) if value_dims.is_empty() => Ok(Some(value_dims)),
         (Some(value_dims), _) => Ok(Some(value_dims)),
         (None, Some(declared)) => Ok(Some(declared)),
         (None, None) => Ok(None),
@@ -380,44 +384,126 @@ pub(super) fn projection_assignment_target(
     if last.subs.is_empty() {
         return Ok(ProjectionAssignmentTarget {
             base: component_ref.to_var_name().as_str().to_string(),
-            indices: None,
+            selectors: None,
             span,
         });
     }
-    let mut indices = projection_vec_with_capacity(
+    let mut selectors = projection_vec_with_capacity(
         last.subs.len(),
         "function assignment target subscript count",
         span,
     )?;
     for subscript in &last.subs {
-        let index = match subscript {
-            rumoca_core::Subscript::Index { value, span } if *value > 0 => Ok(*value),
+        let selector = match subscript {
+            rumoca_core::Subscript::Index { value, .. } if *value > 0 => {
+                Ok(ProjectionAssignmentSelector::Index(*value))
+            }
+            rumoca_core::Subscript::Colon { .. } => Ok(ProjectionAssignmentSelector::All),
             _ => Err(unsupported_at(
                 "dynamic function assignment target subscripts cannot be projected",
                 subscript.span(),
             )),
         }?;
-        indices.push(index);
+        selectors.push(selector);
     }
     last.subs.clear();
     Ok(ProjectionAssignmentTarget {
         base: rumoca_core::Reference::from_component_reference(base_ref)
             .as_str()
             .to_string(),
-        indices: Some(indices),
+        selectors: Some(selectors),
         span,
     })
 }
 
 pub(super) struct FunctionScopeSubstituter<'a> {
     pub(super) scope: &'a FunctionProjectionScope,
+    pub(super) materialize_arrays: bool,
     pub(super) error: Option<LowerError>,
     pub(super) stack: Vec<String>,
+}
+
+impl FunctionScopeSubstituter<'_> {
+    fn indexed_scope_value(
+        &mut self,
+        expr: &rumoca_core::Expression,
+    ) -> Option<rumoca_core::Expression> {
+        let rumoca_core::Expression::Index {
+            base,
+            subscripts,
+            span,
+        } = expr
+        else {
+            return None;
+        };
+        let rumoca_core::Expression::VarRef {
+            name,
+            subscripts: base_subscripts,
+            ..
+        } = base.as_ref()
+        else {
+            return None;
+        };
+        if !base_subscripts.is_empty() {
+            return None;
+        }
+        let values = self.scope.scalars.get(name.as_str())?;
+        let dims = self.scope.dims.get(name.as_str())?;
+        let indices = subscripts
+            .iter()
+            .map(|subscript| match subscript {
+                rumoca_core::Subscript::Index { value, .. } if *value > 0 => Some(*value),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        match flat_index_from_indices(dims, &indices, *span, "projected indexed substitution") {
+            Ok(Some(index)) => values
+                .get(index)
+                .cloned()
+                .map(|value| value.with_span(*span)),
+            Ok(None) => None,
+            Err(error) => {
+                self.error = Some(error);
+                Some(expr.clone())
+            }
+        }
+    }
+
+    fn projected_array_binding(
+        &mut self,
+        expr: &rumoca_core::Expression,
+        name: &rumoca_core::Reference,
+        span: rumoca_core::Span,
+    ) -> rumoca_core::Expression {
+        if !self.materialize_arrays {
+            return expr.clone();
+        }
+        let Some(values) = self.scope.scalars.get(name.as_str()) else {
+            return expr.clone();
+        };
+        let Some(dims) = self.scope.dims.get(name.as_str()) else {
+            self.error = Some(LowerError::contract_violation(
+                format!(
+                    "projected array `{}` has scalar values but no dimensions",
+                    name.as_str()
+                ),
+                span,
+            ));
+            return expr.clone();
+        };
+        projected_array_expression(values, dims, span).unwrap_or_else(|error| {
+            self.error = Some(error);
+            expr.clone()
+        })
+    }
 }
 
 impl ExpressionRewriter for FunctionScopeSubstituter<'_> {
     #[allow(clippy::too_many_lines)]
     fn rewrite_expression(&mut self, expr: &rumoca_core::Expression) -> rumoca_core::Expression {
+        if let Some(value) = self.indexed_scope_value(expr) {
+            return value;
+        }
         if let rumoca_core::Expression::Index {
             base,
             subscripts,
@@ -486,7 +572,7 @@ impl ExpressionRewriter for FunctionScopeSubstituter<'_> {
             {
                 return value.clone().with_span(*span);
             }
-            return expr.clone();
+            return self.projected_array_binding(expr, name, *span);
         }
         if let Some(replacement) = self.scope.full.get(name.as_str()) {
             if let rumoca_core::Expression::VarRef {
@@ -540,6 +626,25 @@ impl ExpressionRewriter for FunctionScopeSubstituter<'_> {
             }
         }
         self.walk_expression(expr)
+    }
+
+    fn walk_function_call_expression(
+        &mut self,
+        name: &rumoca_core::Reference,
+        args: &[rumoca_core::Expression],
+        is_constructor: bool,
+        span: rumoca_core::Span,
+    ) -> rumoca_core::Expression {
+        let previous = self.materialize_arrays;
+        self.materialize_arrays = true;
+        let args = self.rewrite_expressions(args);
+        self.materialize_arrays = previous;
+        rumoca_core::Expression::FunctionCall {
+            name: name.clone(),
+            args,
+            is_constructor,
+            span,
+        }
     }
 }
 

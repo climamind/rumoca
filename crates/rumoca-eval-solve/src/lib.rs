@@ -48,7 +48,10 @@ pub use jacobian::{
     JacobianReport, ObjectiveGradientReport, ParameterJacobianReport, SteadyStateSensitivityReport,
 };
 use linear_solve::{solve_component_op, solve_component_unchecked};
-pub use prepared::{PreparedComputeBlock, PreparedScalarProgramBlock};
+pub use prepared::{
+    PreparedComputeBlock, PreparedScalarProgramBlock, TargetAssignmentShape,
+    target_assignment_shape,
+};
 use random_runtime::{
     ImpureRandomState, impure_random_mutex, impure_random_sample, impure_random_stream_id,
     initial_state_values, projected_random_value, random_result_and_state, read_reg_range,
@@ -148,6 +151,12 @@ pub enum EvalSolveError {
         helper: &'static str,
         op: &'static str,
     },
+    LinearSolve {
+        size: usize,
+        component: Option<usize>,
+        reason: &'static str,
+        span: Option<rumoca_core::Span>,
+    },
     InvalidRow {
         message: String,
         span: Option<rumoca_core::Span>,
@@ -170,6 +179,7 @@ impl EvalSolveError {
             Self::UninitializedRegister { span, .. } => *span,
             Self::OutputTooSmall { span, .. } => *span,
             Self::SingularTargetAssignment { span, .. } => *span,
+            Self::LinearSolve { span, .. } => *span,
             Self::InvalidRow { span, .. } => *span,
             Self::Scalarization { span, .. } => *span,
             Self::ShapeContract { span, .. } => *span,
@@ -223,6 +233,17 @@ impl EvalSolveError {
                 row,
                 target_y_index,
                 coefficient,
+                span,
+            },
+            Self::LinearSolve {
+                size,
+                component,
+                reason,
+                span: None,
+            } => Self::LinearSolve {
+                size,
+                component,
+                reason,
                 span,
             },
             Self::InvalidRow {
@@ -315,6 +336,18 @@ impl std::fmt::Display for EvalSolveError {
             Self::InvalidLinearOp { helper, op } => {
                 write!(f, "Solve-IR {helper} helper cannot evaluate {op} op")
             }
+            Self::LinearSolve {
+                size,
+                component,
+                reason,
+                ..
+            } => match component {
+                Some(component) => write!(
+                    f,
+                    "Solve-IR linear solve of size {size} cannot evaluate component {component}: {reason}"
+                ),
+                None => write!(f, "Solve-IR linear solve of size {size} failed: {reason}"),
+            },
             Self::InvalidRow { message, .. } => write!(f, "invalid Solve-IR row: {message}"),
             Self::Scalarization { message, .. } => {
                 write!(f, "Solve-IR scalarization failed: {message}")

@@ -14,7 +14,7 @@ mod init_projection;
 mod ode;
 mod prepared;
 mod runtime;
-pub mod stepper;
+pub mod session;
 
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
@@ -30,7 +30,7 @@ use diffsol::{
 };
 use init_projection::{EventObservation, initialize_state_runtime_values};
 use rumoca_eval_solve::sim_driver::{
-    SimDriverError, SolverStepper, StateTrajectory, StepOutcome, simulate_state_targets,
+    SimDriverError, SolverAdvanceBackend, StateTrajectory, StepOutcome, simulate_state_targets,
 };
 use rumoca_eval_solve::{
     self as solve_eval, RowEvalContext, SolveRuntime, current_dynamic_time_event_stop,
@@ -38,17 +38,16 @@ use rumoca_eval_solve::{
 };
 use rumoca_ir_solve as solve;
 use rumoca_solver::{
-    DiffsolMethod, EventPreMode, RuntimeEventBoundary, RuntimeEventBoundaryHandler,
-    RuntimeEventStop, SimOptions, SimResult, SimTermination, SolveStopSchedule,
-    build_sim_result_from_solve_model, commit_pre_params_after_event, discrete_row_pre_mode,
-    process_runtime_event_boundary, push_visible_values, replace_last_visible_values,
-    runtime_event_horizon, runtime_root_event_application_time,
-    timeline::sample_time_match_with_tol, write_pre_params_from_sources,
+    DiffsolMethod, RuntimeEventBoundary, RuntimeEventBoundaryHandler, RuntimeEventStop, SimOptions,
+    SimResult, SimTermination, SolveStopSchedule, build_sim_result_from_solve_model,
+    commit_pre_params_after_event, process_runtime_event_boundary, push_visible_values,
+    replace_last_visible_values, runtime_event_horizon, runtime_root_event_application_time,
+    stop_time_reached_with_tol, timeline::sample_time_match_with_tol,
 };
 pub(crate) use runtime::{
-    EventUpdateInput, apply_discrete_value, apply_event_updates,
-    apply_event_updates_with_event_pre, apply_initialization_updates, seed_initial_discrete_values,
-    settle_algebraics_and_relation_memory,
+    EventUpdateInput, apply_event_updates, apply_event_updates_with_event_pre,
+    apply_initialization_updates, refresh_algebraics_and_detect_changes,
+    seed_initial_discrete_values, settle_algebraics_and_relation_memory,
 };
 use runtime::{check_no_state_initialization, simulate_no_state_solve_ir};
 
@@ -57,10 +56,27 @@ type Vector = <Matrix as MatrixCommon>::V;
 type Scalar = <Matrix as MatrixCommon>::T;
 pub(crate) type LinearSolver = FaerSparseLU<f64>;
 pub(crate) type RuntimeParameters = Rc<RefCell<Vec<f64>>>;
+
+#[derive(Clone)]
+pub(crate) struct AlgebraicWarmStart(Rc<RefCell<Vec<f64>>>);
+
+impl AlgebraicWarmStart {
+    fn new(solver_y: Vec<f64>) -> Self {
+        Self(Rc::new(RefCell::new(solver_y)))
+    }
+
+    fn speculative(&self) -> Vec<f64> {
+        self.0.borrow().clone()
+    }
+
+    fn commit(&self, solver_y: Vec<f64>) {
+        *self.0.borrow_mut() = solver_y;
+    }
+}
 pub use error::SimError;
 pub(crate) use ode::{
     OdeModel, build_ode_problem_with_runtime_params_and_initial,
-    build_state_ode_problem_with_runtime_params_and_initial, new_bdf_eval_counters,
+    build_state_ode_problem_with_runtime_params_and_initial, state_ode_problem_input,
     trace_bdf_eval_counter_snapshot, validate_model,
 };
 pub use prepared::PreparedSimulation;
@@ -241,7 +257,7 @@ fn simulate_with_states(
         equilibrium_model.clone(),
         runtime.clone(),
     )?;
-    let mut stepper = build_general_stepper(GeneralStepperInput {
+    let mut backend = build_general_advance_backend(GeneralAdvanceBackendInput {
         model,
         opts,
         equilibrium_model,
@@ -256,7 +272,7 @@ fn simulate_with_states(
         opts,
         &times,
         &runtime_params,
-        stepper.as_mut(),
+        backend.as_mut(),
         StateTrajectory {
             params: &mut params,
             data: &mut data,
@@ -274,7 +290,6 @@ fn simulate_with_states(
         StateSimFinalize {
             model,
             opts,
-            equilibrium_model,
             runtime,
             runtime_params: &runtime_params,
             params,
@@ -285,7 +300,7 @@ fn simulate_with_states(
     )
 }
 
-struct GeneralStepperInput<'a, 'b, Eqn>
+struct GeneralAdvanceBackendInput<'a, 'b, Eqn>
 where
     Eqn: OdeEquations,
 {
@@ -299,15 +314,15 @@ where
     params: &'b [f64],
 }
 
-fn build_general_stepper<'a, Eqn>(
-    input: GeneralStepperInput<'a, '_, Eqn>,
-) -> Result<Box<dyn SolverStepper + 'a>, SimError>
+fn build_general_advance_backend<'a, Eqn>(
+    input: GeneralAdvanceBackendInput<'a, '_, Eqn>,
+) -> Result<Box<dyn SolverAdvanceBackend + 'a>, SimError>
 where
     Eqn:
         OdeEquationsImplicit<M = Matrix, V = Vector, T = f64, C = <Matrix as MatrixCommon>::C> + 'a,
     Eqn::V: VectorHost<T = f64>,
 {
-    let GeneralStepperInput {
+    let GeneralAdvanceBackendInput {
         model,
         opts,
         equilibrium_model,
@@ -333,15 +348,18 @@ where
             let solver = solver_call("BDF new", || {
                 diffsol::Bdf::<_, _, _, diffsol::NoAug<_>>::new(problem, state, nl_solver)
             })?;
-            Ok(Box::new(DiffsolStepper::new(DiffsolStepperInputs {
-                solver,
-                model,
-                equilibrium_model: equilibrium_model.as_ref(),
-                runtime: runtime.as_ref(),
-                runtime_params,
-                opts,
-                mode: DiffsolMode::General,
-            })))
+            Ok(Box::new(DiffsolAdvanceBackend::new(
+                DiffsolAdvanceBackendInputs {
+                    solver,
+                    model,
+                    equilibrium_model: equilibrium_model.as_ref(),
+                    runtime: runtime.as_ref(),
+                    runtime_params,
+                    algebraic_warm_start: None,
+                    opts,
+                    mode: DiffsolMode::General,
+                },
+            )))
         }
         method @ (DiffsolMethod::Esdirk34 | DiffsolMethod::TrBdf2) => {
             let state = initial_rk_state(
@@ -355,15 +373,18 @@ where
                 DiffsolMethod::Esdirk34 => problem.esdirk34_solver::<LinearSolver>(state),
                 _ => problem.tr_bdf2_solver::<LinearSolver>(state),
             })?;
-            Ok(Box::new(DiffsolStepper::new(DiffsolStepperInputs {
-                solver,
-                model,
-                equilibrium_model: equilibrium_model.as_ref(),
-                runtime: runtime.as_ref(),
-                runtime_params,
-                opts,
-                mode: DiffsolMode::General,
-            })))
+            Ok(Box::new(DiffsolAdvanceBackend::new(
+                DiffsolAdvanceBackendInputs {
+                    solver,
+                    model,
+                    equilibrium_model: equilibrium_model.as_ref(),
+                    runtime: runtime.as_ref(),
+                    runtime_params,
+                    algebraic_warm_start: None,
+                    opts,
+                    mode: DiffsolMode::General,
+                },
+            )))
         }
     }
 }
@@ -374,7 +395,6 @@ where
 struct StateSimFinalize<'a> {
     model: &'a solve::SolveModel,
     opts: &'a SimOptions,
-    equilibrium_model: &'a Arc<OdeModel>,
     runtime: &'a Arc<SolveRuntime>,
     runtime_params: &'a RuntimeParameters,
     params: Vec<f64>,
@@ -395,13 +415,12 @@ fn finalize_state_simulation(
             None,
         )),
         Err(SimError::Terminated { time, message }) => {
-            refresh_observation_discrete_rows(
-                fin.model,
-                &fin.equilibrium_model.runtime_state,
+            fin.runtime.refresh_observation_discrete_rows(
                 &mut fin.current_y,
                 &mut fin.params,
                 time,
                 fin.opts.atol.max(1.0e-10),
+                EVENT_UPDATE_MAX_ITERS,
             )?;
             fin.runtime_params.borrow_mut().copy_from_slice(&fin.params);
             let mut samples = SampleRecorder {
@@ -471,41 +490,49 @@ fn simulate_state_only_bdf(
     )?;
 
     let runtime_params: RuntimeParameters = Rc::new(RefCell::new(params.clone()));
-    let eval_counters = new_bdf_eval_counters();
-    let problem = build_state_ode_problem_with_runtime_params_and_initial(
-        model,
-        opts,
-        runtime_params.clone(),
+    let algebraic_warm_start = AlgebraicWarmStart::new(current_y.clone());
+    let (problem_input, eval_counters) = state_ode_problem_input(
+        &runtime_params,
+        &algebraic_warm_start,
         current_t,
-        current_state.clone(),
-        eval_counters.clone(),
-        runtime.clone(),
+        &current_state,
+        runtime,
+    );
+    let problem =
+        build_state_ode_problem_with_runtime_params_and_initial(model, opts, problem_input)?;
+    let state = initial_state_only_bdf_state(
+        runtime,
+        &problem,
+        &current_state,
+        &params,
+        opts,
+        &algebraic_warm_start,
     )?;
-    let state = initial_state_only_bdf_state(runtime, &problem, &current_state, &params, opts)?;
     let nl_solver =
         NewtonNonlinearSolver::new(LinearSolver::default(), BacktrackingLineSearch::default());
     let solver = solver_call("BDF new", || {
         diffsol::Bdf::<_, _, _, diffsol::NoAug<_>>::new(&problem, state, nl_solver)
     })?;
-    let mut stepper = DiffsolStepper::new(DiffsolStepperInputs {
+    let mut backend = DiffsolAdvanceBackend::new(DiffsolAdvanceBackendInputs {
         solver,
         model,
         equilibrium_model,
         runtime,
         runtime_params: runtime_params.clone(),
+        algebraic_warm_start: Some(algebraic_warm_start),
         opts,
         mode: DiffsolMode::StateOnly,
     });
 
     // Drive the reduced state-only solver through the *same* backend-neutral
     // output / event / root loop as the general path; `DiffsolMode::StateOnly`
-    // (inside the stepper) projects the reduced state to the full solver_y.
+    // (inside the backend) projects the reduced state to the full solver_y.
     let result = simulate_state_targets(
         model,
         opts,
         times,
         &runtime_params,
-        &mut stepper,
+        &mut backend,
         StateTrajectory {
             params: &mut params,
             data: &mut data,
@@ -525,7 +552,6 @@ fn simulate_state_only_bdf(
         StateSimFinalize {
             model,
             opts,
-            equilibrium_model,
             runtime,
             runtime_params: &runtime_params,
             params,
@@ -542,6 +568,7 @@ fn initial_state_only_bdf_state<Eqn>(
     state_y: &[f64],
     params: &[f64],
     opts: &SimOptions,
+    algebraic_warm_start: &AlgebraicWarmStart,
 ) -> Result<BdfState<Vector>, SimError>
 where
     Eqn: diffsol::OdeEquationsImplicit<
@@ -553,7 +580,16 @@ where
 {
     let mut state = BdfState::<Vector>::new_without_initialise(problem)
         .map_err(|err| SimError::SolverError(format!("BDF state init: {err}")))?;
-    let dy = runtime.eval_state_derivatives(problem.t0, state_y, params, opts.atol, 256)?;
+    let mut solver_y = algebraic_warm_start.speculative();
+    let dy = runtime.eval_state_derivatives_with_guess(
+        problem.t0,
+        state_y,
+        params,
+        &mut solver_y,
+        opts.atol,
+        256,
+    )?;
+    algebraic_warm_start.commit(solver_y);
     {
         let state_ref = state.as_mut();
         state_ref.y.as_mut_slice().copy_from_slice(state_y);
@@ -585,7 +621,7 @@ impl From<SimDriverError> for SimError {
     }
 }
 
-/// Which system the diffsol solver integrates (folded behind the stepper so the
+/// Which system the diffsol solver integrates (folded behind the backend so the
 /// shared driver never sees it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffsolMode {
@@ -595,43 +631,46 @@ enum DiffsolMode {
     StateOnly,
 }
 
-/// diffsol adapter implementing the backend-neutral [`SolverStepper`] over an
+/// diffsol adapter implementing the backend-neutral [`SolverAdvanceBackend`] over an
 /// `OdeSolverMethod` plus the `OdeModel` / runtime context its projection, reset,
 /// and event kernels need.
-struct DiffsolStepper<'a, Eqn, S> {
+struct DiffsolAdvanceBackend<'a, Eqn, S> {
     solver: S,
     model: &'a solve::SolveModel,
     equilibrium_model: &'a OdeModel,
     runtime: &'a SolveRuntime,
     runtime_params: RuntimeParameters,
+    algebraic_warm_start: Option<AlgebraicWarmStart>,
     opts: &'a SimOptions,
     mode: DiffsolMode,
     _eqn: std::marker::PhantomData<fn() -> Eqn>,
 }
 
-struct DiffsolStepperInputs<'a, S> {
+struct DiffsolAdvanceBackendInputs<'a, S> {
     solver: S,
     model: &'a solve::SolveModel,
     equilibrium_model: &'a OdeModel,
     runtime: &'a SolveRuntime,
     runtime_params: RuntimeParameters,
+    algebraic_warm_start: Option<AlgebraicWarmStart>,
     opts: &'a SimOptions,
     mode: DiffsolMode,
 }
 
-impl<'a, Eqn, S> DiffsolStepper<'a, Eqn, S>
+impl<'a, Eqn, S> DiffsolAdvanceBackend<'a, Eqn, S>
 where
     Eqn: OdeEquations<T = f64> + 'a,
     Eqn::V: VectorHost<T = f64>,
     S: OdeSolverMethod<'a, Eqn>,
 {
-    fn new(inputs: DiffsolStepperInputs<'a, S>) -> Self {
+    fn new(inputs: DiffsolAdvanceBackendInputs<'a, S>) -> Self {
         Self {
             solver: inputs.solver,
             model: inputs.model,
             equilibrium_model: inputs.equilibrium_model,
             runtime: inputs.runtime,
             runtime_params: inputs.runtime_params,
+            algebraic_warm_start: inputs.algebraic_warm_start,
             opts: inputs.opts,
             mode: inputs.mode,
             _eqn: std::marker::PhantomData,
@@ -641,9 +680,27 @@ where
     fn tol(&self) -> f64 {
         self.opts.atol.max(1.0e-10)
     }
+
+    fn commit_state_only_warm_start(&self) -> Result<(), SimDriverError> {
+        let Some(warm_start) = &self.algebraic_warm_start else {
+            return Ok(());
+        };
+        let state = self.solver.state();
+        let mut solver_y = warm_start.speculative();
+        self.runtime.full_solver_y_with_guess(
+            state.t,
+            state.y.as_slice(),
+            self.runtime_params.borrow().as_slice(),
+            &mut solver_y,
+            self.tol(),
+            EVENT_UPDATE_MAX_ITERS,
+        )?;
+        warm_start.commit(solver_y);
+        Ok(())
+    }
 }
 
-impl<'a, Eqn, S> SolverStepper for DiffsolStepper<'a, Eqn, S>
+impl<'a, Eqn, S> SolverAdvanceBackend for DiffsolAdvanceBackend<'a, Eqn, S>
 where
     Eqn: OdeEquations<T = f64> + 'a,
     Eqn::V: VectorHost<T = f64>,
@@ -658,11 +715,15 @@ where
     }
 
     fn step(&mut self) -> Result<StepOutcome, SimDriverError> {
-        match solver_call("BDF step", || self.solver.step()).map_err(sim_to_driver)? {
-            OdeSolverStopReason::TstopReached => Ok(StepOutcome::Stop),
-            OdeSolverStopReason::InternalTimestep => Ok(StepOutcome::Internal),
-            OdeSolverStopReason::RootFound(t_root, _) => Ok(StepOutcome::Root { t_root }),
+        let outcome = match solver_call("BDF step", || self.solver.step()).map_err(sim_to_driver)? {
+            OdeSolverStopReason::TstopReached => StepOutcome::Stop,
+            OdeSolverStopReason::InternalTimestep => StepOutcome::Internal,
+            OdeSolverStopReason::RootFound(t_root, _) => StepOutcome::Root { t_root },
+        };
+        if !matches!(outcome, StepOutcome::Root { .. }) {
+            self.commit_state_only_warm_start()?;
         }
+        Ok(outcome)
     }
 
     fn set_stop_time(&mut self, stop_time: f64) -> Result<(), SimDriverError> {
@@ -692,13 +753,19 @@ where
             DiffsolMode::General => Ok(native.to_vec()),
             DiffsolMode::StateOnly => {
                 let state_count = self.model.state_scalar_count().min(native.len());
-                Ok(self.runtime.full_solver_y(
+                let mut solver_y = self
+                    .algebraic_warm_start
+                    .as_ref()
+                    .map_or_else(Vec::new, AlgebraicWarmStart::speculative);
+                self.runtime.full_solver_y_with_guess(
                     t,
                     &native[..state_count],
                     params,
+                    &mut solver_y,
                     self.tol(),
                     EVENT_UPDATE_MAX_ITERS,
-                )?)
+                )?;
+                Ok(solver_y)
             }
         }
     }
@@ -719,10 +786,12 @@ where
             DiffsolMode::StateOnly => {
                 let state_count = self.model.state_scalar_count().min(current_y.len());
                 let native = current_y[..state_count].to_vec();
-                let dy = self.runtime.eval_state_derivatives(
+                let mut solver_y = current_y.to_vec();
+                let dy = self.runtime.eval_state_derivatives_with_guess(
                     t,
                     &native,
                     params,
+                    &mut solver_y,
                     self.tol(),
                     EVENT_UPDATE_MAX_ITERS,
                 )?;
@@ -748,7 +817,11 @@ where
             t,
             h_cap,
         )
-        .map_err(sim_to_driver)
+        .map_err(sim_to_driver)?;
+        if !stop_time_reached_with_tol(t, self.opts.t_end) {
+            set_solver_stop_time(&mut self.solver, self.opts.t_end).map_err(sim_to_driver)?;
+        }
+        self.commit_state_only_warm_start()
     }
 
     fn prefer_exact_output_steps(&self) -> bool {
@@ -765,18 +838,49 @@ where
         t: f64,
         tol: f64,
     ) -> Result<bool, RuntimeSolveError> {
-        project_algebraics_and_detect_changes(
-            self.equilibrium_model,
-            y,
-            p,
-            t,
-            self.equilibrium_model.state_count_for_projection(),
-            tol,
-        )
+        match self.mode {
+            DiffsolMode::General => project_algebraics_and_detect_changes(
+                self.equilibrium_model,
+                y,
+                p,
+                t,
+                self.equilibrium_model.state_count_for_projection(),
+                tol,
+            ),
+            DiffsolMode::StateOnly => {
+                let before = y.to_vec();
+                self.runtime.refresh_algebraic_and_output_slots(
+                    t,
+                    y,
+                    p,
+                    tol,
+                    EVENT_UPDATE_MAX_ITERS,
+                )?;
+                Ok(values_changed(&before, y, tol))
+            }
+        }
     }
 
     fn derivative_guess(&self, y: &[f64], p: &[f64], t: f64) -> Result<Vec<f64>, SimDriverError> {
-        bdf_derivative_guess(self.model, self.equilibrium_model, y, p, t).map_err(sim_to_driver)
+        match self.mode {
+            DiffsolMode::General => {
+                bdf_derivative_guess(self.model, self.equilibrium_model, y, p, t)
+                    .map_err(sim_to_driver)
+            }
+            DiffsolMode::StateOnly => {
+                let state_count = self.model.state_scalar_count().min(y.len());
+                let state_dy = self.runtime.eval_state_derivatives(
+                    t,
+                    &y[..state_count],
+                    p,
+                    self.tol(),
+                    EVENT_UPDATE_MAX_ITERS,
+                )?;
+                let mut dy = vec![0.0; y.len()];
+                dy[..state_dy.len()].copy_from_slice(&state_dy);
+                Ok(dy)
+            }
+        }
     }
 
     fn record_sample(
@@ -802,16 +906,11 @@ where
         p: &mut [f64],
         t: f64,
     ) -> Result<(), SimDriverError> {
-        refresh_observation_discrete_rows(
-            self.model,
-            &self.equilibrium_model.runtime_state,
-            y,
-            p,
-            t,
-            self.tol(),
-        )
-        .map(|_| ())
-        .map_err(sim_to_driver)
+        self.runtime
+            .refresh_observation_discrete_rows(y, p, t, self.tol(), EVENT_UPDATE_MAX_ITERS)
+            .map(|_| ())
+            .map_err(SimError::from)
+            .map_err(sim_to_driver)
     }
 
     fn trace_step_failure(
@@ -969,7 +1068,7 @@ fn refresh_observation_rows_and_relation_memory(
 ) -> Result<(), SimError> {
     let state_count = model.state_scalar_count();
     settle_algebraics_and_relation_memory(runtime, equilibrium_model, y, p, t, state_count, tol)?;
-    if refresh_observation_discrete_rows(model, &equilibrium_model.runtime_state, y, p, t, tol)? {
+    if runtime.refresh_observation_discrete_rows(y, p, t, tol, EVENT_UPDATE_MAX_ITERS)? {
         settle_algebraics_and_relation_memory(
             runtime,
             equilibrium_model,
@@ -981,111 +1080,6 @@ fn refresh_observation_rows_and_relation_memory(
         )?;
     }
     Ok(())
-}
-
-fn refresh_observation_discrete_rows(
-    model: &solve::SolveModel,
-    runtime_state: &solve_eval::SimulationRuntimeState,
-    y: &mut [f64],
-    p: &mut [f64],
-    t: f64,
-    tol: f64,
-) -> Result<bool, SimError> {
-    if model.problem.discrete.observation_refresh.is_empty() {
-        return Ok(false);
-    }
-    let mut changed_any = false;
-    let event_pre_y = y.to_vec();
-    let event_pre_p = p.to_vec();
-    for _ in 0..EVENT_UPDATE_MAX_ITERS {
-        let changed = apply_observation_discrete_refresh_pass(
-            model,
-            ObservationRefreshPass {
-                runtime_state,
-                event_pre_y: event_pre_y.as_slice(),
-                event_pre_p: event_pre_p.as_slice(),
-                tol,
-            },
-            y,
-            p,
-            t,
-        )?;
-        if !changed {
-            return Ok(changed_any);
-        }
-        changed_any = true;
-    }
-    Err(SimError::SolveIr(
-        "observation-time discrete refresh did not converge".to_string(),
-    ))
-}
-
-struct ObservationRefreshPass<'a> {
-    runtime_state: &'a solve_eval::SimulationRuntimeState,
-    event_pre_y: &'a [f64],
-    event_pre_p: &'a [f64],
-    tol: f64,
-}
-
-fn apply_observation_discrete_refresh_pass(
-    model: &solve::SolveModel,
-    ctx: ObservationRefreshPass<'_>,
-    y: &mut [f64],
-    p: &mut [f64],
-    t: f64,
-) -> Result<bool, SimError> {
-    if model.problem.discrete.observation_refresh.len() != model.problem.discrete.rhs.len() {
-        return Err(SimError::SolveIr(format!(
-            "discrete observation-refresh row count {} does not match discrete RHS row count {}",
-            model.problem.discrete.observation_refresh.len(),
-            model.problem.discrete.rhs.len()
-        )));
-    }
-    let mut changed = false;
-    for (row_idx, row) in model.problem.discrete.rhs.programs.iter().enumerate() {
-        if !model.problem.discrete.observation_refresh[row_idx] {
-            continue;
-        }
-        refresh_observation_pre_params(model, row_idx, &ctx, y, p);
-        let value = solve_eval::eval_row_with_context(
-            row,
-            y,
-            p,
-            t,
-            RowEvalContext {
-                external_tables: Some(model.external_tables.as_slice()),
-                runtime_state: Some(ctx.runtime_state),
-                ..Default::default()
-            },
-        )
-        .map_err(|err| SimError::SolveIr(err.to_string()))?;
-        changed |= apply_discrete_value(
-            model.problem.discrete.update_targets[row_idx],
-            value,
-            y,
-            p,
-            ctx.tol,
-        )?;
-    }
-    Ok(changed)
-}
-
-fn refresh_observation_pre_params(
-    model: &solve::SolveModel,
-    row_idx: usize,
-    ctx: &ObservationRefreshPass<'_>,
-    y: &[f64],
-    p: &mut [f64],
-) {
-    match discrete_row_pre_mode(model, row_idx) {
-        EventPreMode::EventEntry | EventPreMode::Fixed => {
-            write_pre_params_from_sources(model, ctx.event_pre_y, ctx.event_pre_p, p, ctx.tol);
-        }
-        EventPreMode::FollowCurrent => {
-            let snapshot_p = p.to_vec();
-            write_pre_params_from_sources(model, y, snapshot_p.as_slice(), p, ctx.tol);
-        }
-    }
 }
 
 fn visible_values(
@@ -1105,6 +1099,13 @@ fn visible_values(
         },
     )
     .map_err(|err| SimError::SolveIr(err.to_string()))
+}
+
+fn values_changed(before: &[f64], after: &[f64], tol: f64) -> bool {
+    before
+        .iter()
+        .zip(after.iter())
+        .any(|(before, after)| (*before - *after).abs() > tol)
 }
 
 fn trace_bdf_step_failure(
