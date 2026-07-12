@@ -85,6 +85,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Verify repository toolchain pins
+        run: node --test .github/scripts/toolchain-pins.test.mjs
+
       # Architectural invariant, checked without compiling anything: `xtask` must
       # carry NO rumoca-* workspace crate. It parses args, moves files, and shells
       # out; heavy compiler-linked work runs on demand via `cargo run -p <crate>`
