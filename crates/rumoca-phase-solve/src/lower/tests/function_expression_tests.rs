@@ -2634,3 +2634,126 @@ fn lower_expression_rejects_non_singleton_vectorized_record_array_field_for_vect
         "unexpected error: {err}"
     );
 }
+
+#[test]
+fn lower_expression_rejects_unknown_record_constructor_input_field_with_span() {
+    let span = rumoca_core::Span::from_offsets(
+        rumoca_core::SourceId::from_source_name(
+            "phase_solve_lower_tests_function_expression_tests_source_45.mo",
+        ),
+        10,
+        30,
+    );
+    let mut dae_model = dae::Dae::default();
+
+    let mut orientation = rumoca_core::Function::new("My.Orientation", span);
+    orientation.is_constructor = true;
+    orientation.inputs.push(
+        rumoca_core::FunctionParam::new("T", "Real", lower_test_span()).with_dims(vec![3, 3]),
+    );
+    orientation
+        .inputs
+        .push(rumoca_core::FunctionParam::new("w", "Real", lower_test_span()).with_dims(vec![3]));
+    dae_model
+        .symbols
+        .functions
+        .insert(orientation.name.clone(), orientation);
+
+    let mut use_orientation = rumoca_core::Function::new("My.useOrientation", span);
+    use_orientation.add_input(
+        rumoca_core::FunctionParam::new("R", "My.Orientation", lower_test_span())
+            .with_type_class(rumoca_core::ClassType::Record),
+    );
+    use_orientation.add_output(rumoca_core::FunctionParam::new(
+        "y",
+        "Real",
+        lower_test_span(),
+    ));
+    use_orientation
+        .body
+        .push(rumoca_core::Statement::Assignment {
+            comp: component_ref("y"),
+            value: rumoca_core::Expression::Literal {
+                value: rumoca_core::Literal::Real(0.0),
+                span,
+            },
+            span,
+        });
+    dae_model
+        .symbols
+        .functions
+        .insert(use_orientation.name.clone(), use_orientation);
+
+    let bad_constructor = rumoca_core::Expression::FunctionCall {
+        name: rumoca_core::Reference::from_component_reference(test_component_ref_from_name(
+            "My.Orientation",
+        )),
+        args: vec![rumoca_core::Expression::FunctionCall {
+            name: rumoca_core::VarName::new("__rumoca_named_arg__.q").into(),
+            args: vec![rumoca_core::Expression::Literal {
+                value: rumoca_core::Literal::Real(1.0),
+                span,
+            }],
+            is_constructor: true,
+            span,
+        }],
+        is_constructor: true,
+        span,
+    };
+    let expr = rumoca_core::Expression::FunctionCall {
+        name: rumoca_core::Reference::from_component_reference(test_component_ref_from_name(
+            "My.useOrientation.y",
+        )),
+        args: vec![rumoca_core::Expression::FunctionCall {
+            name: rumoca_core::VarName::new("__rumoca_named_arg__.R").into(),
+            args: vec![bad_constructor],
+            is_constructor: true,
+            span,
+        }],
+        is_constructor: false,
+        span,
+    };
+
+    let err = lower_expression(&expr, &VarLayout::default(), &dae_model.symbols.functions)
+        .expect_err("unknown record constructor input field should fail without panicking");
+    assert_eq!(err.source_span(), Some(span));
+    assert!(
+        err.to_string()
+            .contains("record constructor `My.Orientation` does not define field `q`"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn lower_expression_projects_record_constructor_output_field_with_default() {
+    let span = lower_test_span();
+    let mut constructor = rumoca_core::Function::new("Pkg.RecordCtor", span);
+    constructor.is_constructor = true;
+    constructor
+        .inputs
+        .push(rumoca_core::FunctionParam::new("re", "Real", span));
+    constructor
+        .inputs
+        .push(rumoca_core::FunctionParam::new("im", "Real", span).with_default(real_lit(0.0)));
+    constructor.outputs.push(
+        rumoca_core::FunctionParam::new("result", "Pkg.RecordValue", span)
+            .with_type_class(rumoca_core::ClassType::Record),
+    );
+
+    let mut functions = IndexMap::new();
+    functions.insert(constructor.name.clone(), constructor);
+    let expr = rumoca_core::Expression::FunctionCall {
+        name: rumoca_core::Reference::from_component_reference(test_component_ref_from_name(
+            "Pkg.RecordCtor.result.im",
+        )),
+        args: vec![real_lit(2.0)],
+        is_constructor: false,
+        span,
+    };
+
+    let lowered = lower_expression(&expr, &VarLayout::default(), &functions)
+        .expect("record constructor output fields should project from bound inputs");
+    let (regs, _) = eval_linear_ops(&lowered.ops, &[], &[], 0.0);
+
+    assert_eq!(read_reg(&regs, lowered.result), 0.0);
+}
