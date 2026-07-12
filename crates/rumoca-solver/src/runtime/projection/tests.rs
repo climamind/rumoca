@@ -660,6 +660,33 @@ fn initial_projection_rejects_omitted_residual_and_restores_candidate() {
 }
 
 #[test]
+fn project_algebraics_rejects_nonzero_residual_row_omitted_from_plan() {
+    let model = BlockProjectionModel {
+        plan: solve::AlgebraicProjectionPlan {
+            blocks: vec![solve::AlgebraicProjectionBlock {
+                rows: vec![0],
+                y_indices: vec![0],
+            }],
+        },
+        initial_residual_len: 0,
+    };
+    let mut y = vec![0.0, 0.0];
+
+    let err = project_algebraics(&model, &mut y, &[], 0.0, 0, 1.0e-12)
+        .expect_err("an omitted nonzero algebraic residual must reject projection");
+
+    assert!(
+        err.to_string()
+            .contains("algebraic projection did not converge")
+    );
+    assert_eq!(
+        y,
+        vec![0.0, 0.0],
+        "failed projection must restore the candidate"
+    );
+}
+
+#[test]
 fn project_algebraics_rejects_state_count_past_y_length() {
     let model = BlockProjectionModel {
         plan: solve::AlgebraicProjectionPlan::default(),

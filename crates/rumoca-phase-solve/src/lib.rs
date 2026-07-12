@@ -730,7 +730,10 @@ fn lower_initialization_system(
         &row_targets,
         &projection_indices,
         0..residual_rows.len(),
-        false,
+        ProjectionPlanPolicy {
+            include_explicit_row_targets: false,
+            require_complete_algebraic_coverage: false,
+        },
         Some(&implicit_initial_projection_rows),
         dae_model_span(dae_model)?,
     )?;
@@ -1024,10 +1027,19 @@ fn lower_algebraic_projection_plan(
         row_targets,
         &projection_indices,
         state_scalar_count..solver_scalar_count,
-        true,
+        ProjectionPlanPolicy {
+            include_explicit_row_targets: true,
+            require_complete_algebraic_coverage: true,
+        },
         None,
         context_span,
     )
+}
+
+#[derive(Clone, Copy)]
+struct ProjectionPlanPolicy {
+    include_explicit_row_targets: bool,
+    require_complete_algebraic_coverage: bool,
 }
 
 // SPEC_0021: Exception - projection planning keeps explicit target,
@@ -1038,7 +1050,7 @@ fn lower_projection_plan(
     row_targets: &[Option<solve::ScalarSlot>],
     projection_indices: &[usize],
     row_indices: std::ops::Range<usize>,
-    include_explicit_row_targets: bool,
+    policy: ProjectionPlanPolicy,
     implicit_incidence_rows: Option<&BTreeSet<usize>>,
     context_span: rumoca_core::Span,
 ) -> Result<solve::AlgebraicProjectionPlan, LowerError> {
@@ -1053,7 +1065,7 @@ fn lower_projection_plan(
         })
         .collect::<BTreeMap<_, _>>();
 
-    for row_idx in row_indices {
+    for &row_idx in &row_indices {
         let mut y_indices = if implicit_incidence_rows.is_none_or(|rows| rows.contains(&row_idx)) {
             collect_algebraic_y_indices_for_row(rows[row_idx].as_slice(), &projection_set)
         } else {
@@ -1063,7 +1075,7 @@ fn lower_projection_plan(
             row_targets.get(row_idx).copied().flatten()
             && projection_set.contains(&index)
         {
-            if include_explicit_row_targets {
+            if policy.include_explicit_row_targets {
                 y_indices.insert(index);
             } else {
                 y_indices.clear();
@@ -1101,10 +1113,24 @@ fn lower_projection_plan(
         projection_indices,
         context_span,
     )?;
-    let blocks = projection_blt_blocks(&projection_incidence, context_span)?;
-    Ok(solve::AlgebraicProjectionPlan {
-        blocks: lower_blt_projection_blocks(&blocks, &projection_incidence, context_span)?,
-    })
+    let (blocks, dropped_equations) = projection_blt_blocks(&projection_incidence, context_span)?;
+    let mut blocks = lower_blt_projection_blocks(&blocks, &projection_incidence, context_span)?;
+    if policy.require_complete_algebraic_coverage {
+        blocks = retain_dropped_projection_rows(
+            blocks,
+            &dropped_equations,
+            &projection_incidence,
+            context_span,
+        )?;
+        validate_complete_algebraic_projection_plan(
+            &blocks,
+            rows,
+            &row_indices,
+            &projection_incidence,
+            context_span,
+        )?;
+    }
+    Ok(solve::AlgebraicProjectionPlan { blocks })
 }
 
 fn projection_index_not_claimed_by_identity(
@@ -1137,9 +1163,9 @@ fn identity_projection_y_index(
 fn projection_blt_blocks(
     projection_incidence: &ProjectionIncidence,
     context_span: rumoca_core::Span,
-) -> Result<Vec<BltBlock>, LowerError> {
+) -> Result<(Vec<BltBlock>, Vec<EquationRef>), LowerError> {
     if projection_incidence.incidence.n_eq == 0 && projection_incidence.incidence.n_var == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let regular = rumoca_phase_structural::maximum_regular_subsystem(
         &projection_incidence.incidence,
@@ -1151,7 +1177,207 @@ fn projection_blt_blocks(
             context_span,
         )
     })?;
-    Ok(regular.blocks)
+    Ok((regular.blocks, regular.dropped_equations))
+}
+
+fn combine_projection_blocks(
+    lhs: solve::AlgebraicProjectionBlock,
+    rhs: solve::AlgebraicProjectionBlock,
+    context_span: rumoca_core::Span,
+) -> Result<solve::AlgebraicProjectionBlock, LowerError> {
+    let causal_step_count = lhs
+        .causal_steps
+        .len()
+        .checked_add(rhs.causal_steps.len())
+        .ok_or_else(|| {
+            lower_contract_violation(
+                "merged algebraic projection causal-step count overflows host index range"
+                    .to_string(),
+                context_span,
+            )
+        })?;
+    let mut causal_steps = lower_vec_with_capacity(
+        causal_step_count,
+        "merged algebraic projection causal-step count",
+        context_span,
+    )?;
+    causal_steps.extend(lhs.causal_steps);
+    causal_steps.extend(rhs.causal_steps);
+    Ok(solve::AlgebraicProjectionBlock {
+        rows: merge_unique(
+            lhs.rows,
+            rhs.rows,
+            "merged algebraic projection row count",
+            context_span,
+        )?,
+        y_indices: merge_unique(
+            lhs.y_indices,
+            rhs.y_indices,
+            "merged algebraic projection target count",
+            context_span,
+        )?,
+        causal_steps,
+    })
+}
+
+fn merge_unique(
+    lhs: Vec<usize>,
+    rhs: Vec<usize>,
+    context: &'static str,
+    context_span: rumoca_core::Span,
+) -> Result<Vec<usize>, LowerError> {
+    let capacity = lhs.len().checked_add(rhs.len()).ok_or_else(|| {
+        lower_contract_violation(
+            format!("{context} overflows host index range"),
+            context_span,
+        )
+    })?;
+    let mut merged = lower_vec_with_capacity(capacity, context, context_span)?;
+    merged.extend(lhs);
+    merged.extend(rhs);
+    merged.sort_unstable();
+    merged.dedup();
+    Ok(merged)
+}
+
+fn retain_dropped_projection_rows(
+    mut blocks: Vec<solve::AlgebraicProjectionBlock>,
+    dropped_equations: &[EquationRef],
+    projection_incidence: &ProjectionIncidence,
+    context_span: rumoca_core::Span,
+) -> Result<Vec<solve::AlgebraicProjectionBlock>, LowerError> {
+    for equation in dropped_equations {
+        let row_y_indices = projection_row_y_indices(equation.0, projection_incidence);
+        let mut retained = lower_vec_with_capacity(
+            blocks.len(),
+            "retained algebraic projection block count",
+            context_span,
+        )?;
+        let mut insertion_index = None;
+        let mut merged = None;
+        for block in blocks {
+            if block
+                .y_indices
+                .iter()
+                .any(|index| row_y_indices.contains(index))
+            {
+                insertion_index.get_or_insert(retained.len());
+                merged = Some(match merged {
+                    Some(previous) => combine_projection_blocks(previous, block, context_span)?,
+                    None => block,
+                });
+            } else {
+                retained.push(block);
+            }
+        }
+        if let (Some(mut block), Some(index)) = (merged, insertion_index) {
+            reserve_lower_capacity(
+                &mut block.rows,
+                1,
+                "retained algebraic projection row count",
+                context_span,
+            )?;
+            block.rows.push(equation.0);
+            block.rows.sort_unstable();
+            block.rows.dedup();
+            retained.insert(index, block);
+        }
+        blocks = retained;
+    }
+    Ok(blocks)
+}
+
+fn projection_row_y_indices(
+    row: usize,
+    projection_incidence: &ProjectionIncidence,
+) -> BTreeSet<usize> {
+    let Some(position) = projection_incidence
+        .incidence
+        .equation_refs
+        .iter()
+        .position(|equation| equation.0 == row)
+    else {
+        return BTreeSet::new();
+    };
+    projection_incidence.incidence.eq_unknowns[position]
+        .iter()
+        .filter_map(|unknown_index| {
+            projection_incidence
+                .incidence
+                .unknown_names
+                .get(*unknown_index)
+                .and_then(|unknown| projection_y_index(unknown, projection_incidence))
+        })
+        .collect()
+}
+
+fn validate_complete_algebraic_projection_plan(
+    blocks: &[solve::AlgebraicProjectionBlock],
+    rows: &[Vec<solve::LinearOp>],
+    expected_rows: &[usize],
+    projection_incidence: &ProjectionIncidence,
+    context_span: rumoca_core::Span,
+) -> Result<(), LowerError> {
+    let covered_rows = blocks
+        .iter()
+        .flat_map(|block| block.rows.iter().copied())
+        .collect::<BTreeSet<_>>();
+    for row in expected_rows {
+        if covered_rows.contains(row) {
+            continue;
+        }
+        let has_projection_incidence = projection_incidence
+            .incidence
+            .equation_refs
+            .iter()
+            .any(|equation| equation.0 == *row);
+        if has_projection_incidence || statically_nonzero_projection_row(&rows[*row]).is_some() {
+            return Err(lower_contract_violation(
+                format!("algebraic projection plan omits implicit row {row}"),
+                context_span,
+            ));
+        }
+    }
+
+    let covered_y_indices = blocks
+        .iter()
+        .flat_map(|block| block.y_indices.iter().copied())
+        .collect::<BTreeSet<_>>();
+    for y_index in &projection_incidence.unknown_y_indices {
+        if !covered_y_indices.contains(y_index) {
+            return Err(lower_contract_violation(
+                format!("algebraic projection plan omits residual target y[{y_index}]"),
+                context_span,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn statically_nonzero_projection_row(row: &[solve::LinearOp]) -> Option<f64> {
+    if !row.iter().all(|op| {
+        matches!(
+            op,
+            solve::LinearOp::Const { .. }
+                | solve::LinearOp::Move { .. }
+                | solve::LinearOp::Unary { .. }
+                | solve::LinearOp::Binary { .. }
+                | solve::LinearOp::Compare { .. }
+                | solve::LinearOp::Select { .. }
+                | solve::LinearOp::StoreOutput { .. }
+        )
+    }) {
+        return None;
+    }
+    let value = rumoca_eval_solve::eval_row_with_context(
+        row,
+        &[],
+        &[],
+        0.0,
+        rumoca_eval_solve::RowEvalContext::default(),
+    )
+    .ok()?;
+    (value.is_finite() && value != 0.0).then_some(value)
 }
 
 fn collect_algebraic_y_indices_for_row(

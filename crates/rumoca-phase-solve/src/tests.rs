@@ -2085,3 +2085,62 @@ fn solve_problem_lowers_structured_continuous_residual_with_guard_to_map() {
         [solve::ComputeNode::Map { .. }]
     ));
 }
+
+#[test]
+fn algebraic_projection_matching_preserves_explicit_row_target_preference() -> Result<(), LowerError>
+{
+    let row_to_vars = BTreeMap::from([(7, BTreeSet::from([9, 10])), (8, BTreeSet::from([9, 10]))]);
+    let mut row_targets = vec![None; 9];
+    row_targets[7] = Some(solve::scalar_slot_y(9));
+    row_targets[8] = Some(solve::scalar_slot_y(10));
+    let incidence =
+        algebraic_projection_incidence(&row_to_vars, &row_targets, &[9, 10], solve_test_span())?;
+    let (blocks, dropped) = projection_blt_blocks(&incidence, solve_test_span())?;
+    assert!(dropped.is_empty());
+    let blocks = lower_blt_projection_blocks(&blocks, &incidence, solve_test_span())?;
+    let steps = blocks
+        .iter()
+        .flat_map(|block| block.causal_steps.iter())
+        .map(|step| (step.row, step.y_index))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(steps, BTreeSet::from([(7, 9), (8, 10)]));
+    Ok(())
+}
+
+#[test]
+fn retained_projection_row_merges_its_matched_blocks() -> Result<(), LowerError> {
+    let incidence = algebraic_projection_incidence(
+        &BTreeMap::from([(40, BTreeSet::from([3, 4]))]),
+        &[],
+        &[3, 4],
+        solve_test_span(),
+    )?;
+    let blocks = retain_dropped_projection_rows(
+        vec![
+            solve::AlgebraicProjectionBlock {
+                rows: vec![10],
+                y_indices: vec![3],
+                causal_steps: Vec::new(),
+            },
+            solve::AlgebraicProjectionBlock {
+                rows: vec![20],
+                y_indices: vec![4],
+                causal_steps: Vec::new(),
+            },
+            solve::AlgebraicProjectionBlock {
+                rows: vec![30],
+                y_indices: vec![8],
+                causal_steps: Vec::new(),
+            },
+        ],
+        &[EquationRef(40)],
+        &incidence,
+        solve_test_span(),
+    )?;
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].rows, vec![10, 20, 40]);
+    assert_eq!(blocks[0].y_indices, vec![3, 4]);
+    assert_eq!(blocks[1].rows, vec![30]);
+    assert_eq!(blocks[1].y_indices, vec![8]);
+    Ok(())
+}
