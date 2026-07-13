@@ -571,6 +571,9 @@ fn algebraic_projection_plan_uses_blt_scalar_blocks() {
     for block in &plan.blocks {
         assert_eq!(block.rows.len(), 1);
         assert_eq!(block.y_indices.len(), 1);
+        assert_eq!(block.causal_steps.len(), 1);
+        assert_eq!(block.causal_steps[0].row, block.rows[0]);
+        assert_eq!(block.causal_steps[0].y_index, block.y_indices[0]);
     }
 }
 
