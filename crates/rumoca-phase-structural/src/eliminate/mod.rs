@@ -72,7 +72,7 @@ use substitution_application::{
     equation_analysis_expr, simplify_arithmetic_identities,
 };
 use substitution_target::{
-    expr_contains_derivative_substitution_target, expr_contains_substitution_target,
+    expr_contains_derivative_substitution_target, expr_contains_substitution_target_in_scope,
 };
 use tearing_elimination::tear_and_eliminate_loop_block;
 use unknown_index::{
@@ -2679,6 +2679,7 @@ fn scalar_blt_solution(
     let Some(eq_rhs) = apply_substitutions_for_symbolic_candidate(
         &dae.continuous.equations[eq_idx].rhs,
         substitutions,
+        dae,
     )?
     else {
         return Ok(None);
@@ -2729,10 +2730,12 @@ fn scalar_blt_solution(
 pub(super) fn apply_substitutions_for_symbolic_candidate(
     expr: &Expression,
     substitutions: &[Substitution],
+    dae: &Dae,
 ) -> Result<Option<Expression>, StructuralError> {
-    let mut out = apply_record_field_aggregate_substitutions(expr, substitutions, None);
+    let dae_scope = DaeVariableScope::new(dae);
+    let mut out = apply_record_field_aggregate_substitutions(expr, substitutions, Some(dae));
     for sub in substitutions {
-        if !expr_contains_substitution_target(&out, sub) {
+        if !expr_contains_substitution_target_in_scope(&out, sub, Some(&dae_scope)) {
             continue;
         }
         if !is_trivial_alias(&sub.expr) && !solution_is_cheap_for_symbolic_substitution(&sub.expr) {
@@ -2743,6 +2746,7 @@ pub(super) fn apply_substitutions_for_symbolic_candidate(
             replacement: &sub.expr,
             replacement_dims: &sub.replacement_dims,
             derivative_replacement: None,
+            dae_scope: Some(&dae_scope),
         }
         .rewrite_expression(&out)?;
         if !expression_is_within_symbolic_candidate_budget(&out) {
@@ -2928,9 +2932,10 @@ pub(crate) fn apply_substitutions_to_expr_with_derivatives_and_dae(
         &Substitution,
     ) -> Result<Option<Expression>, StructuralError>,
 ) -> Result<Expression, StructuralError> {
+    let substitution_scope = dae_context.map(DaeVariableScope::new);
     let mut out = apply_record_field_aggregate_substitutions(expr, substitutions, dae_context);
     for sub in substitutions {
-        if expr_contains_substitution_target(&out, sub) {
+        if expr_contains_substitution_target_in_scope(&out, sub, substitution_scope.as_ref()) {
             let derivative_replacement = if expr_contains_derivative_substitution_target(&out, sub)
             {
                 derivative_replacement_for(sub)?
@@ -2942,6 +2947,7 @@ pub(crate) fn apply_substitutions_to_expr_with_derivatives_and_dae(
                 replacement: &sub.expr,
                 replacement_dims: &sub.replacement_dims,
                 derivative_replacement: derivative_replacement.as_ref(),
+                dae_scope: substitution_scope.as_ref(),
             }
             .rewrite_expression(&out)?;
         }
@@ -2954,7 +2960,9 @@ fn apply_record_field_aggregate_substitutions(
     substitutions: &[Substitution],
     dae_context: Option<&Dae>,
 ) -> Expression {
-    let aggregate_alias_groups = aggregate_alias_substitution_groups(substitutions);
+    let dae_scope = dae_context.map(DaeVariableScope::new);
+    let aggregate_alias_groups =
+        aggregate_alias_substitution_groups(substitutions, dae_scope.as_ref());
     let complex_groups = complex_field_substitution_groups(substitutions);
     if aggregate_alias_groups.is_empty() && complex_groups.is_empty() {
         return expr.clone();
@@ -2962,7 +2970,7 @@ fn apply_record_field_aggregate_substitutions(
     RecordFieldAggregateRewriter {
         aggregate_alias_groups,
         complex_groups,
-        dae_scope: dae_context.map(DaeVariableScope::new),
+        dae_scope,
     }
     .rewrite_expression(expr)
 }
@@ -3188,10 +3196,12 @@ fn replacement_aggregate_base(
 
 fn aggregate_alias_substitution_groups(
     substitutions: &[Substitution],
+    dae_scope: Option<&DaeVariableScope<'_>>,
 ) -> IndexMap<VarName, AggregateAliasSubstitutionGroup> {
     let mut groups = IndexMap::new();
     for substitution in substitutions {
-        let Some((base, indices)) = scalar_substitution_target_key(substitution) else {
+        let target = scalar_substitution_target_key_in_scope(substitution, dae_scope);
+        let Some((base, indices)) = target else {
             continue;
         };
         groups
@@ -3204,6 +3214,16 @@ fn aggregate_alias_substitution_groups(
             );
     }
     groups
+}
+
+fn scalar_substitution_target_key_in_scope(
+    substitution: &Substitution,
+    dae_scope: Option<&DaeVariableScope<'_>>,
+) -> Option<(Reference, Vec<usize>)> {
+    match dae_scope {
+        Some(scope) => scope.scalarized_aggregate_target(&substitution.var_name),
+        None => scalar_substitution_target_key(substitution),
+    }
 }
 
 fn scalar_substitution_target_key(substitution: &Substitution) -> Option<(Reference, Vec<usize>)> {
@@ -3510,7 +3530,7 @@ impl RecordFieldAggregateRewriter<'_> {
     }
 
     fn aggregate_dims_for_reference(&self, name: &Reference) -> Option<Vec<usize>> {
-        let dims = self.dae_scope.as_ref()?.dims(name.var_name()).ok()?;
+        let dims = self.dae_scope.as_ref()?.dims_for_reference(name).ok()??;
         dims.into_iter()
             .map(usize::try_from)
             .collect::<Result<Vec<_>, _>>()
@@ -3973,14 +3993,23 @@ pub(super) fn var_ref_matches_unknown_for_substitution(
     subscripts: &[rumoca_core::Subscript],
     substitution: &Substitution,
 ) -> bool {
-    if indexed_component_ref_mismatch_for_substitution(name, subscripts, substitution) {
+    var_ref_matches_unknown_for_substitution_in_scope(name, subscripts, substitution, None)
+}
+
+pub(super) fn var_ref_matches_unknown_for_substitution_in_scope(
+    name: &Reference,
+    subscripts: &[rumoca_core::Subscript],
+    substitution: &Substitution,
+    dae_scope: Option<&DaeVariableScope<'_>>,
+) -> bool {
+    if indexed_component_ref_mismatch_for_substitution(name, subscripts, substitution, dae_scope) {
         return false;
     }
     if name.var_name().id() == substitution.var_name.id() {
         return subscripts.is_empty() || subscripts_all_one(subscripts);
     }
 
-    if scalar_subscript_ref_matches_substitution(name, subscripts, substitution) {
+    if scalar_subscript_ref_matches_substitution(name, subscripts, substitution, dae_scope) {
         return true;
     }
 
@@ -4012,8 +4041,11 @@ fn scalar_subscript_ref_matches_substitution(
     name: &Reference,
     subscripts: &[rumoca_core::Subscript],
     substitution: &Substitution,
+    dae_scope: Option<&DaeVariableScope<'_>>,
 ) -> bool {
-    let Some((base, expected_indices)) = scalar_substitution_target_key(substitution) else {
+    let Some((base, expected_indices)) =
+        scalar_substitution_target_key_in_scope(substitution, dae_scope)
+    else {
         return false;
     };
     if !references_same_base(name, &base) || subscripts.len() != expected_indices.len() {
@@ -4033,7 +4065,7 @@ pub(super) fn aggregate_subscript_ref_matches_var(
     subscripts: &[rumoca_core::Subscript],
     substitution: &Substitution,
 ) -> bool {
-    if indexed_component_ref_mismatch_for_substitution(name, subscripts, substitution) {
+    if indexed_component_ref_mismatch_for_substitution(name, subscripts, substitution, None) {
         return false;
     }
     !substitution.var_dims.is_empty()
@@ -4045,9 +4077,15 @@ fn indexed_component_ref_mismatch_for_substitution(
     name: &Reference,
     _subscripts: &[rumoca_core::Subscript],
     substitution: &Substitution,
+    dae_scope: Option<&DaeVariableScope<'_>>,
 ) -> bool {
     if !reference_has_scalar_indices(name) || !substitution_has_scalar_indices(substitution) {
         return false;
+    }
+    if let Some((base, _)) =
+        dae_scope.and_then(|scope| scope.scalarized_aggregate_target(&substitution.var_name))
+    {
+        return !references_same_base(name, &base);
     }
     substitution_exact_reference_name(substitution)
         .is_some_and(|substitution_name| name.as_str() != substitution_name)
@@ -4066,6 +4104,7 @@ struct SubstituteVarRewriter<'a> {
     replacement: &'a Expression,
     replacement_dims: &'a [i64],
     derivative_replacement: Option<&'a Expression>,
+    dae_scope: Option<&'a DaeVariableScope<'a>>,
 }
 
 impl FallibleExpressionRewriter for SubstituteVarRewriter<'_> {
@@ -4163,7 +4202,12 @@ impl FallibleExpressionRewriter for SubstituteVarRewriter<'_> {
                 self.replacement_dims,
                 span,
             )
-        } else if var_ref_matches_unknown_for_substitution(name, subscripts, self.substitution) {
+        } else if var_ref_matches_unknown_for_substitution_in_scope(
+            name,
+            subscripts,
+            self.substitution,
+            self.dae_scope,
+        ) {
             if !subscripts.is_empty() {
                 return index_replacement_expr_with_subscripts(
                     self.replacement,
@@ -4190,10 +4234,11 @@ impl SubstituteVarRewriter<'_> {
         combined_subscripts.extend_from_slice(base_subscripts);
         combined_subscripts.extend_from_slice(subscripts);
         aggregate_subscript_ref_matches_var(name, &combined_subscripts, self.substitution)
-            || var_ref_matches_unknown_for_substitution(
+            || var_ref_matches_unknown_for_substitution_in_scope(
                 name,
                 &combined_subscripts,
                 self.substitution,
+                self.dae_scope,
             )
             || embedded_alias_indices_for_substitution(
                 name,
