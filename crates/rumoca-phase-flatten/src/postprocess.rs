@@ -1873,7 +1873,7 @@ fn substitute_variable_annotations(
                 var_values,
             )?;
         }
-        substitute_opt_expr_with_options_and_dims(
+        substitute_opt_expr_with_options_dims_and_values(
             &mut var.start,
             ctx,
             live_vars,
@@ -1881,6 +1881,7 @@ fn substitute_variable_annotations(
             &scope,
             true,
             var_dims,
+            var_values,
         )?;
         substitute_opt_expr_with_options_and_dims(
             &mut var.min,
