@@ -1985,8 +1985,7 @@ fn test_eliminate_trivial_rewrites_eliminated_complex_field_parent_ref() {
     );
 }
 
-#[test]
-fn test_apply_elimination_substitutions_rewrites_dae_runtime_partitions() {
+fn dae_with_alias_in_runtime_partitions() -> Dae {
     let mut dae = Dae::new();
     dae.initialization.equations.push(dae::Equation {
         lhs: None,
@@ -2036,7 +2035,12 @@ fn test_apply_elimination_substitutions_rewrites_dae_runtime_partitions() {
         span: Span::DUMMY,
         origin: "assert".to_string(),
     });
+    dae
+}
 
+#[test]
+fn test_apply_elimination_substitutions_rewrites_dae_runtime_partitions() {
+    let mut dae = dae_with_alias_in_runtime_partitions();
     let substitutions = [Substitution {
         var_name: VarName::new("alias"),
         var_ref: Some(reference("alias")),
