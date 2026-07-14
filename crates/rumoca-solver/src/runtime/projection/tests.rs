@@ -946,3 +946,70 @@ fn project_initial_variables_rejects_plan_rows_outside_residual_vector() {
 
     assert!(err.to_string().contains("residual row 2 is outside 0..2"));
 }
+
+#[test]
+fn project_algebraics_solves_targeted_loop_simultaneously_without_causal_steps() {
+    let model = BlockProjectionModel {
+        plan: solve::AlgebraicProjectionPlan {
+            blocks: vec![solve::AlgebraicProjectionBlock {
+                rows: vec![0, 1],
+                y_indices: vec![0, 1],
+            }],
+        },
+        initial_residual_len: 0,
+    };
+    let mut y = vec![0.0, 0.0];
+
+    project_algebraics(&model, &mut y, &[], 0.0, 0, 1.0e-12)
+        .expect("targeted algebraic loop should converge through the simultaneous solve");
+
+    let mut residual = vec![f64::NAN; 2];
+    model
+        .eval_residual(&y, &[], 0.0, &mut residual)
+        .expect("residual evaluation should succeed");
+    assert_eq!(y, vec![2.0, 3.0]);
+    assert_eq!(residual, vec![0.0, 0.0]);
+}
+
+#[test]
+fn projection_error_reports_absolute_implicit_row_index() {
+    let model = BlockProjectionModel {
+        plan: solve::AlgebraicProjectionPlan::default(),
+        initial_residual_len: 0,
+    };
+
+    let error = projection_error(&model, 3, "projection failed", &[0.25, 0.5]);
+
+    assert!(error.to_string().contains("max residual row=4"));
+}
+
+#[test]
+fn singleton_assignment_preserves_representable_sub_tolerance_change() {
+    let target = 5.0_f64.next_up();
+    let model = ContinuousCausalAssignmentModel {
+        residual_calls: Cell::new(0),
+        residual_row_calls: Cell::new(0),
+        jacobian_calls: Cell::new(0),
+        target_value: target,
+        plan: solve::AlgebraicProjectionPlan {
+            blocks: vec![solve::AlgebraicProjectionBlock {
+                rows: vec![0],
+                y_indices: vec![0],
+            }],
+        },
+    };
+    let mut y = vec![5.0];
+    let update = project_algebraic_singleton_assignment(
+        &model,
+        &mut y,
+        &[],
+        0.0,
+        &model.plan.blocks[0],
+        1.0e-6,
+    )
+    .expect("finite assignment should evaluate")
+    .expect("assignment target should exist");
+    assert!(update.changed);
+    assert!(update.settled);
+    assert_eq!(y, vec![target]);
+}

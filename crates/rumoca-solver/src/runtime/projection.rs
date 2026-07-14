@@ -543,10 +543,10 @@ fn project_algebraic_singleton_assignment<M: ImplicitProjectionModel>(
     let Some(before) = model.eval_implicit_residual_row(*row, y, p, t)? else {
         return Ok(None);
     };
-    if before.abs() <= tol || !before.is_finite() {
+    if !before.is_finite() {
         return Ok(Some(ProjectionBlockUpdate {
             changed: false,
-            settled: before.is_finite(),
+            settled: false,
         }));
     }
     let Some(value) = model.eval_implicit_target_value(*row, *y_index, y, p, t)? else {
@@ -558,10 +558,11 @@ fn project_algebraic_singleton_assignment<M: ImplicitProjectionModel>(
     let previous = y[*y_index];
     y[*y_index] = value;
     let after = model.eval_implicit_residual_row(*row, y, p, t)?;
-    if let Some(after) = after.filter(|after| after.is_finite() && after.abs() + tol < before.abs())
-    {
+    if let Some(after) = after.filter(|after| {
+        after.is_finite() && (after.abs() <= tol || after.abs() + tol < before.abs())
+    }) {
         return Ok(Some(ProjectionBlockUpdate {
-            changed: (previous - value).abs() > tol,
+            changed: previous != value,
             settled: after.abs() <= tol,
         }));
     }
@@ -734,11 +735,12 @@ fn projection_error<M: ImplicitProjectionModel>(
         .max_by(|(_, lhs), (_, rhs)| residual_sort_key(*lhs).total_cmp(&residual_sort_key(*rhs)));
     match worst {
         Some((row, value)) => {
+            let absolute_row = state_count + row;
             let target = model
-                .target_name_for_row(state_count + row)
+                .target_name_for_row(absolute_row)
                 .map_or(String::new(), |name| format!(" target={name}"));
             RuntimeSolveError::solve_ir(format!(
-                "{message}: max residual row={row}{target} value={value:.6e} norm={:.6e}",
+                "{message}: max residual row={absolute_row}{target} value={value:.6e} norm={:.6e}",
                 residual_norm(residual)
             ))
         }
