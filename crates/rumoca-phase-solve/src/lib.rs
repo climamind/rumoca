@@ -1114,7 +1114,8 @@ fn lower_projection_plan(
         context_span,
     )?;
     let (blocks, dropped_equations) = projection_blt_blocks(&projection_incidence, context_span)?;
-    let mut blocks = lower_blt_projection_blocks(&blocks, &projection_incidence, context_span)?;
+    let mut blocks =
+        lower_blt_projection_blocks(&blocks, row_targets, &projection_incidence, context_span)?;
     if policy.require_complete_algebraic_coverage {
         blocks = retain_dropped_projection_rows(
             blocks,
@@ -1632,6 +1633,7 @@ fn projection_y_index(
 
 fn lower_blt_projection_blocks(
     blocks: &[BltBlock],
+    row_targets: &[Option<solve::ScalarSlot>],
     projection_incidence: &ProjectionIncidence,
     context_span: rumoca_core::Span,
 ) -> Result<Vec<solve::AlgebraicProjectionBlock>, LowerError> {
@@ -1650,7 +1652,7 @@ fn lower_blt_projection_blocks(
                             context_span,
                         )
                     })?;
-                scalar_projection_block(equation.0, y_index, context_span)?
+                scalar_projection_block(equation.0, y_index, row_targets, context_span)?
             }
             BltBlock::AlgebraicLoop {
                 equations,
@@ -1670,6 +1672,7 @@ fn lower_blt_projection_blocks(
 fn scalar_projection_block(
     row: usize,
     y_index: usize,
+    row_targets: &[Option<solve::ScalarSlot>],
     context_span: rumoca_core::Span,
 ) -> Result<solve::AlgebraicProjectionBlock, LowerError> {
     let mut rows = lower_vec_with_capacity(
@@ -1684,10 +1687,26 @@ fn scalar_projection_block(
         context_span,
     )?;
     y_indices.push(y_index);
+    let causal_steps = row_targets
+        .get(row)
+        .copied()
+        .flatten()
+        .and_then(|target| match target {
+            solve::ScalarSlot::Y { index, .. } => Some(index),
+            _ => None,
+        })
+        .filter(|target| y_indices.contains(target))
+        .map(|target| {
+            vec![solve::AlgebraicProjectionStep {
+                row,
+                y_index: target,
+            }]
+        })
+        .unwrap_or_default();
     Ok(solve::AlgebraicProjectionBlock {
         rows,
         y_indices,
-        causal_steps: Vec::new(),
+        causal_steps,
     })
 }
 
@@ -1748,37 +1767,11 @@ fn lower_algebraic_loop_projection_block(
             context_span,
         ));
     }
-    let causal_steps =
-        matched_projection_steps(equations, unknowns, projection_incidence, context_span)?;
     Ok(solve::AlgebraicProjectionBlock {
         rows,
         y_indices,
-        causal_steps,
+        causal_steps: Vec::new(),
     })
-}
-
-fn matched_projection_steps(
-    equations: &[EquationRef],
-    unknowns: &[UnknownId],
-    projection_incidence: &ProjectionIncidence,
-    context_span: rumoca_core::Span,
-) -> Result<Vec<solve::AlgebraicProjectionStep>, LowerError> {
-    let step_count = equations.len().min(unknowns.len());
-    let mut steps = lower_vec_with_capacity(
-        step_count,
-        "algebraic loop projection matched step count",
-        context_span,
-    )?;
-    for (equation, unknown) in equations.iter().zip(unknowns.iter()) {
-        let Some(y_index) = projection_y_index(unknown, projection_incidence) else {
-            continue;
-        };
-        steps.push(solve::AlgebraicProjectionStep {
-            row: equation.0,
-            y_index,
-        });
-    }
-    Ok(steps)
 }
 
 fn loop_projection_target_set(
