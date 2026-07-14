@@ -3,8 +3,8 @@ use rumoca_ir_solve as solve;
 use rumoca_solver::{
     EventActionOutcome, ImplicitProjectionModel, RuntimeEventStop, RuntimeSolveError,
     SolveStopSchedule, project_algebraic_seed_with_plan, project_algebraics_with_plan,
-    push_visible_values, replace_last_visible_values, timeline::sample_time_match_with_tol,
-    update_relation_memory_slots,
+    push_visible_values, relation_memory_value_from_root, replace_last_visible_values,
+    timeline::sample_time_match_with_tol, update_relation_memory_slots,
 };
 use std::{cell::RefCell, collections::HashMap};
 
@@ -197,6 +197,25 @@ fn seed_error_allows_projection(error: &RuntimeSolveError) -> bool {
         RuntimeSolveError::NonFiniteValue { .. }
             | RuntimeSolveError::RefreshTargetUnassignable { .. }
     )
+}
+
+pub struct RootSearchInput<'a> {
+    pub t: f64,
+    pub state: &'a [f64],
+    pub params: &'a [f64],
+    pub guess: &'a mut Vec<f64>,
+    pub tol: f64,
+    pub max_iters: usize,
+    pub out: &'a mut [f64],
+}
+
+pub struct ProjectedRuntimeSettleInput<'a> {
+    pub y: &'a mut [f64],
+    pub p: &'a mut [f64],
+    pub t: f64,
+    pub tol: f64,
+    pub max_iters: usize,
+    pub root_relation_overrides: &'a [(usize, f64)],
 }
 
 impl From<solve_eval::EvalSolveError> for RuntimeSolveError {
@@ -842,14 +861,17 @@ impl SolveRuntime {
     /// callbacks free of hidden mutable runtime state.
     pub fn eval_root_search_conditions_with_guess_into(
         &self,
-        t: f64,
-        state: &[f64],
-        params: &[f64],
-        guess: &mut Vec<f64>,
-        tol: f64,
-        max_iters: usize,
-        out: &mut [f64],
+        input: RootSearchInput<'_>,
     ) -> Result<(), RuntimeSolveError> {
+        let RootSearchInput {
+            t,
+            state,
+            params,
+            guess,
+            tol,
+            max_iters,
+            out,
+        } = input;
         let roots = &self.model.problem.events.root_conditions;
         if roots.is_empty() {
             if let Some(first) = out.first_mut() {
@@ -1314,41 +1336,48 @@ impl SolveRuntime {
         P: FnMut(&mut [f64], &mut [f64]) -> Result<bool, RuntimeSolveError>,
     {
         self.settle_projected_runtime_and_relation_memory_with_overrides(
-            y,
-            p,
-            t,
-            tol,
-            max_iters,
-            &[],
+            ProjectedRuntimeSettleInput {
+                y,
+                p,
+                t,
+                tol,
+                max_iters,
+                root_relation_overrides: &[],
+            },
             &mut project_algebraics,
         )
     }
 
     pub fn settle_projected_runtime_and_relation_memory_with_overrides<P>(
         &self,
-        y: &mut [f64],
-        p: &mut [f64],
-        t: f64,
-        tol: f64,
-        max_iters: usize,
-        root_relation_overrides: &[(usize, f64)],
+        input: ProjectedRuntimeSettleInput<'_>,
         mut project_algebraics: P,
     ) -> Result<(), RuntimeSolveError>
     where
         P: FnMut(&mut [f64], &mut [f64]) -> Result<bool, RuntimeSolveError>,
     {
+        let ProjectedRuntimeSettleInput {
+            y,
+            p,
+            t,
+            tol,
+            max_iters,
+            root_relation_overrides,
+        } = input;
         for _ in 0..max_iters {
             let mut changed =
                 self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
             changed |= self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
             changed |= project_algebraics(y, p)?;
             changed |= self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
-            if root_relation_overrides.is_empty() {
-                changed |= self.update_relation_memory_from_solver_y(t, y, p, tol)?;
-            } else {
-                changed |=
-                    self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
-            }
+            changed |= self.update_relation_memory_from_solver_y_excluding(
+                t,
+                y,
+                p,
+                root_relation_overrides,
+            )?;
+            changed |=
+                self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
             if !changed {
                 return Ok(());
             }
@@ -1416,13 +1445,15 @@ impl SolveRuntime {
             root_relation_overrides,
         } = input;
         if self.model.problem.discrete.rhs.is_empty() {
-            self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
             return self.settle_runtime_assignments_and_projection(
-                y,
-                p,
-                t,
-                tol,
-                max_iters,
+                ProjectedRuntimeSettleInput {
+                    y,
+                    p,
+                    t,
+                    tol,
+                    max_iters,
+                    root_relation_overrides,
+                },
                 &mut project_algebraics,
             );
         }
@@ -1433,6 +1464,14 @@ impl SolveRuntime {
             changed |= self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
             changed |= project_algebraics(y, p)?;
             changed |= self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
+            changed |= self.update_relation_memory_from_solver_y_excluding(
+                t,
+                y,
+                p,
+                root_relation_overrides,
+            )?;
+            changed |=
+                self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
             let iter_pre_y = copy_runtime_values(y, "projected event iteration y snapshot")?;
             let iter_pre_p = copy_runtime_values(p, "projected event iteration p snapshot")?;
             let snapshot = DiscretePreSnapshot {
@@ -1458,9 +1497,12 @@ impl SolveRuntime {
                     &mut project_algebraics,
                 )?;
             }
-            if root_relation_overrides.is_empty() {
-                changed |= self.update_relation_memory_from_solver_y(t, y, p, tol)?;
-            }
+            changed |= self.update_relation_memory_from_solver_y_excluding(
+                t,
+                y,
+                p,
+                root_relation_overrides,
+            )?;
             changed |=
                 self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
             changed |= project_algebraics(y, p)?;
@@ -1487,21 +1529,33 @@ impl SolveRuntime {
 
     fn settle_runtime_assignments_and_projection<P>(
         &self,
-        y: &mut [f64],
-        p: &mut [f64],
-        t: f64,
-        tol: f64,
-        max_iters: usize,
+        input: ProjectedRuntimeSettleInput<'_>,
         project_algebraics: &mut P,
     ) -> Result<EventActionOutcome, RuntimeSolveError>
     where
         P: FnMut(&mut [f64], &mut [f64]) -> Result<bool, RuntimeSolveError>,
     {
+        let ProjectedRuntimeSettleInput {
+            y,
+            p,
+            t,
+            tol,
+            max_iters,
+            root_relation_overrides,
+        } = input;
         for _ in 0..max_iters {
             let mut changed =
                 self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
             changed |= project_algebraics(y, p)?;
             changed |= self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
+            changed |= self.update_relation_memory_from_solver_y_excluding(
+                t,
+                y,
+                p,
+                root_relation_overrides,
+            )?;
+            changed |=
+                self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
             if !changed {
                 return self.eval_event_actions(y, p, t);
             }
@@ -1581,6 +1635,35 @@ impl SolveRuntime {
             p,
             relation_memory_indices,
         ))
+    }
+
+    fn update_relation_memory_from_solver_y_excluding(
+        &self,
+        t: f64,
+        y: &[f64],
+        p: &mut [f64],
+        excluded_roots: &[(usize, f64)],
+    ) -> Result<bool, RuntimeSolveError> {
+        let relation_memory_indices = &self
+            .model
+            .problem
+            .solve_layout
+            .relation_memory_parameter_indices;
+        let roots = self.eval_root_conditions_from_solver_y(t, y, p)?;
+        let mut changed = false;
+        for (root_index, (root, parameter_index)) in
+            roots.iter().zip(relation_memory_indices).enumerate()
+        {
+            if excluded_roots.iter().any(|(index, _)| *index == root_index) {
+                continue;
+            }
+            if let Some(slot) = p.get_mut(*parameter_index) {
+                let value = relation_memory_value_from_root(*root);
+                changed |= *slot != value;
+                *slot = value;
+            }
+        }
+        Ok(changed)
     }
 
     pub fn eval_root_conditions_from_solver_y(
