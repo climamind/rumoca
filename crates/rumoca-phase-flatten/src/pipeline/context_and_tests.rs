@@ -404,7 +404,7 @@ impl Context {
         overlay: &InstanceOverlay,
         tree: &ClassTree,
     ) -> Result<bool, FlattenError> {
-        let mut changed = false;
+        let mut flat_changed = false;
         let max_passes = overlay.components.len().max(1);
         for _ in 0..max_passes {
             let mut pass_changed = false;
@@ -461,6 +461,7 @@ impl Context {
                 if flat_var.dims != resolved_dims && should_update_dims {
                     flat_var.dims.clone_from(&resolved_dims);
                     pass_changed = true;
+                    flat_changed = true;
                 }
                 let current_cached_dims = self.array_dimensions.get(var_name.as_str());
                 let should_update_cached_dims = current_cached_dims.is_none_or(|current| {
@@ -477,12 +478,11 @@ impl Context {
                     pass_changed = true;
                 }
             }
-            changed |= pass_changed;
             if !pass_changed {
                 break;
             }
         }
-        Ok(changed)
+        Ok(flat_changed)
     }
 
     fn binding_shape_override_dimensions(
