@@ -572,3 +572,354 @@ fn reverse_implicit_residual_vjp_transposes_forward_jvp() {
         "test point should produce a nonzero pairing"
     );
 }
+
+#[test]
+fn explicit_branch_seeds_refresh_only_their_dependency_plan() {
+    use solve::LinearOp::{Const, LoadY, StoreOutput};
+
+    let mut model = projection_coupled_state_model(2.0);
+    // The derivative and root depend only on the state. The full observation
+    // projection still owns algebraic `a = 2*x`.
+    model.problem.continuous.derivative_rhs =
+        solve::ComputeBlock::from_scalar_program_block(spanned_block(
+            vec![vec![Const { dst: 0, value: 0.0 }, StoreOutput { src: 0 }]],
+            "branch_seed_derivative.mo",
+        ));
+    model.problem.events.root_conditions = spanned_block(
+        vec![vec![LoadY { dst: 0, index: 0 }, StoreOutput { src: 0 }]],
+        "branch_seed_root.mo",
+    );
+    model.problem.events.root_relation_memory_targets = vec![None];
+    let runtime = SolveRuntime::new(&model).expect("valid branch-seed runtime should prepare");
+
+    let mut derivative_seed = vec![99.0, 42.0];
+    let mut derivative = [f64::NAN];
+    runtime
+        .eval_state_derivatives_with_guess_into(
+            0.0,
+            &[3.0],
+            &[],
+            &mut derivative_seed,
+            1.0e-12,
+            32,
+            &mut derivative,
+        )
+        .expect("derivative branch should settle");
+
+    let mut root_seed = vec![99.0, 42.0];
+    let mut root = [f64::NAN];
+    runtime
+        .eval_root_search_conditions_with_guess_into(
+            0.0,
+            &[3.0],
+            &[],
+            &mut root_seed,
+            1.0e-12,
+            32,
+            &mut root,
+        )
+        .expect("root branch should settle");
+
+    let mut observation_seed = vec![99.0, 42.0];
+    runtime
+        .full_solver_y_with_guess(0.0, &[3.0], &[], &mut observation_seed, 1.0e-12, 32)
+        .expect("full observation projection should settle");
+
+    assert_eq!(derivative_seed, vec![3.0, 42.0]);
+    assert_eq!(root_seed, vec![3.0, 42.0]);
+    assert_eq!(observation_seed, vec![3.0, 6.0]);
+    assert_eq!(derivative, [0.0]);
+    assert_eq!(root, [3.0]);
+}
+
+#[test]
+fn coupled_projection_preserves_the_accepted_local_branch() {
+    use solve::LinearOp::{Binary, Const, LoadY, StoreOutput};
+    use solve::{BinaryOp, ComputeBlock};
+
+    let mut model = linear_algebraic_loop_state_model();
+    // Artifact-derived minimal analogue of the ThyristorBridge2Pulse_R
+    // projection failure. The fixed-point map has a nearby physical root at
+    // a=b=1 and a remote root at a=b=100. Starting from the accepted branch
+    // a=b=1.1,
+    // plain Gauss-Seidel follows the attracting map to 100; branch-local
+    // Newton on the coupled residual must instead preserve the nearby root.
+    //
+    // a = b; b = F(a), where F(a) = a - (a - 1) * (a - 100) / 99.
+    model.problem.continuous.implicit_rhs = ComputeBlock::from_scalar_program_block(spanned_block(
+        vec![
+            vec![LoadY { dst: 0, index: 0 }, StoreOutput { src: 0 }],
+            vec![
+                LoadY { dst: 0, index: 1 },
+                LoadY { dst: 1, index: 2 },
+                Binary {
+                    dst: 2,
+                    op: BinaryOp::Sub,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                StoreOutput { src: 2 },
+            ],
+            vec![
+                LoadY { dst: 0, index: 1 },
+                Const { dst: 1, value: 1.0 },
+                Binary {
+                    dst: 2,
+                    op: BinaryOp::Sub,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                Const {
+                    dst: 3,
+                    value: 100.0,
+                },
+                Binary {
+                    dst: 4,
+                    op: BinaryOp::Sub,
+                    lhs: 0,
+                    rhs: 3,
+                },
+                Binary {
+                    dst: 5,
+                    op: BinaryOp::Mul,
+                    lhs: 2,
+                    rhs: 4,
+                },
+                Const {
+                    dst: 6,
+                    value: 1.0 / 99.0,
+                },
+                Binary {
+                    dst: 7,
+                    op: BinaryOp::Mul,
+                    lhs: 5,
+                    rhs: 6,
+                },
+                Binary {
+                    dst: 8,
+                    op: BinaryOp::Sub,
+                    lhs: 0,
+                    rhs: 7,
+                },
+                LoadY { dst: 9, index: 2 },
+                Binary {
+                    dst: 10,
+                    op: BinaryOp::Sub,
+                    lhs: 9,
+                    rhs: 8,
+                },
+                StoreOutput { src: 10 },
+            ],
+        ],
+        "accepted_branch_projection.mo",
+    ));
+    set_test_implicit_jvp(
+        &mut model,
+        vec![
+            vec![
+                solve::LinearOp::LoadSeed { dst: 0, index: 0 },
+                StoreOutput { src: 0 },
+            ],
+            vec![
+                solve::LinearOp::LoadSeed { dst: 0, index: 1 },
+                solve::LinearOp::LoadSeed { dst: 1, index: 2 },
+                Binary {
+                    dst: 2,
+                    op: BinaryOp::Sub,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                StoreOutput { src: 2 },
+            ],
+            vec![
+                LoadY { dst: 0, index: 1 },
+                Const { dst: 1, value: 2.0 },
+                Binary {
+                    dst: 2,
+                    op: BinaryOp::Mul,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                Const {
+                    dst: 3,
+                    value: 200.0,
+                },
+                Binary {
+                    dst: 4,
+                    op: BinaryOp::Sub,
+                    lhs: 2,
+                    rhs: 3,
+                },
+                Const {
+                    dst: 5,
+                    value: 99.0,
+                },
+                Binary {
+                    dst: 6,
+                    op: BinaryOp::Div,
+                    lhs: 4,
+                    rhs: 5,
+                },
+                solve::LinearOp::LoadSeed { dst: 7, index: 1 },
+                Binary {
+                    dst: 8,
+                    op: BinaryOp::Mul,
+                    lhs: 6,
+                    rhs: 7,
+                },
+                solve::LinearOp::LoadSeed { dst: 9, index: 2 },
+                Binary {
+                    dst: 10,
+                    op: BinaryOp::Add,
+                    lhs: 8,
+                    rhs: 9,
+                },
+                StoreOutput { src: 10 },
+            ],
+        ],
+        "accepted_branch_projection_jvp.mo",
+    );
+    set_complete_test_projection_plan(&mut model);
+    model.initial_y = vec![0.0, 1.1, 1.1];
+    let runtime = SolveRuntime::new(&model).expect("valid multi-root projection runtime");
+    assert!(!runtime.algebraic_refresh.causal_solution_certified);
+
+    let tol = 1.0e-8;
+    let mut accepted_seed = vec![0.0, 1.1, 1.1];
+    let first = runtime
+        .eval_state_derivatives_with_guess(0.0, &[0.0], &[], &mut accepted_seed, tol, 256)
+        .expect("accepted branch projection should settle");
+    let map = accepted_seed[1] - (accepted_seed[1] - 1.0) * (accepted_seed[1] - 100.0) / 99.0;
+    let residual = (accepted_seed[1] - accepted_seed[2])
+        .abs()
+        .max((accepted_seed[2] - map).abs());
+    assert!(
+        (accepted_seed[1] - 1.0).abs() <= tol,
+        "projection jumped from the accepted local branch to {}",
+        accepted_seed[1]
+    );
+    assert!((accepted_seed[2] - 1.0).abs() <= tol);
+    assert!(
+        residual <= tol,
+        "projection residual {residual} exceeds {tol}"
+    );
+
+    let mut projected_seed = accepted_seed.clone();
+    let second = runtime
+        .eval_state_derivatives_with_guess(0.0, &[0.0], &[], &mut projected_seed, tol, 256)
+        .expect("reprojecting the accepted branch should settle");
+    assert!(
+        (first[0] - second[0]).abs() <= tol,
+        "accepted-seed update changed derivative output from {} to {}",
+        first[0],
+        second[0]
+    );
+}
+
+#[test]
+fn converged_coupled_projection_polishes_reconstructed_zero_flow() {
+    use solve::LinearOp::{Binary, Const, LoadY, StoreOutput};
+    use solve::{BinaryOp, ComputeBlock};
+
+    // Artifact-derived analogue of the severe `ground.p.i` channels in
+    // IdealTriacCircuit and HBridge_TrianglePWM_RL. Structural elimination
+    // reconstructs the grounded flow as the difference of two branch currents;
+    // those currents belong to a coupled projection block. A merely
+    // tolerance-converged solve leaks its residual into that observation even
+    // though the physical connection flow is exactly zero.
+    let mut model = linear_algebraic_loop_state_model();
+    let coupled_row = |target: usize, other: usize| {
+        vec![
+            LoadY {
+                dst: 0,
+                index: target,
+            },
+            Const { dst: 1, value: 2.0 },
+            Binary {
+                dst: 2,
+                op: BinaryOp::Mul,
+                lhs: 0,
+                rhs: 1,
+            },
+            LoadY {
+                dst: 3,
+                index: other,
+            },
+            Binary {
+                dst: 4,
+                op: BinaryOp::Sub,
+                lhs: 2,
+                rhs: 3,
+            },
+            Const { dst: 5, value: 1.0 },
+            Binary {
+                dst: 6,
+                op: BinaryOp::Sub,
+                lhs: 4,
+                rhs: 5,
+            },
+            StoreOutput { src: 6 },
+        ]
+    };
+    model.problem.continuous.implicit_rhs = ComputeBlock::from_scalar_program_block(spanned_block(
+        vec![
+            vec![LoadY { dst: 0, index: 0 }, StoreOutput { src: 0 }],
+            coupled_row(1, 2),
+            coupled_row(2, 1),
+        ],
+        "ground_flow_projection.mo",
+    ));
+    let seed_row = |target, other| {
+        vec![
+            solve::LinearOp::LoadSeed {
+                dst: 0,
+                index: target,
+            },
+            Const { dst: 1, value: 2.0 },
+            Binary {
+                dst: 2,
+                op: BinaryOp::Mul,
+                lhs: 0,
+                rhs: 1,
+            },
+            solve::LinearOp::LoadSeed {
+                dst: 3,
+                index: other,
+            },
+            Binary {
+                dst: 4,
+                op: BinaryOp::Sub,
+                lhs: 2,
+                rhs: 3,
+            },
+            StoreOutput { src: 4 },
+        ]
+    };
+    set_test_implicit_jvp(
+        &mut model,
+        vec![
+            vec![
+                solve::LinearOp::LoadSeed { dst: 0, index: 0 },
+                StoreOutput { src: 0 },
+            ],
+            seed_row(1, 2),
+            seed_row(2, 1),
+        ],
+        "ground_flow_projection_jvp.mo",
+    );
+    set_complete_test_projection_plan(&mut model);
+    model.initial_y = vec![0.0, 1.0 + 5.0e-11, 1.0 - 5.0e-11];
+    let runtime = SolveRuntime::new(&model).expect("coupled flow fixture should prepare");
+    assert!(!runtime.algebraic_refresh.causal_solution_certified);
+
+    let mut observation = model.initial_y.clone();
+    runtime
+        .full_solver_y_with_guess(0.0, &[0.0], &[], &mut observation, 1.0e-10, 32)
+        .expect("coupled observation projection should settle");
+
+    assert!(
+        (observation[1] - observation[2]).abs() <= 4.0 * f64::EPSILON,
+        "reconstructed grounded flow retained projection residual: {:?}",
+        observation
+    );
+}

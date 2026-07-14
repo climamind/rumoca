@@ -834,6 +834,162 @@ impl SolveRuntime {
         self.write_planned_root_search_conditions(plan, &solver_y, params, t, out)
     }
 
+    /// Evaluate root-search values from an explicit algebraic branch seed.
+    ///
+    /// The caller owns `guess`: state slots are replaced by `state`, while the
+    /// remaining solver slots retain the supplied branch before the root
+    /// dependency projection is settled. This keeps adaptive-solver trial
+    /// callbacks free of hidden mutable runtime state.
+    pub fn eval_root_search_conditions_with_guess_into(
+        &self,
+        t: f64,
+        state: &[f64],
+        params: &[f64],
+        guess: &mut Vec<f64>,
+        tol: f64,
+        max_iters: usize,
+        out: &mut [f64],
+    ) -> Result<(), RuntimeSolveError> {
+        let roots = &self.model.problem.events.root_conditions;
+        if roots.is_empty() {
+            if let Some(first) = out.first_mut() {
+                *first = 1.0;
+            }
+            return Ok(());
+        }
+        if guess.len() != self.solver_count {
+            copy_runtime_values_into(guess, &self.model.initial_y, "root solver guess")?;
+            resize_runtime_values(guess, self.solver_count, 0.0, "root solver guess")?;
+        }
+        self.overwrite_state_slots_preserving_algebraics(guess, state)?;
+        let Some(plan) = &self.root_condition_plan else {
+            self.refresh_slots_with_plan(
+                &self.root_refresh,
+                RefreshSlotArgs {
+                    t,
+                    solver_y: guess,
+                    params,
+                    tol,
+                    max_iters,
+                },
+            )?;
+            return self.eval_root_conditions_from_refreshed_solver_y(t, guess, params, out);
+        };
+        self.validate_root_plan_output_len(plan, out)?;
+        if plan.search_rows.is_empty() {
+            return self.write_planned_root_search_defaults(plan, params, t, out);
+        }
+        self.refresh_slots_with_plan(
+            &self.root_refresh,
+            RefreshSlotArgs {
+                t,
+                solver_y: guess,
+                params,
+                tol,
+                max_iters,
+            },
+        )?;
+        self.write_planned_root_search_conditions(plan, guess, params, t, out)
+    }
+
+    pub fn neutralize_initial_root_search_values(
+        &self,
+        params: &[f64],
+        tol: f64,
+        out: &mut [f64],
+    ) -> Result<(), RuntimeSolveError> {
+        let root_count = self.model.problem.events.root_conditions.output_count();
+        let targets = &self.model.problem.events.root_relation_memory_targets;
+        if targets.len() != root_count {
+            return Err(RuntimeSolveError::solve_ir(format!(
+                "root relation metadata length {} does not match root output count {root_count}",
+                targets.len()
+            )));
+        }
+        if out.len() < root_count {
+            return Err(RuntimeSolveError::solve_ir(format!(
+                "root search output has {} values for {root_count} roots",
+                out.len()
+            )));
+        }
+        for (root_index, target) in targets.iter().copied().enumerate() {
+            if out[root_index] != 0.0 {
+                continue;
+            }
+            let Some(target) = target else {
+                continue;
+            };
+            let solve::ScalarSlot::P { index, .. } = target else {
+                return Err(RuntimeSolveError::solve_ir(format!(
+                    "root crossing index {root_index} has non-parameter relation memory target"
+                )));
+            };
+            let current = params.get(index).copied().ok_or_else(|| {
+                RuntimeSolveError::solve_ir(format!(
+                    "root crossing index {root_index} relation memory parameter {index} is outside parameter storage"
+                ))
+            })?;
+            out[root_index] = if current.abs() <= tol {
+                1.0
+            } else if (current - 1.0).abs() <= tol {
+                -1.0
+            } else {
+                return Err(RuntimeSolveError::solve_ir(format!(
+                    "root crossing index {root_index} relation memory value {current} is not boolean"
+                )));
+            };
+        }
+        Ok(())
+    }
+
+    pub fn apply_consumed_root_search_overrides(
+        &self,
+        params: &[f64],
+        tol: f64,
+        overrides: &[(usize, f64)],
+        out: &mut [f64],
+    ) -> Result<(), RuntimeSolveError> {
+        let root_count = self.model.problem.events.root_conditions.output_count();
+        let targets = &self.model.problem.events.root_relation_memory_targets;
+        if targets.len() != root_count || out.len() < root_count {
+            return Err(RuntimeSolveError::solve_ir(format!(
+                "root relation metadata/output shape does not match {root_count} roots"
+            )));
+        }
+        for &(root_index, post) in overrides {
+            let target = targets.get(root_index).copied().flatten().ok_or_else(|| {
+                RuntimeSolveError::solve_ir(format!(
+                    "consumed root index {root_index} has no relation memory target"
+                ))
+            })?;
+            let solve::ScalarSlot::P { index, .. } = target else {
+                return Err(RuntimeSolveError::solve_ir(format!(
+                    "consumed root index {root_index} has non-parameter relation memory target"
+                )));
+            };
+            let current = params.get(index).copied().ok_or_else(|| {
+                RuntimeSolveError::solve_ir(format!(
+                    "consumed root index {root_index} relation memory parameter {index} is outside parameter storage"
+                ))
+            })?;
+            if (current - post).abs() > tol {
+                return Err(RuntimeSolveError::solve_ir(format!(
+                    "consumed root index {root_index} post-side {post} does not match relation memory {current}"
+                )));
+            }
+            out[root_index] = if post.abs() <= tol {
+                1.0
+            } else if (post - 1.0).abs() <= tol {
+                -1.0
+            } else {
+                return Err(RuntimeSolveError::solve_ir(format!(
+                    "consumed root index {root_index} post-side {post} is not boolean"
+                )));
+            };
+        }
+        Ok(())
+    }
+
     pub fn next_planned_time_root(
         &self,
         params: &[f64],
@@ -1157,12 +1313,42 @@ impl SolveRuntime {
     where
         P: FnMut(&mut [f64], &mut [f64]) -> Result<bool, RuntimeSolveError>,
     {
+        self.settle_projected_runtime_and_relation_memory_with_overrides(
+            y,
+            p,
+            t,
+            tol,
+            max_iters,
+            &[],
+            &mut project_algebraics,
+        )
+    }
+
+    pub fn settle_projected_runtime_and_relation_memory_with_overrides<P>(
+        &self,
+        y: &mut [f64],
+        p: &mut [f64],
+        t: f64,
+        tol: f64,
+        max_iters: usize,
+        root_relation_overrides: &[(usize, f64)],
+        mut project_algebraics: P,
+    ) -> Result<(), RuntimeSolveError>
+    where
+        P: FnMut(&mut [f64], &mut [f64]) -> Result<bool, RuntimeSolveError>,
+    {
         for _ in 0..max_iters {
             let mut changed =
-                self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
+                self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
+            changed |= self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
             changed |= project_algebraics(y, p)?;
             changed |= self.apply_runtime_assignments_until_stable(y, p, t, tol, max_iters)?;
-            changed |= self.update_relation_memory_from_solver_y(t, y, p, tol)?;
+            if root_relation_overrides.is_empty() {
+                changed |= self.update_relation_memory_from_solver_y(t, y, p, tol)?;
+            } else {
+                changed |=
+                    self.apply_root_relation_memory_overrides(root_relation_overrides, y, p, tol)?;
+            }
             if !changed {
                 return Ok(());
             }
@@ -1608,7 +1794,32 @@ impl SolveRuntime {
     ) -> Result<(), RuntimeSolveError> {
         copy_runtime_values_into(solver_y, &self.model.initial_y, "solver y initial values")?;
         resize_runtime_values(solver_y, self.solver_count, 0.0, "solver y")?;
-        for (dst, src) in solver_y.iter_mut().zip(state.iter().copied()) {
+        self.overwrite_state_slots_preserving_algebraics(solver_y, state)
+    }
+
+    fn overwrite_state_slots_preserving_algebraics(
+        &self,
+        solver_y: &mut [f64],
+        state: &[f64],
+    ) -> Result<(), RuntimeSolveError> {
+        if solver_y.len() != self.solver_count {
+            return Err(RuntimeSolveError::solve_ir(format!(
+                "solver y has {} values, expected {}",
+                solver_y.len(),
+                self.solver_count
+            )));
+        }
+        if state.len() < self.state_count {
+            return Err(RuntimeSolveError::solve_ir(format!(
+                "state has {} values, expected at least {}",
+                state.len(),
+                self.state_count
+            )));
+        }
+        for (dst, src) in solver_y[..self.state_count]
+            .iter_mut()
+            .zip(state.iter().copied())
+        {
             *dst = src;
         }
         Ok(())
@@ -1619,17 +1830,7 @@ impl SolveRuntime {
         solver_y: &mut [f64],
         state: &[f64],
     ) -> Result<(), RuntimeSolveError> {
-        if solver_y.len() != self.solver_count {
-            return Err(RuntimeSolveError::solve_ir(format!(
-                "algebraic warm-start length mismatch: expected {}, got {}",
-                self.solver_count,
-                solver_y.len()
-            )));
-        }
-        for (dst, src) in solver_y.iter_mut().zip(state.iter().copied()) {
-            *dst = src;
-        }
-        Ok(())
+        self.overwrite_state_slots_preserving_algebraics(solver_y, state)
     }
 
     fn eval_state_derivatives_at_solver_y(

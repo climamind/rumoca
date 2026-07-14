@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+};
 
 use indexmap::{IndexMap, IndexSet};
 use rumoca_ir_solve as solve;
@@ -658,4 +661,17 @@ fn refresh_plan_capacity_error(
         message: format!("refresh plan {context} capacity overflows"),
         span,
     }
+}
+
+pub fn algebraic_projection_producer_programs(
+    model: &solve::SolveModel,
+) -> Result<BTreeMap<usize, usize>, EvalSolveError> {
+    let block =
+        PreparedScalarProgramBlock::from_compute_block(&model.problem.continuous.implicit_rhs)?;
+    let plan = build_algebraic_refresh_plan(model, &block)?;
+    Ok(plan
+        .rows
+        .into_iter()
+        .map(|row| (row.target_index, row.row_idx))
+        .collect())
 }

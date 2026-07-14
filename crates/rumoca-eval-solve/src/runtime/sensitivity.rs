@@ -37,6 +37,9 @@ impl SolveRuntime {
         self.eval_derivative_jacobian_v_with_seed(lin, state, seed, self.state_count, out)
     }
 
+    /// State Jacobian-vector product at an explicitly seeded algebraic branch.
+    /// The supplied guess is settled in place, so callers can use a private
+    /// trial copy without mutating the accepted branch shared by an integrator.
     pub fn eval_state_jacobian_v_ad_with_guess_into(
         &self,
         lin: AlgebraicLinearization<'_>,
