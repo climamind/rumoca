@@ -1,9 +1,4 @@
-use std::{
-    any::Any,
-    collections::{BTreeMap, BTreeSet},
-    fmt::Display,
-    sync::Mutex,
-};
+use std::{any::Any, collections::BTreeSet, fmt::Display, sync::Mutex};
 
 use diffsol::{
     BdfState, MatrixCommon, OdeEquations, OdeEquationsImplicit, OdeSolverMethod, OdeSolverProblem,
@@ -289,6 +284,7 @@ where
     S: OdeSolverMethod<'a, Eqn>,
 {
     runtime_params.borrow_mut().copy_from_slice(params);
+    let previous_h = solver.state().h;
     let problem = solver.problem();
     let mut fresh_state = S::State::new_without_initialise(problem)
         .map_err(|err| SimError::SolverError(format!("solver state reset: {err}")))?;
@@ -299,22 +295,29 @@ where
         *state.t = t;
     }
     fresh_state.set_step_size(problem.h0, &problem.atol, problem.rtol, &problem.eqn, 1);
-    cap_fresh_step_size::<Eqn, S>(&mut fresh_state, h_cap);
+    apply_event_restart_step_size::<Eqn, S>(&mut fresh_state, previous_h, h_cap);
     solver.set_state(fresh_state);
     mark_solver_state_modified_for_reinit(solver);
     Ok(())
 }
 
-fn cap_fresh_step_size<'a, Eqn, S>(state: &mut S::State, h_cap: f64)
+fn apply_event_restart_step_size<'a, Eqn, S>(state: &mut S::State, previous_h: f64, h_cap: f64)
 where
     Eqn: OdeEquations<T = f64> + 'a,
     Eqn::V: VectorHost<T = f64>,
     S: OdeSolverMethod<'a, Eqn>,
 {
-    let state = state.as_mut();
-    if *state.h > h_cap {
-        *state.h = h_cap;
+    if let Some(restart_h) = event_restart_step_size(previous_h, h_cap) {
+        *state.as_mut().h = restart_h;
     }
+}
+
+fn event_restart_step_size(previous_h: f64, h_cap: f64) -> Option<f64> {
+    if !previous_h.is_finite() || previous_h == 0.0 || !h_cap.is_finite() || h_cap <= 0.0 {
+        return None;
+    }
+    let magnitude = previous_h.abs().min(h_cap);
+    (magnitude > 0.0).then(|| magnitude.copysign(previous_h))
 }
 
 fn mark_solver_state_modified_for_reinit<'a, Eqn, S>(solver: &mut S)
@@ -366,18 +369,6 @@ fn state_only_bdf_eligibility(
     if direct_deps.is_empty() {
         return Ok(StateOnlyBdfEligibility::Eligible);
     }
-    if model
-        .problem
-        .continuous
-        .algebraic_projection_plan
-        .blocks
-        .iter()
-        .any(|block| !block.causal_steps.is_empty())
-    {
-        return Ok(StateOnlyBdfEligibility::Ineligible(
-            "algebraic loop projection requires the general implicit DAE path".to_string(),
-        ));
-    }
     if let Some(reason) = projection_plan_missing_non_state_loads(model, direct_deps)? {
         Ok(StateOnlyBdfEligibility::Ineligible(reason))
     } else {
@@ -407,37 +398,57 @@ fn projection_plan_missing_non_state_loads(
     let solver_count = model.solver_scalar_count();
     let implicit_rows =
         solve_eval::to_scalar_program_block(&model.problem.continuous.implicit_rhs)?;
-    // The projection plan references residual rows by OUTPUT index; a program may
-    // now emit several outputs, so the producer map is bounded by output count
-    // and resolved to its producing program.
-    let producer_rows = match projection_producer_rows(model, implicit_rows.output_count()) {
-        Ok(producer_rows) => producer_rows,
-        Err(reason) => return Ok(Some(reason)),
-    };
-    let mut needed = BTreeSet::new();
+    // Coupled blocks are producers even when they have no direct assignment
+    // seed. Their complete residual row set owns the dependency closure.
+    let blocks = &model.problem.continuous.algebraic_projection_plan.blocks;
+    let mut owners = BTreeMap::new();
+    for (block_index, block) in blocks.iter().enumerate() {
+        for index in &block.y_indices {
+            if owners.insert(*index, block_index).is_some() {
+                return Ok(Some(format!(
+                    "multiple projection blocks own solver_y[{index}] ({})",
+                    solver_name(model, *index)
+                )));
+            }
+        }
+    }
+    let mut visited_blocks = BTreeSet::new();
     let mut stack = direct_deps.into_iter().collect::<Vec<_>>();
     while let Some(index) = stack.pop() {
-        if index < state_count || !needed.insert(index) {
+        if index < state_count {
             continue;
         }
-        let Some(output_idx) = producer_rows.get(&index).copied() else {
+        let Some(block_index) = owners.get(&index).copied() else {
             return Ok(Some(format!(
                 "missing projection producer for solver_y[{index}] ({})",
                 solver_name(model, index)
             )));
         };
-        let Some(program_idx) = implicit_rows.program_index_for_output(output_idx) else {
+        if !visited_blocks.insert(block_index) {
+            continue;
+        }
+        let block = &blocks[block_index];
+        if block.rows.is_empty() {
             return Ok(Some(format!(
-                "missing implicit program for projection output row {output_idx} producing solver_y[{index}] ({})",
+                "missing implicit producer rows for solver_y[{index}] ({})",
                 solver_name(model, index)
             )));
-        };
-        let Some(row) = implicit_rows.programs.get(program_idx) else {
-            return Ok(Some(format!(
-                "missing implicit row program {program_idx} for projection output row {output_idx}"
-            )));
-        };
-        stack.extend(non_state_y_loads(row, state_count, solver_count));
+        }
+        for output_index in &block.rows {
+            let Some(program_index) = implicit_rows.program_index_for_output(*output_index) else {
+                return Ok(Some(format!(
+                    "missing implicit producer output {output_index} for solver_y[{index}] ({})",
+                    solver_name(model, index)
+                )));
+            };
+            let Some(row) = implicit_rows.programs.get(program_index) else {
+                return Ok(Some(format!(
+                    "missing implicit producer program {program_index} for solver_y[{index}] ({})",
+                    solver_name(model, index)
+                )));
+            };
+            stack.extend(non_state_y_loads(row, state_count, solver_count));
+        }
     }
     Ok(None)
 }
@@ -451,46 +462,6 @@ fn solver_name(model: &solve::SolveModel, index: usize) -> &str {
         .get(index)
         .map(String::as_str)
         .unwrap_or("<unnamed>")
-}
-
-fn projection_producer_rows(
-    model: &solve::SolveModel,
-    implicit_row_count: usize,
-) -> Result<BTreeMap<usize, usize>, String> {
-    let mut producer_rows = BTreeMap::new();
-    for block in &model.problem.continuous.algebraic_projection_plan.blocks {
-        let pairs = if block.causal_steps.is_empty() {
-            block
-                .rows
-                .iter()
-                .copied()
-                .zip(block.y_indices.iter().copied())
-                .collect::<Vec<_>>()
-        } else {
-            block
-                .causal_steps
-                .iter()
-                .map(|step| (step.row, step.y_index))
-                .collect::<Vec<_>>()
-        };
-        for (row_idx, target_index) in pairs {
-            if row_idx >= implicit_row_count {
-                return Err(format!(
-                    "projection row {row_idx} for solver_y[{target_index}] ({}) is outside implicit output count {implicit_row_count}",
-                    solver_name(model, target_index)
-                ));
-            }
-            if let Some(previous_row) = producer_rows.insert(target_index, row_idx)
-                && previous_row != row_idx
-            {
-                return Err(format!(
-                    "solver_y[{target_index}] ({}) has multiple projection producer rows: {previous_row} and {row_idx}",
-                    solver_name(model, target_index)
-                ));
-            }
-        }
-    }
-    Ok(producer_rows)
 }
 
 fn non_state_y_loads(
@@ -512,4 +483,24 @@ fn non_state_y_loads(
     loads.sort_unstable();
     loads.dedup();
     loads
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_restart_step_size;
+
+    #[test]
+    fn event_restart_preserves_accepted_scale_direction_and_cap() {
+        assert_eq!(event_restart_step_size(1.0e-4, 1.0e-3), Some(1.0e-4));
+        assert_eq!(event_restart_step_size(2.0e-3, 1.0e-3), Some(1.0e-3));
+        assert_eq!(event_restart_step_size(-2.0e-3, 1.0e-3), Some(-1.0e-3));
+    }
+
+    #[test]
+    fn event_restart_rejects_invalid_scale_without_overwriting_fresh_state() {
+        assert_eq!(event_restart_step_size(0.0, 1.0e-3), None);
+        assert_eq!(event_restart_step_size(f64::NAN, 1.0e-3), None);
+        assert_eq!(event_restart_step_size(1.0e-4, f64::INFINITY), None);
+        assert_eq!(event_restart_step_size(1.0e-4, 0.0), None);
+    }
 }

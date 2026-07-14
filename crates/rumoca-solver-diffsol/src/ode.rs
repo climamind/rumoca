@@ -16,7 +16,8 @@ use rumoca_solver::{
 };
 
 use crate::{
-    AlgebraicWarmStart, EVENT_UPDATE_MAX_ITERS, Matrix, RuntimeParameters, Scalar, SimError, Vector,
+    AlgebraicWarmStart, EVENT_UPDATE_MAX_ITERS, Matrix, RootStartMode, RootStartModeHandle,
+    RootStartTime, RuntimeParameters, Scalar, SimError, Vector,
 };
 
 #[derive(Debug, Default)]
@@ -71,6 +72,8 @@ pub(crate) struct BdfEvalCounterSnapshot {
 pub(crate) struct StateOdeProblemInput {
     pub(crate) runtime_params: RuntimeParameters,
     pub(crate) algebraic_warm_start: AlgebraicWarmStart,
+    pub(crate) root_start_time: RootStartTime,
+    pub(crate) root_start_mode: RootStartModeHandle,
     pub(crate) t_start: f64,
     pub(crate) initial_state: Vec<f64>,
     pub(crate) eval_counters: Option<Arc<BdfEvalCounters>>,
@@ -89,6 +92,8 @@ impl StateOdeProblemInput {
         Self {
             runtime_params,
             algebraic_warm_start,
+            root_start_time: std::rc::Rc::new(std::cell::Cell::new(t_start)),
+            root_start_mode: std::rc::Rc::new(std::cell::RefCell::new(RootStartMode::Initial)),
             t_start,
             initial_state,
             eval_counters,
@@ -508,6 +513,8 @@ pub(crate) fn build_ode_problem_with_runtime_params_and_initial(
     model: &solve::SolveModel,
     opts: &SimOptions,
     runtime_params: RuntimeParameters,
+    root_start_time: RootStartTime,
+    root_start_mode: RootStartModeHandle,
     t_start: f64,
     initial_y: Vec<f64>,
     ode_model: Arc<OdeModel>,
@@ -525,6 +532,8 @@ pub(crate) fn build_ode_problem_with_runtime_params_and_initial(
         t_start,
         initial_y,
         Some(runtime_params),
+        root_start_time,
+        root_start_mode,
         ode_model,
         root_runtime,
     )
@@ -552,21 +561,23 @@ pub(crate) fn build_state_ode_problem_with_runtime_params_and_initial(
     let rhs_params = Some(input.runtime_params.clone());
     let jac_params = Some(input.runtime_params.clone());
     let root_params = Some(input.runtime_params);
-    let rhs_warm_start = input.algebraic_warm_start.clone();
-    let jac_warm_start = input.algebraic_warm_start;
+    let root_start_time_for_eval = input.root_start_time;
+    let root_start_mode_for_eval = input.root_start_mode;
+    let rhs_accepted = input.algebraic_warm_start.0.clone();
+    let jac_accepted = input.algebraic_warm_start.0.clone();
+    let root_accepted = input.algebraic_warm_start.0;
+    let rhs_runtime = input.rhs_runtime;
     let tol = opts.atol.max(1.0e-10);
-
     let rhs_fn = move |y: &Vector, p: &Vector, t: Scalar, out: &mut Vector| {
         let start = rhs_counters.as_ref().map(|_| Instant::now());
         with_runtime_params(&rhs_params, p.as_slice(), |params| {
-            let mut solver_y = rhs_warm_start.speculative();
-            if input
-                .rhs_runtime
+            let mut trial = rhs_accepted.borrow().derivative.clone();
+            if rhs_runtime
                 .eval_state_derivatives_with_guess_into(
                     t,
                     y.as_slice(),
                     params,
-                    &mut solver_y,
+                    &mut trial,
                     tol,
                     256,
                     out.as_mut_slice(),
@@ -583,7 +594,7 @@ pub(crate) fn build_state_ode_problem_with_runtime_params_and_initial(
     let jac_fn = move |y: &Vector, p: &Vector, t: Scalar, v: &Vector, out: &mut Vector| {
         let start = jac_counters.as_ref().map(|_| Instant::now());
         with_runtime_params(&jac_params, p.as_slice(), |params| {
-            let mut solver_y = jac_warm_start.speculative();
+            let mut trial = jac_accepted.borrow().derivative.clone();
             if jac_runtime
                 .eval_state_jacobian_v_ad_with_guess_into(
                     solve_eval::AlgebraicLinearization {
@@ -593,7 +604,7 @@ pub(crate) fn build_state_ode_problem_with_runtime_params_and_initial(
                     },
                     y.as_slice(),
                     v.as_slice(),
-                    &mut solver_y,
+                    &mut trial,
                     out.as_mut_slice(),
                 )
                 .is_err()
@@ -608,17 +619,39 @@ pub(crate) fn build_state_ode_problem_with_runtime_params_and_initial(
     let root_fn = move |y: &Vector, p: &Vector, t: Scalar, out: &mut Vector| {
         let start = root_counters.as_ref().map(|_| Instant::now());
         with_runtime_params(&root_params, p.as_slice(), |params| {
-            if root_runtime
-                .eval_root_search_conditions_into(
-                    t,
-                    y.as_slice(),
-                    params,
-                    tol,
-                    EVENT_UPDATE_MAX_ITERS,
-                    out.as_mut_slice(),
-                )
-                .is_err()
-            {
+            let mut trial = root_accepted.borrow().root.clone();
+            let evaluated = root_runtime.eval_root_search_conditions_with_guess_into(
+                t,
+                y.as_slice(),
+                params,
+                &mut trial,
+                tol,
+                EVENT_UPDATE_MAX_ITERS,
+                out.as_mut_slice(),
+            );
+            let root_start = root_start_time_for_eval.get();
+            let initialized = evaluated.and_then(|()| {
+                if t == root_start {
+                    match &*root_start_mode_for_eval.borrow() {
+                        RootStartMode::Initial => root_runtime
+                            .neutralize_initial_root_search_values(
+                                params,
+                                tol,
+                                out.as_mut_slice(),
+                            )?,
+                        RootStartMode::Root(overrides) => root_runtime
+                            .apply_consumed_root_search_overrides(
+                                params,
+                                tol,
+                                overrides,
+                                out.as_mut_slice(),
+                            )?,
+                        RootStartMode::Scheduled => {}
+                    }
+                }
+                Ok(())
+            });
+            if initialized.is_err() {
                 fill_eval_error(out.as_mut_slice());
             }
         });
@@ -658,6 +691,8 @@ fn build_ode_problem_with_initial(
     t_start: f64,
     initial_y: Vec<f64>,
     runtime_params: Option<RuntimeParameters>,
+    root_start_time: RootStartTime,
+    root_start_mode: RootStartModeHandle,
     ode_model: Arc<OdeModel>,
     root_runtime: Arc<SolveRuntime>,
 ) -> Result<
@@ -681,6 +716,8 @@ fn build_ode_problem_with_initial(
     let rhs_runtime_params = runtime_params.clone();
     let jac_runtime_params = runtime_params.clone();
     let root_runtime_params = runtime_params.clone();
+    let root_start_time_for_eval = root_start_time;
+    let root_start_mode_for_eval = root_start_mode;
     let jac_model = ode_model.clone();
     let tol = opts.atol.max(1.0e-10);
     let jac_fn = move |y: &Vector, p: &Vector, t: Scalar, v: &Vector, out: &mut Vector| {
@@ -695,17 +732,36 @@ fn build_ode_problem_with_initial(
     };
     let root_fn = move |y: &Vector, p: &Vector, t: Scalar, out: &mut Vector| {
         with_runtime_params(&root_runtime_params, p.as_slice(), |params| {
-            if root_runtime
-                .eval_root_search_conditions_into(
-                    t,
-                    y.as_slice(),
-                    params,
-                    tol,
-                    EVENT_UPDATE_MAX_ITERS,
-                    out.as_mut_slice(),
-                )
-                .is_err()
-            {
+            let evaluated = root_runtime.eval_root_search_conditions_into(
+                t,
+                y.as_slice(),
+                params,
+                tol,
+                EVENT_UPDATE_MAX_ITERS,
+                out.as_mut_slice(),
+            );
+            let initialized = evaluated.and_then(|()| {
+                if t == root_start_time_for_eval.get() {
+                    match &*root_start_mode_for_eval.borrow() {
+                        RootStartMode::Initial => root_runtime
+                            .neutralize_initial_root_search_values(
+                                params,
+                                tol,
+                                out.as_mut_slice(),
+                            )?,
+                        RootStartMode::Root(overrides) => root_runtime
+                            .apply_consumed_root_search_overrides(
+                                params,
+                                tol,
+                                overrides,
+                                out.as_mut_slice(),
+                            )?,
+                        RootStartMode::Scheduled => {}
+                    }
+                }
+                Ok(())
+            });
+            if initialized.is_err() {
                 fill_eval_error(out.as_mut_slice());
             }
         });
