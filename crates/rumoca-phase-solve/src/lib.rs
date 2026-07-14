@@ -1687,7 +1687,7 @@ fn scalar_projection_block(
         context_span,
     )?;
     y_indices.push(y_index);
-    let causal_steps = row_targets
+    let causal_target = row_targets
         .get(row)
         .copied()
         .flatten()
@@ -1695,14 +1695,15 @@ fn scalar_projection_block(
             solve::ScalarSlot::Y { index, .. } => Some(index),
             _ => None,
         })
-        .filter(|target| y_indices.contains(target))
-        .map(|target| {
-            vec![solve::AlgebraicProjectionStep {
-                row,
-                y_index: target,
-            }]
-        })
-        .unwrap_or_default();
+        .filter(|target| y_indices.contains(target));
+    let causal_steps = if let Some(target) = causal_target {
+        vec![solve::AlgebraicProjectionStep {
+            row,
+            y_index: target,
+        }]
+    } else {
+        Vec::new()
+    };
     Ok(solve::AlgebraicProjectionBlock {
         rows,
         y_indices,
