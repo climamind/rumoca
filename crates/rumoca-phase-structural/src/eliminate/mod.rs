@@ -657,75 +657,65 @@ fn drop_structured_families_touching_equations(dae: &mut Dae, touched_sorted: &[
         return;
     }
     dae.continuous.structured_equations.retain(|family| {
-        let total = family
+        let Some(block_end) = family
             .scalar_view_row_count()
-            .expect("validated structured family row count");
-        let block_end = family.first_equation_index + total;
-        let touches_family = touched_sorted
-            .iter()
-            .any(|&idx| idx >= family.first_equation_index && idx < block_end);
+            .ok()
+            .and_then(|total| family.first_equation_index.checked_add(total))
+        else {
+            return false;
+        };
+        let touches_family =
+            sorted_rows_touch_range(touched_sorted, family.first_equation_index, block_end);
+        let compact_corner_touch = if family.regular.is_some() && !family.interiors_materialized {
+            match unmaterialized_family_corner_is_touched(family, touched_sorted) {
+                Some(touched) => Some(touched),
+                None => return false,
+            }
+        } else {
+            None
+        };
         if !touches_family {
             return true;
         }
-        family.regular.is_some()
-            && !family.interiors_materialized
-            && !unmaterialized_family_corner_is_touched(family, touched_sorted)
+        compact_corner_touch == Some(false)
     });
 }
 
 fn unmaterialized_family_corner_is_touched(
     family: &dae::StructuredEquationFamily,
     touched_sorted: &[usize],
-) -> bool {
-    let Ok(index_tuples) = family.domain.index_tuples() else {
-        return true;
-    };
-    if index_tuples.len() != family.equation_counts.len() {
-        return true;
+) -> Option<bool> {
+    let point_count = family.point_count().ok()?;
+    if point_count == 0 || family.equations_per_point == 0 {
+        return Some(false);
     }
-    let Some(base) = index_tuples.first() else {
-        return true;
-    };
-    if base.len() != family.domain.binders.len()
-        || index_tuples
-            .iter()
-            .any(|tuple| tuple.len() != family.domain.binders.len())
-    {
-        return true;
-    }
-
-    let mut row_start = family.first_equation_index;
-    for (tuple, &row_count) in index_tuples.iter().zip(&family.equation_counts) {
-        let Some(row_end) = row_start.checked_add(row_count) else {
-            return true;
-        };
-        let iteration_is_touched = touched_sorted
-            .iter()
-            .any(|&row| row >= row_start && row < row_end);
-        if iteration_is_touched && regular_family_tuple_is_corner(base, tuple, family) {
-            return true;
+    let mut corner_iterations = vec![0usize];
+    let mut iteration_stride = 1usize;
+    for binder in family.domain.binders.iter().rev() {
+        let extent = binder.value_count().ok()?;
+        if extent > 1 {
+            corner_iterations.push(iteration_stride);
         }
-        row_start = row_end;
+        iteration_stride = iteration_stride.checked_mul(extent)?;
     }
-    false
+    corner_iterations.sort_unstable();
+    corner_iterations.dedup();
+
+    for iteration in corner_iterations {
+        let row_start = iteration
+            .checked_mul(family.equations_per_point)?
+            .checked_add(family.first_equation_index)?;
+        let row_end = row_start.checked_add(family.equations_per_point)?;
+        if sorted_rows_touch_range(touched_sorted, row_start, row_end) {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
-fn regular_family_tuple_is_corner(
-    base: &[i64],
-    tuple: &[i64],
-    family: &dae::StructuredEquationFamily,
-) -> bool {
-    let mut advanced_dimension = false;
-    for ((&base_value, &value), binder) in base.iter().zip(tuple).zip(&family.domain.binders) {
-        if value == base_value {
-            continue;
-        }
-        if advanced_dimension || base_value.checked_add(binder.step) != Some(value) {
-            return false;
-        }
-        advanced_dimension = true;
-    }
-    true
+fn sorted_rows_touch_range(rows: &[usize], start: usize, end: usize) -> bool {
+    let first_candidate = rows.partition_point(|row| *row < start);
+    rows.get(first_candidate).is_some_and(|row| *row < end)
 }
 
 fn finish_boundary_elimination(
