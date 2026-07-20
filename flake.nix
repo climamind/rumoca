@@ -146,9 +146,9 @@
         rumocaPythonEnv = pkgs.python312.withPackages (_: [ rumocaPython ]);
 
         # Release-mode artifacts for the MSL parity gate, built as one Cargo
-        # graph so the shard / merge / ModelicaTest / pinned-library consumers
-        # restore them via
-        # Cachix instead of recompiling + re-LTO'ing the workspace. A single
+        # graph so the shard / merge / ModelicaTest consumers restore them via
+        # a GitHub Actions closure artifact instead of recompiling + re-LTO'ing
+        # the workspace. A single
         # derivation keeps rumoca-worker, rumoca-sim-worker, rumoca-msl-tools,
         # the focused profile runner, and the libtest harness in one target
         # directory; separate derivations
