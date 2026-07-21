@@ -190,6 +190,9 @@ impl<'a> FunctionProjectionAnalysis<'a> {
             Err(err) => return Err(err),
         };
         let Some(outputs) = outputs else {
+            if is_direct_declared_array_output_call(expr, self.dae_model) {
+                return Ok(None);
+            }
             return Ok(Some(call));
         };
         if let [output] = outputs.as_slice() {
