@@ -582,7 +582,7 @@ pub struct DaeEventPartition {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DaeScheduledTimeEvent {
     pub time: f64,
-    pub source_span: Span,
+    pub source_span: Option<Span>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1407,7 +1407,7 @@ mod tests {
             .scheduled_time_events
             .push(super::DaeScheduledTimeEvent {
                 time: 0.1,
-                source_span: fixture_span(),
+                source_span: Some(fixture_span()),
             });
         dae.clocks.schedules.push(ClockSchedule {
             period_seconds: 0.1,
