@@ -93,6 +93,9 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 else {
                     return Ok(None);
                 };
+                if base_dims.is_empty() {
+                    return Ok(None);
+                }
                 self.subscripted_projection_dims(&base_dims, subscripts, scope, depth + 1, span)
                     .map(Some)
             }
