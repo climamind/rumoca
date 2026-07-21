@@ -1485,7 +1485,12 @@ events = false
         );
         let capabilities = manifest.capabilities.as_ref().expect("capabilities");
         let mut dae = Dae::new();
-        dae.events.scheduled_time_events.push(0.1);
+        dae.events
+            .scheduled_time_events
+            .push(rumoca_ir_dae::DaeScheduledTimeEvent {
+                time: 0.1,
+                source_span: Span::DUMMY,
+            });
 
         let err = validate_dae_target_capabilities(&dae, &manifest, capabilities)
             .expect_err("events should be rejected");
