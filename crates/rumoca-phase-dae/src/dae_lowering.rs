@@ -3354,7 +3354,6 @@ fn scalarize_if_expr_at(
         span,
     })
 }
-
 fn scalarize_builtin_array_constructor_at(
     function: rumoca_core::BuiltinFunction,
     args: &[rumoca_core::Expression],
@@ -3397,7 +3396,6 @@ fn scalarize_builtin_array_constructor_at(
         _ => Ok(None),
     }
 }
-
 fn scalarized_fill_value_lane(
     value: &rumoca_core::Expression,
     k: usize,
@@ -3412,7 +3410,6 @@ fn scalarized_fill_value_lane(
     };
     if width <= 1 { 0 } else { k % width }
 }
-
 fn scalarized_fill_value_width(
     value: &rumoca_core::Expression,
     phantom_map: &HashMap<String, Vec<rumoca_core::Reference>>,
@@ -3458,7 +3455,6 @@ fn scalarized_fill_value_width(
         _ => None,
     }
 }
-
 fn literal_positive_usize(expr: &rumoca_core::Expression) -> Option<usize> {
     match expr {
         rumoca_core::Expression::Literal {
@@ -3472,14 +3468,12 @@ fn literal_positive_usize(expr: &rumoca_core::Expression) -> Option<usize> {
         _ => None,
     }
 }
-
 fn real_literal(value: f64, span: rumoca_core::Span) -> rumoca_core::Expression {
     rumoca_core::Expression::Literal {
         value: rumoca_core::Literal::Real(value),
         span,
     }
 }
-
 fn first_function_output_size(
     name: &str,
     functions: &IndexMap<rumoca_core::VarName, rumoca_core::Function>,
@@ -3489,18 +3483,15 @@ fn first_function_output_size(
     let output = function.outputs.first()?;
     Some(compute_var_size(&output.dims))
 }
-
 fn vectorize_phantom_expr(
     expr: &rumoca_core::Expression,
     phantom_map: &HashMap<String, Vec<rumoca_core::Reference>>,
 ) -> rumoca_core::Expression {
     PhantomVectorizer { phantom_map }.rewrite_expression(expr)
 }
-
 struct PhantomVectorizer<'a> {
     phantom_map: &'a HashMap<String, Vec<rumoca_core::Reference>>,
 }
-
 impl ExpressionRewriter for PhantomVectorizer<'_> {
     fn rewrite_var_ref_expression(
         &mut self,
@@ -4060,12 +4051,11 @@ impl Projector<'_> {
             return Ok(None);
         };
         if matches!(op, OpBinary::Add | OpBinary::Sub) {
-            if target_dims.is_empty()
-                || self.dims(expr, *span)?.as_deref() != Some(target_dims)
-                || matches!(lhs.as_ref(), Expr::FunctionCall { .. })
-                || matches!(rhs.as_ref(), Expr::FunctionCall { .. })
-            {
-                return Ok(None);
+            let result_dims = self
+                .dims(expr, *span)?
+                .ok_or_else(|| projection_error("unknown operand shape", *span))?;
+            if result_dims != target_dims {
+                return Err(projection_error("result shape mismatch", *span));
             }
             let indices = lane_indices_for_dims(k, target_dims)
                 .ok_or_else(|| projection_error("result shape mismatch", *span))?;
@@ -4088,6 +4078,14 @@ impl Projector<'_> {
         }
         let lhs_dims = lhs_dims.ok_or_else(|| projection_error("unknown operand shape", *span))?;
         let rhs_dims = rhs_dims.ok_or_else(|| projection_error("unknown operand shape", *span))?;
+        if (!lhs_dims.is_empty() && matches!(lhs.as_ref(), Expr::FunctionCall { .. }))
+            || (!rhs_dims.is_empty() && matches!(rhs.as_ref(), Expr::FunctionCall { .. }))
+        {
+            return Err(projection_error(
+                "array-valued function output cannot be projected",
+                *span,
+            ));
+        }
         let result_dims = product_dims(op, &lhs_dims, &rhs_dims, *span)?;
         if result_dims != target_dims {
             let detail = if target_dims.is_empty() {
@@ -4140,6 +4138,11 @@ impl Projector<'_> {
             .ok_or_else(|| projection_error("unsupported inner dimension", *span))
     }
     fn element(&self, expr: &Expr, indices: &[i64], span: Span) -> Result<Expr, ToDaeError> {
+        if !matches!(expr, Expr::Binary { .. })
+            && matches!(self.dims(expr, span)?, Some(dims) if dims.is_empty())
+        {
+            return Ok(expr.clone());
+        }
         if let Some((name, subscripts)) = matrix_var_slice(expr) {
             let expr_span = expr.span().unwrap_or(span);
             let base_dims = self
@@ -4205,10 +4208,27 @@ impl Projector<'_> {
                 self.project(expr, lane, &dims)?
                     .ok_or_else(|| projection_error("array operand cannot be projected", span))
             }
-            Expr::FunctionCall { span, .. } => Err(projection_error(
-                "array-valued function output cannot be projected",
-                *span,
-            )),
+            Expr::FunctionCall { span, .. } => {
+                let dims = self
+                    .dims(expr, *span)?
+                    .ok_or_else(|| projection_error("unknown operand shape", *span))?;
+                let lane = linear_lane_for_indices(indices, &dims)
+                    .ok_or_else(|| projection_error("result shape mismatch", *span))?;
+                let index = one_based_scalar_index(
+                    lane,
+                    *span,
+                    "DAE matrix-product function output projection",
+                )?;
+                Ok(Expr::Index {
+                    base: Box::new(expr.clone()),
+                    subscripts: vec![generated_index_subscript(
+                        index,
+                        *span,
+                        "DAE matrix-product function output projection",
+                    )?],
+                    span: *span,
+                })
+            }
             _ => Err(projection_error("unknown operand shape", span)),
         }
     }
@@ -4404,7 +4424,6 @@ impl RhsProjectionCtx<'_> {
             _ => Ok(expr.clone()),
         }
     }
-
     fn project_var_ref(
         &self,
         expr: &rumoca_core::Expression,
@@ -4440,7 +4459,6 @@ impl RhsProjectionCtx<'_> {
         }
         Ok(expr.clone())
     }
-
     fn project_index(
         &self,
         base: &rumoca_core::Expression,
@@ -4473,7 +4491,6 @@ impl RhsProjectionCtx<'_> {
             span,
         })
     }
-
     fn project_array(
         &self,
         elements: &[rumoca_core::Expression],
@@ -4490,7 +4507,6 @@ impl RhsProjectionCtx<'_> {
         }
         Ok(expr.clone())
     }
-
     fn project_array_comprehension(
         &self,
         inner: &rumoca_core::Expression,
@@ -4513,7 +4529,6 @@ impl RhsProjectionCtx<'_> {
         let selected = substitution.rewrite_expression(inner);
         self.project(&selected)
     }
-
     fn project_function_call(
         &self,
         name: &rumoca_core::Reference,
@@ -4545,7 +4560,6 @@ impl RhsProjectionCtx<'_> {
             span,
         })
     }
-
     fn project_function_call_with_formals(
         &self,
         name: &rumoca_core::Reference,
@@ -4577,7 +4591,6 @@ impl RhsProjectionCtx<'_> {
             span,
         })
     }
-
     fn project_field_access(
         &self,
         base: &rumoca_core::Expression,
@@ -4604,7 +4617,6 @@ impl RhsProjectionCtx<'_> {
             span,
         })
     }
-
     fn project_binary(
         &self,
         op: &rumoca_core::OpBinary,
@@ -4619,7 +4631,6 @@ impl RhsProjectionCtx<'_> {
             span,
         })
     }
-
     fn project_unary(
         &self,
         op: &rumoca_core::OpUnary,
@@ -4632,7 +4643,6 @@ impl RhsProjectionCtx<'_> {
             span,
         })
     }
-
     fn project_if(
         &self,
         branches: &[(rumoca_core::Expression, rumoca_core::Expression)],
@@ -4650,7 +4660,6 @@ impl RhsProjectionCtx<'_> {
         })
     }
 }
-
 fn scalarized_array_literal_lane(
     elements: &[rumoca_core::Expression],
     k: usize,
@@ -4673,7 +4682,6 @@ fn scalarized_array_literal_lane(
     }
     Some((element_index, k % width))
 }
-
 fn scalarized_array_literal_element_width(
     element: &rumoca_core::Expression,
     array_dims: &HashMap<String, Vec<i64>>,
@@ -4688,11 +4696,9 @@ fn scalarized_array_literal_element_width(
         _ => Some(1),
     }
 }
-
 fn scalar_output_function(function: Option<&rumoca_core::Function>) -> bool {
     matches!(function.and_then(|function| function.outputs.first()), Some(output) if output.dims.is_empty())
 }
-
 fn scalarized_function_arg_formal_rank(
     function: Option<&rumoca_core::Function>,
     arg: &rumoca_core::Expression,
@@ -4715,7 +4721,6 @@ fn scalarized_function_arg_formal_rank(
     *positional_idx += 1;
     rank
 }
-
 fn project_scalarized_function_arg_at(
     arg: &rumoca_core::Expression,
     formal_rank: usize,
@@ -4825,12 +4830,10 @@ fn project_scalarized_function_arg_at(
         span: *span,
     })
 }
-
 fn is_stream_passthrough_intrinsic_dae(name: &str) -> bool {
     rumoca_core::qualified_type_name_matches(name, "actualStream")
         || rumoca_core::qualified_type_name_matches(name, "inStream")
 }
-
 fn scalarized_lhs_zero_based_index_or_singleton(
     name: &rumoca_core::Reference,
     subscripts: &[rumoca_core::Subscript],
@@ -4851,7 +4854,6 @@ fn scalarized_lhs_zero_based_index_or_singleton(
         .collect::<Option<Vec<_>>>()?;
     linear_lane_for_indices(&indices, dims)
 }
-
 fn scalarized_equation_at(
     eq: &dae::Equation,
     scalar_rhs: rumoca_core::Expression,
@@ -4876,7 +4878,6 @@ fn scalarized_equation_at(
         origin,
     ))
 }
-
 fn residual_assignment_parts(
     expr: rumoca_core::Expression,
 ) -> Result<Option<(rumoca_core::Reference, rumoca_core::Expression)>, ToDaeError> {
@@ -4894,7 +4895,6 @@ fn residual_assignment_parts(
     };
     Ok(Some((lhs, *rhs)))
 }
-
 fn assignment_target_reference(
     expr: rumoca_core::Expression,
 ) -> Result<Option<rumoca_core::Reference>, ToDaeError> {
