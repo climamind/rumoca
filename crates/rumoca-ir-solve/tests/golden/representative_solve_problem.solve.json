@@ -1,5 +1,5 @@
 {
-  "schema_version": 17,
+  "schema_version": 18,
   "layout": {
     "bindings": {
       "x": {
@@ -287,6 +287,7 @@
         }
       }
     ],
+    "direct_families": [],
     "projection_indices": [],
     "projection_plan": {
       "blocks": []
