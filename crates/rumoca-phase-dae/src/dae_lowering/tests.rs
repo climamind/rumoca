@@ -2,6 +2,7 @@ use super::*;
 use rumoca_core::Span;
 
 mod initialization_provenance;
+mod colon_slice_dot;
 mod record_array_member;
 mod record_array_projection_alias;
 

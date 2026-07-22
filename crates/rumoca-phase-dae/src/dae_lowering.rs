@@ -34,6 +34,10 @@ struct RecordArgDecomposition {
 
 mod record_field_inference;
 use record_field_inference::{FieldUseMap, infer_record_fields_by_function};
+mod colon_slice_dot;
+use colon_slice_dot::{
+    DotOperand, classify_dot_operand, is_colon_slice, lower_colon_slice_dot_products,
+};
 
 #[derive(Default)]
 struct ArrayParamMap {
@@ -1123,6 +1127,7 @@ pub fn scalarize_phantom_vector_equations(dae: &mut Dae) -> Result<(), ToDaeErro
     let known_names = build_known_var_name_set(dae);
     let phantom_map = build_phantom_expansion_map(dae, &known_names);
     let array_dims = build_array_dims_map(dae);
+    let declared_dims = build_dae_var_dims_map(dae);
     let record_array_projection_aliases = build_record_array_projection_alias_map(dae)?;
     let record_array_fields = build_record_array_field_map(dae);
 
@@ -1160,6 +1165,7 @@ pub fn scalarize_phantom_vector_equations(dae: &mut Dae) -> Result<(), ToDaeErro
         &mut dae.continuous.equations,
         &phantom_map,
         &array_dims,
+        &declared_dims,
         &record_array_fields,
         &dae.symbols.functions,
         false,
@@ -1180,6 +1186,7 @@ pub fn scalarize_phantom_vector_equations(dae: &mut Dae) -> Result<(), ToDaeErro
         &mut dae.initialization.equations,
         &phantom_map,
         &array_dims,
+        &declared_dims,
         &record_array_fields,
         &dae.symbols.functions,
         false,
@@ -1198,6 +1205,7 @@ pub fn scalarize_phantom_vector_equations(dae: &mut Dae) -> Result<(), ToDaeErro
         &mut dae.discrete.real_updates,
         &phantom_map,
         &array_dims,
+        &declared_dims,
         &record_array_fields,
         &dae.symbols.functions,
         true,
@@ -1206,6 +1214,7 @@ pub fn scalarize_phantom_vector_equations(dae: &mut Dae) -> Result<(), ToDaeErro
         &mut dae.discrete.valued_updates,
         &phantom_map,
         &array_dims,
+        &declared_dims,
         &record_array_fields,
         &dae.symbols.functions,
         true,
@@ -1214,6 +1223,7 @@ pub fn scalarize_phantom_vector_equations(dae: &mut Dae) -> Result<(), ToDaeErro
         &mut dae.conditions.equations,
         &phantom_map,
         &array_dims,
+        &declared_dims,
         &record_array_fields,
         &dae.symbols.functions,
         false,
@@ -3677,6 +3687,7 @@ fn scalarize_equation_list(
     equations: &mut Vec<dae::Equation>,
     phantom_map: &HashMap<String, Vec<rumoca_core::Reference>>,
     array_dims: &HashMap<String, Vec<i64>>,
+    declared_dims: &HashMap<String, Vec<i64>>,
     record_array_fields: &RecordArrayFieldMap,
     functions: &IndexMap<rumoca_core::VarName, rumoca_core::Function>,
     recover_discrete_assignments: bool,
@@ -3740,6 +3751,7 @@ fn scalarize_equation_list(
                 eq,
                 phantom_map,
                 array_dims,
+                declared_dims,
                 record_array_fields,
                 functions,
             )?);
@@ -3754,6 +3766,7 @@ fn project_scalarized_residual_rhs(
     eq: dae::Equation,
     phantom_map: &HashMap<String, Vec<rumoca_core::Reference>>,
     array_dims: &HashMap<String, Vec<i64>>,
+    declared_dims: &HashMap<String, Vec<i64>>,
     record_array_fields: &RecordArrayFieldMap,
     functions: &IndexMap<rumoca_core::VarName, rumoca_core::Function>,
 ) -> Result<dae::Equation, ToDaeError> {
@@ -3767,18 +3780,18 @@ fn project_scalarized_residual_rhs(
         span,
     } = &eq.rhs
     else {
-        let rhs = lower_colon_slice_dot_products(&eq.rhs, array_dims)?;
+        let rhs = lower_colon_slice_dot_products(&eq.rhs, declared_dims)?;
         return Ok(dae::Equation { rhs, ..eq });
     };
     let rumoca_core::Expression::VarRef {
         name, subscripts, ..
     } = lhs.as_ref()
     else {
-        let rhs = lower_colon_slice_dot_products(&eq.rhs, array_dims)?;
+        let rhs = lower_colon_slice_dot_products(&eq.rhs, declared_dims)?;
         return Ok(dae::Equation { rhs, ..eq });
     };
     let Some(k) = scalarized_lhs_zero_based_index_or_singleton(name, subscripts, array_dims) else {
-        let rhs = lower_colon_slice_dot_products(&eq.rhs, array_dims)?;
+        let rhs = lower_colon_slice_dot_products(&eq.rhs, declared_dims)?;
         return Ok(dae::Equation { rhs, ..eq });
     };
     let _ = phantom_map;
@@ -3786,8 +3799,8 @@ fn project_scalarized_residual_rhs(
         project_scalarized_rhs_expr_at(lhs, k, array_dims, record_array_fields, functions)?;
     let scalar_rhs =
         project_scalarized_rhs_expr_at(rhs, k, array_dims, record_array_fields, functions)?;
-    let scalar_lhs = lower_colon_slice_dot_products(&scalar_lhs, array_dims)?;
-    let scalar_rhs = lower_colon_slice_dot_products(&scalar_rhs, array_dims)?;
+    let scalar_lhs = lower_colon_slice_dot_products(&scalar_lhs, declared_dims)?;
+    let scalar_rhs = lower_colon_slice_dot_products(&scalar_rhs, declared_dims)?;
     Ok(dae::Equation {
         rhs: rumoca_core::Expression::Binary {
             op: rumoca_core::OpBinary::Sub,
@@ -3813,73 +3826,6 @@ fn project_scalarized_rhs_expr_at(
         functions,
     }
     .project(expr)
-}
-
-fn lower_colon_slice_dot_products(
-    expr: &rumoca_core::Expression,
-    array_dims: &HashMap<String, Vec<i64>>,
-) -> Result<rumoca_core::Expression, ToDaeError> {
-    match expr {
-        rumoca_core::Expression::Index {
-            base,
-            subscripts,
-            span,
-        } => Ok(rumoca_core::Expression::Index {
-            base: Box::new(lower_colon_slice_dot_products(base, array_dims)?),
-            subscripts: subscripts.clone(),
-            span: *span,
-        }),
-        rumoca_core::Expression::Binary { op, lhs, rhs, span } => {
-            lower_colon_slice_binary_expr(op, lhs, rhs, *span, array_dims)
-        }
-        rumoca_core::Expression::Unary { op, rhs, span } => Ok(rumoca_core::Expression::Unary {
-            op: op.clone(),
-            rhs: Box::new(lower_colon_slice_dot_products(rhs, array_dims)?),
-            span: *span,
-        }),
-        rumoca_core::Expression::BuiltinCall {
-            function,
-            args,
-            span,
-        } => Ok(rumoca_core::Expression::BuiltinCall {
-            function: *function,
-            args: args
-                .iter()
-                .map(|arg| lower_colon_slice_dot_products(arg, array_dims))
-                .collect::<Result<Vec<_>, _>>()?,
-            span: *span,
-        }),
-        rumoca_core::Expression::If {
-            branches,
-            else_branch,
-            span,
-        } => Ok(rumoca_core::Expression::If {
-            branches: branches
-                .iter()
-                .map(|(condition, value)| {
-                    Ok((
-                        lower_colon_slice_dot_products(condition, array_dims)?,
-                        lower_colon_slice_dot_products(value, array_dims)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, ToDaeError>>()?,
-            else_branch: Box::new(lower_colon_slice_dot_products(else_branch, array_dims)?),
-            span: *span,
-        }),
-        rumoca_core::Expression::Array {
-            elements,
-            is_matrix,
-            span,
-        } => Ok(rumoca_core::Expression::Array {
-            elements: elements
-                .iter()
-                .map(|element| lower_colon_slice_dot_products(element, array_dims))
-                .collect::<Result<Vec<_>, _>>()?,
-            is_matrix: *is_matrix,
-            span: *span,
-        }),
-        _ => Ok(expr.clone()),
-    }
 }
 
 fn try_project_colon_slice_var_ref(
@@ -3969,6 +3915,31 @@ fn lower_colon_slice_binary_expr(
             rhs: Box::new(lower_colon_slice_dot_products(rhs, array_dims)?),
             span,
         });
+    }
+    if is_colon_slice(lhs) || is_colon_slice(rhs) {
+        let preserve = match (
+            classify_dot_operand(lhs, array_dims)?,
+            classify_dot_operand(rhs, array_dims)?,
+        ) {
+            (DotOperand::Vector(projected_lhs), DotOperand::Vector(projected_rhs)) => {
+                if let Some(dot) =
+                    dot_product_if_matching_vectors(op, &projected_lhs, &projected_rhs, span)
+                {
+                    return Ok(dot);
+                }
+                true
+            }
+            (DotOperand::Unsafe, _) | (_, DotOperand::Unsafe) => true,
+            _ => false,
+        };
+        if preserve {
+            return Ok(rumoca_core::Expression::Binary {
+                op: op.clone(),
+                lhs: Box::new(lower_colon_slice_dot_products(lhs, array_dims)?),
+                rhs: Box::new(lower_colon_slice_dot_products(rhs, array_dims)?),
+                span,
+            });
+        }
     }
     let lhs = lower_colon_slice_dot_operand(op, lhs, array_dims)?;
     let rhs = lower_colon_slice_dot_operand(op, rhs, array_dims)?;
