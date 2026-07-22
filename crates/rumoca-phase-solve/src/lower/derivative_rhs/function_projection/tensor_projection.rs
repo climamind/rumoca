@@ -144,16 +144,12 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 owner_span,
             );
         }
-        let outputs = match self.function_call_outputs_with_projection_scope(
+        let outputs = self.function_call_outputs_with_projection_scope(
             expr,
             depth + 1,
             owner_span,
             Some(scope),
-        ) {
-            Ok(outputs) => outputs,
-            Err(err) if err.is_projection_budget_exceeded() => None,
-            Err(err) => return Err(err),
-        };
+        )?;
         if let Some(outputs) = outputs {
             let span = inherited_projection_source_span(expr.span(), owner_span);
             let ctx = projection_value_ctx(dims, flat_index, scope, depth, span);
@@ -184,11 +180,7 @@ impl<'a> FunctionProjectionAnalysis<'a> {
         if call.span().is_none() {
             call = call.with_span(owner_span);
         }
-        let outputs = match self.function_call_outputs_with_owner(&call, depth + 1, owner_span) {
-            Ok(outputs) => outputs,
-            Err(err) if err.is_projection_budget_exceeded() => return Ok(Some(call)),
-            Err(err) => return Err(err),
-        };
+        let outputs = self.function_call_outputs_with_owner(&call, depth + 1, owner_span)?;
         let Some(outputs) = outputs else {
             if is_direct_declared_array_output_call(expr, self.dae_model) {
                 return Ok(None);
