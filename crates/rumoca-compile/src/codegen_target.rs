@@ -108,6 +108,10 @@ pub enum TensorLayoutCapability {
 pub struct TargetFile {
     pub path: String,
     pub template: String,
+    /// Whether this artifact may render as an empty file. Required artifacts
+    /// remain non-empty by default; targets must opt in per file.
+    #[serde(default)]
+    pub allow_empty: bool,
     /// Optional per-file IR override for mixed-context targets (for example,
     /// FMI resource metadata rendered from DAE alongside Solve runtime code).
     pub ir: Option<TargetTemplateIr>,
@@ -1116,6 +1120,30 @@ render_context = "fmi-model-description"
     }
 
     #[test]
+    fn target_manifest_file_allow_empty_parses_and_defaults_false() {
+        let manifest = super::parse_target_manifest(
+            r#"
+version = 1
+ir = "solve"
+name = "custom"
+
+[[files]]
+path = "required.txt"
+template = "required.txt.jinja"
+
+[[files]]
+path = "optional.txt"
+template = "optional.txt.jinja"
+allow_empty = true
+"#,
+        )
+        .expect("parse target manifest with optional empty output");
+
+        assert!(!manifest.files[0].allow_empty);
+        assert!(manifest.files[1].allow_empty);
+    }
+
+    #[test]
     fn all_builtin_target_manifests_parse() {
         for target in templates::builtin_targets() {
             parse_target_manifest(target.manifest).unwrap_or_else(|err| {
@@ -1462,7 +1490,12 @@ events = false
         );
         let capabilities = manifest.capabilities.as_ref().expect("capabilities");
         let mut dae = Dae::new();
-        dae.events.scheduled_time_events.push(0.1);
+        dae.events
+            .scheduled_time_events
+            .push(rumoca_ir_dae::DaeScheduledTimeEvent {
+                time: 0.1,
+                source_span: None,
+            });
 
         let err = validate_dae_target_capabilities(&dae, &manifest, capabilities)
             .expect_err("events should be rejected");
