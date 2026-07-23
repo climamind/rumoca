@@ -5,6 +5,7 @@
 use super::*;
 use std::collections::BTreeSet;
 mod derivative_row_tests;
+mod direct_scalar_residual_projection;
 mod gpu_preparation;
 mod projection_loop_matching;
 mod projection_plan_more;
@@ -39,6 +40,71 @@ fn scalar_program_block_fixture(
 ) -> rumoca_ir_solve::ScalarProgramBlock {
     rumoca_eval_solve::to_scalar_program_block(block)
         .expect("valid solve-lowering fixture should scalarize")
+}
+
+fn diagonal_linsolve_node(output_indices: Vec<usize>) -> rumoca_ir_solve::ComputeNode {
+    rumoca_ir_solve::ComputeNode::LinSolve {
+        setup_ops: vec![
+            rumoca_ir_solve::LinearOp::Const { dst: 0, value: 2.0 },
+            rumoca_ir_solve::LinearOp::Const { dst: 1, value: 0.0 },
+            rumoca_ir_solve::LinearOp::Const { dst: 2, value: 0.0 },
+            rumoca_ir_solve::LinearOp::Const { dst: 3, value: 4.0 },
+            rumoca_ir_solve::LinearOp::Const { dst: 4, value: 8.0 },
+            rumoca_ir_solve::LinearOp::Const {
+                dst: 5,
+                value: 20.0,
+            },
+        ],
+        matrix_start: 0,
+        rhs_start: 4,
+        n: 2,
+        next_reg: 6,
+        output_indices,
+        metadata: Default::default(),
+        span: solve_test_span(),
+    }
+}
+
+#[test]
+fn implicit_rhs_remaps_explicit_linsolve_outputs_and_preserves_evaluation_slots() {
+    let residual = rumoca_ir_solve::ComputeBlock {
+        nodes: vec![diagonal_linsolve_node(vec![0, 2])],
+    };
+    let remapped = super::implicit_rhs::remap_residual_compute_nodes(
+        &residual,
+        &[Some(1), None, Some(2)],
+        1,
+        solve_test_span(),
+    )
+    .expect("explicit LinSolve residual outputs should remap")
+    .expect("all LinSolve residual outputs are represented in the implicit block");
+    let block = rumoca_ir_solve::ComputeBlock { nodes: remapped };
+
+    assert!(matches!(
+        block.nodes.as_slice(),
+        [rumoca_ir_solve::ComputeNode::LinSolve { output_indices, .. }]
+            if output_indices == &[1, 2]
+    ));
+    assert_eq!(
+        scalar_program_block_fixture(&block).output_indices,
+        vec![1, 2],
+        "scalarization must retain the translated implicit slots"
+    );
+
+    let prepared = rumoca_eval_solve::PreparedComputeBlock::new(&block)
+        .expect("remapped LinSolve should prepare");
+    let mut output = vec![0.0; prepared.len()];
+    prepared
+        .eval_with_context(
+            &[],
+            &[],
+            0.0,
+            rumoca_eval_solve::RowEvalContext::default(),
+            &mut output,
+        )
+        .expect("remapped LinSolve should scatter to translated slots");
+
+    assert_eq!(output, vec![0.0, 4.0, 5.0]);
 }
 
 fn array_var(name: &str, dims: &[i64]) -> dae::Variable {
@@ -594,6 +660,60 @@ fn projection_incidence_uses_store_output_slice() {
     let y_indices = super::collect_algebraic_y_indices_for_row(&row, &projection_set);
 
     assert_eq!(y_indices, BTreeSet::from([12]));
+}
+
+#[test]
+fn projection_plan_row_selection_respects_explicit_target_and_identity_owner() {
+    let row = vec![
+        solve::LinearOp::LoadY { dst: 0, index: 1 },
+        solve::LinearOp::LoadY { dst: 1, index: 2 },
+        solve::LinearOp::Binary {
+            dst: 2,
+            op: solve::BinaryOp::Add,
+            lhs: 0,
+            rhs: 1,
+        },
+        solve::LinearOp::StoreOutput { src: 2 },
+    ];
+    let projection_set = BTreeSet::from([1, 2]);
+    let identity_projection_rows = std::collections::BTreeMap::from([(2, 1)]);
+
+    assert_eq!(
+        super::projection_row_y_indices_for_plan(
+            &row,
+            None,
+            0,
+            true,
+            &projection_set,
+            false,
+            &identity_projection_rows,
+        ),
+        Some(BTreeSet::from([1]))
+    );
+    assert_eq!(
+        super::projection_row_y_indices_for_plan(
+            &row,
+            Some(solve::scalar_slot_y(2)),
+            0,
+            true,
+            &projection_set,
+            false,
+            &identity_projection_rows,
+        ),
+        Some(BTreeSet::from([2]))
+    );
+    assert_eq!(
+        super::projection_row_y_indices_for_plan(
+            &row,
+            None,
+            0,
+            false,
+            &projection_set,
+            false,
+            &identity_projection_rows,
+        ),
+        None
+    );
 }
 
 #[test]
@@ -1226,6 +1346,7 @@ fn solve_appendix_b_validation_rejects_invalid_linsolve_operand_range() {
             rhs_start: 4,
             n: 2,
             next_reg: 5,
+            output_indices: Vec::new(),
             metadata: solve::TensorNodeMetadata::default(),
             span: solve_test_span(),
         }],

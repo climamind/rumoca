@@ -143,6 +143,7 @@ has the same meaning as the default. Incompatible schema changes bump
 
 | Rule | Where | Why |
 |---|---|---|
+| Each proven matrix-product result lane expands to a complete inner-dimension dot sum; unknown or mismatched shapes fail closed | DAE lowering | Preserves exact matrix-product semantics without guessing shape facts |
 | No source temporal operators (`pre`, `edge`, `change`, `sample`, `previous`) survive in f_x, f_z, f_m, f_c, relations, or initialization equations | DAE lowering rewrites them into Appendix B constructs: explicit `__pre__.*` inputs, relation/c variables, scheduled events, clock metadata, and ordinary equations over `v` | MLS Appendix B states the DAE as functions over `v` and `relation(v)`; source temporal operators are not computable DAE/Solve graph nodes |
 | No `der()` on RHS | derivatives flow via `dae.states` + equation structure | Inline `der()` would hide state identity |
 | No `initial()` in f_x/f_z/f_m/f_c | initial phase is handled separately | Avoids mixing initialization into runtime equations |
@@ -188,14 +189,16 @@ Canonical terminology:
 | `TensorProgramNode` | `ComputeNode::{MatMul, LinSolve, AffineStencil, ...}` | A tensor-level kernel with explicit shape/layout metadata and scalar fallback |
 | `ComputeBlock` | `ComputeBlock` | Ordered mix of scalar program blocks and tensor program nodes |
 
-`ScalarProgramBlock` and `ComputeNode::ScalarPrograms` are the public source-code
-names. New Solve-IR APIs must use `ScalarProgram` / `ScalarProgramBlock`
-terminology and must not reintroduce `RowBlock` / `ScalarRows` naming.
+Public APIs use `ScalarProgram`/`ScalarProgramBlock`; `RowBlock`/`ScalarRows`
+must not return.
 
-`ComputeNode::AffineStencil` is source-proven: it comes from preserved DAE
-structured-family domains plus affine operand proofs. It carries the compact
-iteration domain and strides; Solve lowering must not recover stencils by
-scanning unstructured scalar rows after structured-family metadata is discarded.
+GPU initialization requires exact, nonoverlapping, source-spanned Y coverage;
+adjacency may merge, unsupported semantics never fall back, and settlement
+shares one runtime/table context.
+
+`ComputeNode::AffineStencil` is source-proven from preserved DAE family domains
+and affine operand proofs; Solve lowering must not recover stencils from
+unstructured scalar rows.
 
 The root `schema_version` field is mandatory on serialized Solve payloads.
 Deserializers reject unsupported versions and the Solve wire format does not
@@ -280,10 +283,7 @@ rendering (those live in DAE-IR/upstream lowering, `rumoca-exec-*`, or
 
 ## Structural Lowering Scope
 
-Rumoca performs OpenModelica-class structural lowering between DAE and Solve.
-Structural lowering is DAE-to-DAE: it rewrites or annotates mathematical
-structure for downstream lowering without changing IR stage. The supported
-transformations are listed here to keep scope and ownership clear.
+Rumoca performs these DAE-to-DAE transformations before Solve.
 
 **In scope:**
 
