@@ -85,7 +85,7 @@ fn compact_initialization_validation_rejects_negative_target_strides() {
         required_target_ranges: vec![InitializationTargetRange {
             start: 0,
             end: 3,
-            span: None,
+            span: fixture_span(),
         }],
         ..Default::default()
     };
@@ -122,7 +122,7 @@ fn compact_initialization_validation_rejects_direct_fixed_overlap() {
     initialization.fixed_target_ranges = vec![InitializationTargetRange {
         start: 1,
         end: 2,
-        span: Some(fixture_span()),
+        span: fixture_span(),
     }];
 
     let error = validate_initialization_direct_families(&initialization, 3, 3)
@@ -137,18 +137,18 @@ fn compact_initialization_validation_rejects_fixed_fixed_overlap() {
         required_target_ranges: vec![InitializationTargetRange {
             start: 0,
             end: 3,
-            span: None,
+            span: fixture_span(),
         }],
         fixed_target_ranges: vec![
             InitializationTargetRange {
                 start: 0,
                 end: 2,
-                span: None,
+                span: fixture_span(),
             },
             InitializationTargetRange {
                 start: 1,
                 end: 3,
-                span: Some(fixture_span()),
+                span: fixture_span(),
             },
         ],
         ..Default::default()
@@ -166,18 +166,18 @@ fn compact_initialization_validation_merges_adjacent_fixed_ranges() {
         required_target_ranges: vec![InitializationTargetRange {
             start: 0,
             end: 3,
-            span: None,
+            span: fixture_span(),
         }],
         fixed_target_ranges: vec![
             InitializationTargetRange {
                 start: 0,
                 end: 1,
-                span: Some(fixture_span()),
+                span: fixture_span(),
             },
             InitializationTargetRange {
                 start: 1,
                 end: 3,
-                span: Some(fixture_span()),
+                span: fixture_span(),
             },
         ],
         ..Default::default()
@@ -202,8 +202,15 @@ fn complete_compact_initialization() -> InitializationSolveSystem {
         required_target_ranges: vec![InitializationTargetRange {
             start: 0,
             end: 3,
-            span: None,
+            span: fixture_span(),
         }],
+        projection_plan: AlgebraicProjectionPlan {
+            blocks: vec![AlgebraicProjectionBlock {
+                rows: vec![0],
+                y_indices: vec![0],
+                causal_steps: Vec::new(),
+            }],
+        },
         ..Default::default()
     }
 }
@@ -234,7 +241,7 @@ fn compact_initialization_json_rejects_partial_required_union() {
 #[test]
 fn compact_initialization_range_span_survives_json_and_bincode() {
     let mut initialization = complete_compact_initialization();
-    initialization.required_target_ranges[0].span = Some(fixture_span());
+    initialization.required_target_ranges[0].span = fixture_span();
     let problem = SolveProblem {
         layout: make_layout(&[("x", vec![3])], &[]),
         initialization,
@@ -245,14 +252,14 @@ fn compact_initialization_range_span_survives_json_and_bincode() {
         serde_json::from_str(&json).expect("deserialize compact Solve JSON");
     assert_eq!(
         from_json.initialization.required_target_ranges[0].span,
-        Some(fixture_span())
+        fixture_span()
     );
     let bytes = bincode::serialize(&problem).expect("serialize compact Solve bincode");
     let from_bincode: SolveProblem =
         bincode::deserialize(&bytes).expect("deserialize compact Solve bincode");
     assert_eq!(
         from_bincode.initialization.required_target_ranges[0].span,
-        Some(fixture_span())
+        fixture_span()
     );
     assert_eq!(
         from_bincode.initialization.direct_families[0].span,
@@ -261,11 +268,92 @@ fn compact_initialization_range_span_survives_json_and_bincode() {
 }
 
 #[test]
+fn compact_initialization_json_rejects_missing_and_dummy_range_spans() {
+    let mut initialization = complete_compact_initialization();
+    initialization.required_target_ranges[0].span = fixture_span();
+    let problem = SolveProblem {
+        layout: make_layout(&[("x", vec![3])], &[]),
+        initialization,
+        ..Default::default()
+    };
+    let mut missing = serde_json::to_value(&problem).expect("serialize compact Solve artifact");
+    missing["initialization"]["required_target_ranges"][0]
+        .as_object_mut()
+        .expect("target range object")
+        .remove("span");
+    let missing_error = serde_json::from_value::<SolveProblem>(missing)
+        .expect_err("compact target range span is a mandatory wire field");
+    assert!(
+        missing_error.to_string().contains("span"),
+        "{missing_error}"
+    );
+
+    let mut dummy = serde_json::to_value(problem).expect("serialize compact Solve artifact");
+    dummy["initialization"]["required_target_ranges"][0]["span"] =
+        serde_json::to_value(Span::DUMMY).expect("serialize dummy span");
+    let dummy_error = serde_json::from_value::<SolveProblem>(dummy)
+        .expect_err("dummy compact target range spans must fail admission");
+    assert!(dummy_error.to_string().contains("span"), "{dummy_error}");
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_missing_and_dummy_range_spans() {
+    #[derive(Serialize)]
+    struct SourceLessRange {
+        start: usize,
+        end: usize,
+    }
+    let source_less = bincode::serialize(&SourceLessRange { start: 0, end: 3 })
+        .expect("serialize source-less range");
+    let missing_error = bincode::deserialize::<InitializationTargetRange>(&source_less)
+        .expect_err("range bincode without a span must fail decoding");
+    assert!(!missing_error.to_string().is_empty());
+
+    let mut initialization = complete_compact_initialization();
+    initialization.required_target_ranges[0].span = Span::DUMMY;
+    let problem = SolveProblem {
+        layout: make_layout(&[("x", vec![3])], &[]),
+        initialization,
+        ..Default::default()
+    };
+    let bytes = bincode::serialize(&problem).expect("serialize invalid compact Solve bincode");
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("dummy compact target range spans must fail bincode admission");
+    assert!(error.to_string().contains("span"), "{error}");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_nonunit_residual_signs() {
+    for residual_sign in [0, -2] {
+        let mut initialization = complete_compact_initialization();
+        initialization.required_target_ranges[0].span = fixture_span();
+        initialization.direct_families[0].residual_sign = residual_sign;
+        let problem = SolveProblem {
+            layout: make_layout(&[("x", vec![3])], &[]),
+            initialization,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&problem).expect("serialize invalid compact Solve JSON");
+        let json_error = serde_json::from_str::<SolveProblem>(&json)
+            .expect_err("non-unit direct residual sign must fail JSON admission");
+        assert!(json_error.to_string().contains("sign"), "{json_error}");
+
+        let bytes = bincode::serialize(&problem).expect("serialize invalid compact Solve bincode");
+        let bincode_error = bincode::deserialize::<SolveProblem>(&bytes)
+            .expect_err("non-unit direct residual sign must fail bincode admission");
+        assert!(
+            bincode_error.to_string().contains("sign"),
+            "{bincode_error}"
+        );
+    }
+}
+
+#[test]
 fn invalid_initialization_range_reports_span_after_json_and_bincode() {
     let range = InitializationTargetRange {
         start: 2,
         end: 2,
-        span: Some(fixture_span()),
+        span: fixture_span(),
     };
     let json = serde_json::to_string(&range).expect("serialize invalid range JSON");
     let from_json: InitializationTargetRange =

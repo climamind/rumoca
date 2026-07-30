@@ -1081,6 +1081,69 @@ pub(super) fn lower_residual_rows_and_targets_from_equations_with_mode<'a>(
     Ok((rows, targets))
 }
 
+/// Lower initial residual cells with one shared lowering context and hand each
+/// row to the caller before advancing. This is the compact structured proof
+/// path: it never retains a family-sized equation or row vector.
+pub(super) fn visit_initial_residual_cells<'a>(
+    dae_model: &dae::Dae,
+    layout: &VarLayout,
+    equations: impl IntoIterator<Item = (usize, &'a dae::Equation)>,
+    mut visit: impl FnMut(&dae::Equation, &[LinearOp]) -> Result<(), LowerError>,
+) -> Result<(), LowerError> {
+    let structural_bindings = compile_time::structural_bindings(dae_model)?;
+    let indexed_bindings = Arc::new(build_indexed_binding_map(layout));
+    let state_names = dae_model
+        .variables
+        .states
+        .keys()
+        .map(|name| name.as_str().to_string())
+        .collect::<std::collections::HashSet<_>>();
+    let direct_assignments = derivative_rhs::collect_missing_indexed_record_field_assignments(
+        dae_model,
+        &state_names,
+        layout,
+        &structural_bindings,
+    )?;
+    let structural_bindings = Arc::new(structural_bindings);
+    let direct_assignments = Arc::new(direct_assignments);
+    for (row_idx, equation) in equations {
+        if equation.scalar_count == 0 {
+            continue;
+        }
+        let context = RowLoweringContext {
+            layout,
+            functions: &dae_model.symbols.functions,
+            clock_intervals: Some(&dae_model.clocks.intervals),
+            clock_timings: Some(&dae_model.clocks.timings),
+            triggered_clock_conditions: Some(&dae_model.clocks.triggered_conditions),
+            discrete_valued_names: Some(&dae_model.variables.discrete_valued),
+            variable_starts: Some(&dae_model.metadata.variable_starts),
+            dae_variables: Some(&dae_model.variables),
+            structural_bindings: Some(Arc::clone(&structural_bindings)),
+            direct_assignments: Some(Arc::clone(&direct_assignments)),
+            indexed_bindings: Arc::clone(&indexed_bindings),
+            is_initial_mode: true,
+            guard_target_start_before_first_clock_tick: false,
+        };
+        let rows = if let Some(rows) =
+            lower_scalarized_record_residual_rows(equation, row_idx, 0, &context)?
+        {
+            rows
+        } else {
+            lower_equation_residual_rows(equation, row_idx, 0, &context)?
+        };
+        validate_equation_row_count(equation, rows.len(), &context)?;
+        if rows.len() != 1 {
+            return Err(LowerError::contract_violation(
+                "structured initial proof cell must lower to exactly one residual row",
+                equation.span,
+            ));
+        }
+        visit(equation, &rows[0])?;
+    }
+    Ok(())
+}
+
 fn lower_residual_rows_from_equations_core<'a>(
     dae_model: &dae::Dae,
     layout: &VarLayout,

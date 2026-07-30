@@ -273,20 +273,20 @@ fn map_domain_counts(
             if binder.step == 0 {
                 return Err(affine_map_error("structured map binder step is zero", span));
             }
-            let distance = if binder.step > 0 {
-                binder.upper.checked_sub(binder.lower)
+            let count = if binder.step > 0 {
+                if binder.lower > binder.upper {
+                    return Ok(0);
+                }
+                let distance = (binder.upper as i128 - binder.lower as i128) as u128;
+                distance / binder.step as u128 + 1
             } else {
-                binder.lower.checked_sub(binder.upper)
-            }
-            .ok_or_else(|| {
-                affine_map_error("structured map binder bounds contradict step", span)
-            })?;
-            let step = i64::try_from(binder.step.unsigned_abs())
-                .map_err(|_| affine_map_error("structured map binder step overflows i64", span))?;
-            let count = distance
-                .checked_div(step)
-                .and_then(|count| count.checked_add(1))
-                .ok_or_else(|| affine_map_error("structured map binder count overflows", span))?;
+                if binder.lower < binder.upper {
+                    return Ok(0);
+                }
+                let distance = (binder.lower as i128 - binder.upper as i128) as u128;
+                let step = -(binder.step as i128) as u128;
+                distance / step + 1
+            };
             usize::try_from(count).map_err(|_| {
                 affine_map_error("structured map binder count exceeds host range", span)
             })
@@ -312,5 +312,56 @@ pub(super) fn affine_map_error(
     EvalSolveError::InvalidRow {
         message: message.into(),
         span: Some(span),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_map_evaluation_accepts_empty_structured_domain_as_zero_rows() {
+        let span = rumoca_core::Span::from_offsets(
+            rumoca_core::SourceId::from_source_name("empty_native_map.mo"),
+            1,
+            2,
+        );
+        let domain = rumoca_core::StructuredIndexDomain {
+            binders: vec![rumoca_core::StructuredIndexBinder {
+                id: 0,
+                display_name: "i".to_string(),
+                lower: 3,
+                upper: 1,
+                step: 1,
+            }],
+        };
+        let node = ComputeNode::Map {
+            output_map: rumoca_ir_solve::TensorOutputMap::dense_contiguous(0, &domain)
+                .expect("empty output map"),
+            domain,
+            base_ops: vec![
+                LinearOp::Const { dst: 0, value: 1.0 },
+                LinearOp::StoreOutput { src: 0 },
+            ],
+            load_strides: Vec::new(),
+            const_strides: Vec::new(),
+            metadata: rumoca_ir_solve::TensorNodeMetadata::default(),
+            span,
+        };
+        let mut visits = 0usize;
+        let metrics = eval_map_elements_with_context(
+            &node,
+            &mut [],
+            &[],
+            0.0,
+            RowEvalContext::default(),
+            |_, _, _| {
+                visits += 1;
+                Ok(())
+            },
+        )
+        .expect("canonical empty domain evaluates successfully");
+        assert_eq!(visits, 0);
+        assert_eq!(metrics, MapEvaluationMetrics::default());
     }
 }

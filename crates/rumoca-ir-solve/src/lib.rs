@@ -1299,7 +1299,11 @@ impl SolveProblem {
             "initialization.projection_plan",
             &self.initialization.projection_plan,
             initialization_rows,
-            self.solve_layout.solver_scalar_count(),
+            if self.initialization.direct_families.is_empty() {
+                self.solve_layout.solver_scalar_count()
+            } else {
+                self.layout.y_scalars()
+            },
         )?;
         self.discrete
             .runtime_assignment_rhs
@@ -1706,6 +1710,9 @@ pub struct InitializationSolveSystem {
     #[serde(default)]
     pub fixed_target_ranges: Vec<InitializationTargetRange>,
     pub projection_indices: Vec<usize>,
+    /// Initialization projection contract. Compact direct artifacts encode one
+    /// direct-family index per block in `rows` and its target-range anchor in
+    /// `y_indices`; scalar initialization keeps the ordinary scalar-row form.
     #[serde(default)]
     pub projection_plan: AlgebraicProjectionPlan,
     #[serde(default)]
@@ -1966,7 +1973,6 @@ pub struct SolveModel {
     pub visible_value_rows: ScalarProgramBlock,
     pub variable_meta: Vec<SolveVariableMeta>,
 }
-
 impl SolveModel {
     pub fn state_scalar_count(&self) -> usize {
         self.problem.solve_layout.state_scalar_count()
