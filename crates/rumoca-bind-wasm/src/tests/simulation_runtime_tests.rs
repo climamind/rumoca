@@ -315,6 +315,45 @@ fn test_prepare_gpu_simulation_settles_wave_initial_equations() {
 
 #[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
 #[test]
+fn test_prepare_gpu_simulation_executes_structured_initial_projection_plan() {
+    let _guard = session_test_guard();
+    clear_source_root_cache().expect("clear source-root cache");
+    let source = r#"
+    model GpuProjectedInitial
+      Real a[2];
+      Real b[2];
+    initial equation
+      for i in 1:2 loop
+        a[i] = b[i] + 1.0;
+      end for;
+      for i in 1:2 loop
+        b[i] = i;
+      end for;
+    equation
+      for i in 1:2 loop
+        der(a[i]) = 0.0;
+        der(b[i]) = 0.0;
+      end for;
+    end GpuProjectedInitial;
+    "#;
+
+    let json = prepare_gpu_simulation(source, "GpuProjectedInitial")
+        .expect("GPU preparation must execute the structured initialization projection plan");
+    let payload: serde_json::Value = serde_json::from_str(&json).expect("valid GPU payload");
+    let names = payload["state_names"].as_array().expect("state names");
+    let y0 = payload["y0"].as_array().expect("settled y0");
+    for (name, expected) in [("a[1]", 2.0), ("a[2]", 3.0), ("b[1]", 1.0), ("b[2]", 2.0)] {
+        let index = names
+            .iter()
+            .position(|candidate| candidate.as_str() == Some(name))
+            .expect("projected state must be present");
+        assert_eq!(y0[index].as_f64(), Some(expected));
+    }
+    clear_source_root_cache().expect("clear source-root cache");
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+#[test]
 fn test_prepare_gpu_simulation_lowers_and_settles_descending_initial_binder() {
     let _guard = session_test_guard();
     clear_source_root_cache().expect("clear source-root cache");

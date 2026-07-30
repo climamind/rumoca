@@ -239,12 +239,12 @@ compiler/session → DAE structural → solve-IR lowering → runtime contracts 
 
 | Rule | Owner | Why |
 |---|---|---|
-| Compilation/session orchestration | `rumoca-compile` | Pipeline coordination only; no runtime |
+| Compilation/session orchestration | `rumoca-compile` | Coordinates pipeline; no runtime |
 | DAE structural analysis (Pantelides, BLT, tearing, demotion) | `rumoca-phase-structural` | SPEC_0007 §Structural Transformation Scope |
 | Solver-facing prepared data + row ops | `rumoca-ir-solve` | Backend-neutral execution IR |
-| DAE → solve-IR lowering | `rumoca-phase-solve` | Lowering only, not structural mutation |
-| Compact Map evaluation | `rumoca-eval-solve` | Backend-neutral; no scalar reconstruction |
-| GPU initialization settlement | `rumoca-sim` | Orchestration; no solver dependency |
+| DAE → solve-IR lowering | `rumoca-phase-solve` | Proves compact GPU order; no structural mutation |
+| Compact Map evaluation | `rumoca-eval-solve` | No scalar reconstruction |
+| GPU initialization settlement | `rumoca-sim` | Compact GPU projection/verification; solver-free |
 | Optimization/training orchestration | `rumoca-opt` | Consumes Solve/eval APIs; no Modelica semantics |
 | Textual generated artifacts and templates | `rumoca-phase-codegen` | Jinja/minijinja rendering owns generated C, Rust, CUDA C, MLIR, FMI/eFMI and FMU/eFMU packaging text |
 | GALEC `.alg` text (recorded exception) | `rumoca-ir-galec` | Typed AST printing per eFMI conformance; routed via template context (SPEC_0034 GAL-009) |

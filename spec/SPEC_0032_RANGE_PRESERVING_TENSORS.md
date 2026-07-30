@@ -83,13 +83,18 @@ partition. Fixed-start array coverage is derived from the resolved contiguous
 layout base and shape without scalar row-target materialization. Descending
 source binders are normalized to an ascending execution domain by selecting the
 corresponding source base and corners; target maps therefore remain canonical
-positive-stride maps without changing source-index semantics.
+positive-stride maps without changing source-index semantics. Empty domains
+produce no direct node, singleton dimensions require no corner, and only
+dimensions with at least two values contribute a stride proof.
 Corner-derived load, constant, and target strides are admissible only after
 Solve lowering proves the reconstructed program against every materialized
-family cell. A family whose interiors are unavailable, whose values are not
-affine, or whose initializer contains random/impure operations fails closed at
-the first source row that breaks the proof; executing a self-consistent but
-unproven affine reconstruction is forbidden.
+family cell. That proof reuses one lowering context and releases each scalar
+proof row before visiting the next; family-sized tuple/equation/row ownership is
+forbidden. Direct-family `LoadY` dependencies form a compact causal projection
+order in the existing initialization projection envelope. Cycles, unavailable
+interiors, non-affine values, and random/impure operations fail closed at the
+first owning source span; executing a self-consistent but unproven
+reconstruction is forbidden.
 
 ### 5. Ownership Boundaries
 

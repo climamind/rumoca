@@ -81,7 +81,8 @@ pub fn settle_gpu_initial_conditions(
     };
     let mut worst = (0usize, 0.0f64, None);
     let mut native_metrics = rumoca_eval_solve::MapEvaluationMetrics::default();
-    for family in &initialization.direct_families {
+    for block in &initialization.projection_plan.blocks {
+        let family = compact_projection_family(initialization, block)?;
         execute_direct_family(
             family,
             DirectFamilyExecution {
@@ -140,17 +141,8 @@ fn validate_assignment_shape(
 ) -> Result<(), GpuInitializationError> {
     let required = normalize_target_ranges(&initialization.required_target_ranges, y_len)?;
     let fixed = normalize_target_ranges(&initialization.fixed_target_ranges, y_len)?;
-    let expected = if y_len == 0 {
-        Vec::new()
-    } else {
-        vec![solve::InitializationTargetRange {
-            start: 0,
-            end: y_len,
-            span: required.first().and_then(|range| range.span),
-        }]
-    };
     if initialization.residual.is_empty() {
-        return validate_empty_assignment_shape(initialization, &required, &fixed, &expected);
+        return validate_empty_assignment_shape(initialization, &required, &fixed, y_len);
     }
     if initialization.direct_families.is_empty() {
         return Err(GpuInitializationError::Unsupported {
@@ -169,25 +161,93 @@ fn validate_assignment_shape(
     }
     let mut actual_ranges = fixed;
     actual_ranges.extend(validate_direct_node_ownership(initialization)?);
+    validate_compact_projection_plan(initialization)?;
     let actual = normalize_target_ranges(&actual_ranges, y_len)?;
-    if !same_target_coverage(&required, &expected) || !same_target_coverage(&actual, &required) {
+    if !covers_complete_target_range(&required, y_len) || !same_target_coverage(&actual, &required)
+    {
         return Err(GpuInitializationError::Malformed {
             message: "incomplete direct plus fixed-start target union".to_string(),
             row: 0,
             span: actual
                 .first()
-                .and_then(|range| range.span)
-                .or_else(|| required.first().and_then(|range| range.span)),
+                .map(|range| range.span)
+                .or_else(|| required.first().map(|range| range.span)),
         });
     }
     Ok(())
+}
+
+fn validate_compact_projection_plan(
+    initialization: &solve::InitializationSolveSystem,
+) -> Result<(), GpuInitializationError> {
+    if !initialization.projection_indices.is_empty()
+        || initialization.projection_plan.blocks.len() != initialization.direct_families.len()
+    {
+        return Err(GpuInitializationError::Malformed {
+            message: "compact projection must own every direct family without scalar indices"
+                .to_string(),
+            row: 0,
+            span: initialization
+                .direct_families
+                .first()
+                .map(|family| family.span),
+        });
+    }
+    let mut seen = vec![false; initialization.direct_families.len()];
+    for block in &initialization.projection_plan.blocks {
+        let family = compact_projection_family(initialization, block)?;
+        let family_index = block.rows[0];
+        if std::mem::replace(&mut seen[family_index], true) {
+            return Err(GpuInitializationError::Malformed {
+                message: "compact projection owns one direct family more than once".to_string(),
+                row: family_index,
+                span: Some(family.span),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn compact_projection_family<'a>(
+    initialization: &'a solve::InitializationSolveSystem,
+    block: &solve::AlgebraicProjectionBlock,
+) -> Result<&'a solve::InitializationDirectFamily, GpuInitializationError> {
+    let [family_index] = block.rows.as_slice() else {
+        return Err(GpuInitializationError::Malformed {
+            message: "compact projection block must name exactly one direct family".to_string(),
+            row: 0,
+            span: initialization
+                .direct_families
+                .first()
+                .map(|family| family.span),
+        });
+    };
+    let family = initialization
+        .direct_families
+        .get(*family_index)
+        .ok_or_else(|| GpuInitializationError::Malformed {
+            message: "compact projection direct family index is out of bounds".to_string(),
+            row: *family_index,
+            span: initialization
+                .direct_families
+                .first()
+                .map(|family| family.span),
+        })?;
+    if block.y_indices.as_slice() != [family.targets.start] || !block.causal_steps.is_empty() {
+        return Err(GpuInitializationError::Malformed {
+            message: "compact projection block has an invalid target anchor".to_string(),
+            row: *family_index,
+            span: Some(family.span),
+        });
+    }
+    Ok(family)
 }
 
 fn validate_empty_assignment_shape(
     initialization: &solve::InitializationSolveSystem,
     required: &[solve::InitializationTargetRange],
     fixed: &[solve::InitializationTargetRange],
-    expected: &[solve::InitializationTargetRange],
+    y_len: usize,
 ) -> Result<(), GpuInitializationError> {
     if !initialization.direct_families.is_empty() || !initialization.row_targets.is_empty() {
         return Err(GpuInitializationError::Malformed {
@@ -202,17 +262,25 @@ fn validate_empty_assignment_shape(
     if required.is_empty() && fixed.is_empty() {
         return Ok(());
     }
-    if !same_target_coverage(required, expected) || !same_target_coverage(fixed, required) {
+    if !covers_complete_target_range(required, y_len) || !same_target_coverage(fixed, required) {
         return Err(GpuInitializationError::Malformed {
             message: "incomplete fixed-start target union".to_string(),
             row: 0,
             span: fixed
                 .first()
-                .and_then(|range| range.span)
-                .or_else(|| required.first().and_then(|range| range.span)),
+                .map(|range| range.span)
+                .or_else(|| required.first().map(|range| range.span)),
         });
     }
     Ok(())
+}
+
+fn covers_complete_target_range(ranges: &[solve::InitializationTargetRange], y_len: usize) -> bool {
+    match (y_len, ranges) {
+        (0, []) => true,
+        (_, [range]) => range.start == 0 && range.end == y_len,
+        _ => false,
+    }
 }
 
 fn validate_direct_node_ownership(
@@ -289,7 +357,7 @@ fn validate_direct_node_ownership(
         ranges.push(solve::InitializationTargetRange {
             start: family.targets.start,
             end,
-            span: Some(family.span),
+            span: family.span,
         });
     }
     if let Some(node_index) = node_owners.iter().position(Option::is_none) {
@@ -321,11 +389,18 @@ fn normalize_target_ranges(
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
     let mut normalized: Vec<solve::InitializationTargetRange> = Vec::with_capacity(ranges.len());
     for range in ranges {
+        if range.span.is_dummy() {
+            return Err(GpuInitializationError::Malformed {
+                message: "initial target range requires a non-dummy source span".to_string(),
+                row: 0,
+                span: None,
+            });
+        }
         if range.start >= range.end || range.end > upper_bound {
             return Err(GpuInitializationError::Malformed {
                 message: "initial target range is empty or out of bounds".to_string(),
                 row: 0,
-                span: range.span,
+                span: Some(range.span),
             });
         }
         if let Some(last) = normalized.last_mut() {
@@ -333,7 +408,7 @@ fn normalize_target_ranges(
                 return Err(GpuInitializationError::Malformed {
                     message: "initial target ranges overlap".to_string(),
                     row: 0,
-                    span: range.span.or(last.span),
+                    span: Some(range.span),
                 });
             }
             if range.start == last.end {
@@ -616,8 +691,15 @@ mod tests {
             required_target_ranges: vec![solve::InitializationTargetRange {
                 start: 0,
                 end: 2,
-                span: Some(span),
+                span,
             }],
+            projection_plan: solve::AlgebraicProjectionPlan {
+                blocks: vec![solve::AlgebraicProjectionBlock {
+                    rows: vec![0],
+                    y_indices: vec![0],
+                    causal_steps: Vec::new(),
+                }],
+            },
             ..Default::default()
         };
         solve::SolveModel {
@@ -630,6 +712,99 @@ mod tests {
         }
     }
 
+    fn singleton_domain(active_upper: i64) -> rumoca_core::StructuredIndexDomain {
+        rumoca_core::StructuredIndexDomain {
+            binders: vec![
+                rumoca_core::StructuredIndexBinder {
+                    id: 0,
+                    display_name: "i".to_string(),
+                    lower: 1,
+                    upper: 1,
+                    step: 1,
+                },
+                rumoca_core::StructuredIndexBinder {
+                    id: 1,
+                    display_name: "j".to_string(),
+                    lower: 1,
+                    upper: active_upper,
+                    step: 1,
+                },
+            ],
+        }
+    }
+
+    fn compact_projection_reverse_dependency_nodes(
+        domain: &rumoca_core::StructuredIndexDomain,
+        span: rumoca_core::Span,
+    ) -> [ComputeNode; 2] {
+        let dependent = ComputeNode::Map {
+            domain: domain.clone(),
+            output_map: TensorOutputMap::dense_contiguous(0, domain).unwrap(),
+            base_ops: vec![
+                LinearOp::LoadY { dst: 0, index: 0 },
+                LinearOp::LoadY { dst: 1, index: 2 },
+                LinearOp::Binary {
+                    dst: 2,
+                    op: BinaryOp::Sub,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                LinearOp::StoreOutput { src: 2 },
+            ],
+            load_strides: vec![
+                rumoca_ir_solve::AffineStencilLoadStride {
+                    op_position: 0,
+                    terms: vec![AffineStencilIndexStrideTerm {
+                        dimension: 0,
+                        stride: 1,
+                    }],
+                },
+                rumoca_ir_solve::AffineStencilLoadStride {
+                    op_position: 1,
+                    terms: vec![AffineStencilIndexStrideTerm {
+                        dimension: 0,
+                        stride: 1,
+                    }],
+                },
+            ],
+            const_strides: Vec::new(),
+            metadata: TensorNodeMetadata::default(),
+            span,
+        };
+        let source = ComputeNode::Map {
+            domain: domain.clone(),
+            output_map: TensorOutputMap::dense_contiguous(2, domain).unwrap(),
+            base_ops: vec![
+                LinearOp::LoadY { dst: 0, index: 2 },
+                LinearOp::Const { dst: 1, value: 1.0 },
+                LinearOp::Binary {
+                    dst: 2,
+                    op: BinaryOp::Sub,
+                    lhs: 0,
+                    rhs: 1,
+                },
+                LinearOp::StoreOutput { src: 2 },
+            ],
+            load_strides: vec![rumoca_ir_solve::AffineStencilLoadStride {
+                op_position: 0,
+                terms: vec![AffineStencilIndexStrideTerm {
+                    dimension: 0,
+                    stride: 1,
+                }],
+            }],
+            const_strides: vec![rumoca_ir_solve::AffineStencilConstStride {
+                op_position: 1,
+                terms: vec![rumoca_ir_solve::AffineStencilConstStrideTerm {
+                    dimension: 0,
+                    stride: 1.0,
+                }],
+            }],
+            metadata: TensorNodeMetadata::default(),
+            span,
+        };
+        [dependent, source]
+    }
+
     #[test]
     fn direct_initial_assignment_is_one_pass_with_linear_temporary_storage() {
         let result = settle_gpu_initial_conditions(&direct_model(), 0.0)
@@ -638,6 +813,113 @@ mod tests {
         assert_eq!(result.metrics.residual_evaluations, 2);
         assert_eq!(result.metrics.passes, 1);
         assert!(result.metrics.temporary_values <= result.y0.len() * 3);
+    }
+
+    #[test]
+    fn settlement_replays_mixed_singleton_domain_without_scalar_rows() {
+        let mut model = direct_model();
+        let domain = singleton_domain(2);
+        let solve::ComputeNode::Map {
+            domain: residual_domain,
+            output_map,
+            load_strides,
+            const_strides,
+            ..
+        } = &mut model.problem.initialization.residual.nodes[0]
+        else {
+            unreachable!()
+        };
+        *residual_domain = domain.clone();
+        *output_map = TensorOutputMap::dense_contiguous(0, &domain).unwrap();
+        load_strides[0].terms[0].dimension = 1;
+        const_strides[0].terms[0].dimension = 1;
+        model.problem.initialization.direct_families[0].targets =
+            TensorOutputMap::dense_contiguous(0, &domain).unwrap();
+
+        let result = settle_gpu_initial_conditions(&model, 0.0)
+            .expect("mixed-singleton direct family must replay natively");
+        assert_eq!(result.y0, vec![2.0, 0.0]);
+    }
+
+    #[test]
+    fn settlement_replays_all_singleton_domain_with_empty_strides() {
+        let mut model = direct_model();
+        let domain = singleton_domain(1);
+        let solve::ComputeNode::Map {
+            domain: residual_domain,
+            output_map,
+            base_ops,
+            load_strides,
+            const_strides,
+            ..
+        } = &mut model.problem.initialization.residual.nodes[0]
+        else {
+            unreachable!()
+        };
+        *residual_domain = domain.clone();
+        *output_map = TensorOutputMap::dense_contiguous(0, &domain).unwrap();
+        let LinearOp::Const { value, .. } = &mut base_ops[1] else {
+            unreachable!()
+        };
+        *value = 7.0;
+        load_strides.clear();
+        const_strides.clear();
+        model.problem.initialization.direct_families[0].targets =
+            TensorOutputMap::dense_contiguous(0, &domain).unwrap();
+        model.problem.initialization.required_target_ranges[0].end = 1;
+        model.initial_y.truncate(1);
+
+        let result = settle_gpu_initial_conditions(&model, 0.0)
+            .expect("all-singleton direct family must replay natively");
+        assert_eq!(result.y0, vec![7.0]);
+    }
+
+    #[test]
+    fn settlement_executes_compact_projection_order_before_final_verification() {
+        let mut model = direct_model();
+        let span = span();
+        let domain = match &model.problem.initialization.residual.nodes[0] {
+            ComputeNode::Map { domain, .. } => domain.clone(),
+            _ => unreachable!(),
+        };
+        model.problem.initialization.residual.nodes =
+            compact_projection_reverse_dependency_nodes(&domain, span).into();
+        model.problem.initialization.direct_families = vec![
+            solve::InitializationDirectFamily {
+                node_index: 0,
+                targets: TensorOutputMap::dense_contiguous(0, &domain).unwrap(),
+                residual_sign: 1,
+                span,
+            },
+            solve::InitializationDirectFamily {
+                node_index: 1,
+                targets: TensorOutputMap::dense_contiguous(2, &domain).unwrap(),
+                residual_sign: 1,
+                span,
+            },
+        ];
+        model.problem.initialization.required_target_ranges[0].end = 4;
+        model.problem.initialization.projection_plan = solve::AlgebraicProjectionPlan {
+            blocks: vec![
+                solve::AlgebraicProjectionBlock {
+                    rows: vec![1],
+                    y_indices: vec![2],
+                    causal_steps: Vec::new(),
+                },
+                solve::AlgebraicProjectionBlock {
+                    rows: vec![0],
+                    y_indices: vec![0],
+                    causal_steps: Vec::new(),
+                },
+            ],
+        };
+        model.initial_y.resize(4, 0.0);
+
+        let result = settle_gpu_initial_conditions(&model, 0.0)
+            .expect("compact projection order should settle reverse source dependencies");
+        assert_eq!(result.y0, vec![1.0, 2.0, 1.0, 2.0]);
+        assert_eq!(result.metrics.residual_evaluations, 2);
+        assert_eq!(result.metrics.passes, 1);
     }
 
     #[test]
@@ -734,12 +1016,12 @@ mod tests {
             vec![solve::InitializationTargetRange {
                 start: 0,
                 end: 2,
-                span: Some(span),
+                span,
             }];
         model.problem.initialization.fixed_target_ranges = vec![solve::InitializationTargetRange {
             start: 0,
             end: 1,
-            span: Some(span),
+            span,
         }];
 
         let error = settle_gpu_initial_conditions(&model, 0.0)
@@ -793,7 +1075,7 @@ mod tests {
         model.problem.initialization.fixed_target_ranges = vec![solve::InitializationTargetRange {
             start: 1,
             end: 2,
-            span: Some(span),
+            span,
         }];
 
         let error = settle_gpu_initial_conditions(&model, 0.0)
@@ -820,18 +1102,18 @@ mod tests {
             vec![solve::InitializationTargetRange {
                 start: 0,
                 end: 2,
-                span: Some(span),
+                span,
             }];
         model.problem.initialization.fixed_target_ranges = vec![
             solve::InitializationTargetRange {
                 start: 0,
                 end: 1,
-                span: Some(span),
+                span,
             },
             solve::InitializationTargetRange {
                 start: 1,
                 end: 2,
-                span: Some(span),
+                span,
             },
         ];
 
@@ -851,7 +1133,7 @@ mod tests {
         let range = solve::InitializationTargetRange {
             start: 0,
             end: 3,
-            span: Some(span),
+            span,
         };
         let json = serde_json::to_string(&range).expect("serialize invalid range JSON");
         let from_json: solve::InitializationTargetRange =

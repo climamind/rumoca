@@ -191,9 +191,10 @@ Canonical terminology:
 Public APIs use `ScalarProgram`/`ScalarProgramBlock`; `RowBlock`/`ScalarRows`
 must not return.
 
-GPU initialization requires exact, nonoverlapping, source-spanned Y coverage;
-adjacency may merge, unsupported semantics never fall back, and settlement
-shares one runtime/table context.
+GPU initialization requires exact Y coverage, non-dummy spans, and unit
+residual signs. Compact projection blocks own one direct family and target
+anchor; scalar rows/indices remain absent. Settlement shares one context and
+never falls back.
 
 `ComputeNode::AffineStencil` is source-proven from preserved DAE family domains
 and affine operand proofs; Solve lowering must not recover stencils from

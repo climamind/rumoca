@@ -4,8 +4,8 @@ use super::*;
 pub struct InitializationTargetRange {
     pub start: usize,
     pub end: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub span: Option<Span>,
+    /// Mandatory owning source span; dummy/source-free ranges fail admission.
+    pub span: Span,
 }
 
 /// Count stored initialization rows without expanding tensor output maps.
@@ -105,32 +105,32 @@ pub(super) fn validate_initialization_direct_families(
             });
         }
     }
+    validate_compact_direct_projection_plan(initialization)?;
     let direct_ranges = target_ranges
         .into_iter()
         .map(|(range, _, span)| InitializationTargetRange {
             start: range.start,
             end: range.end,
-            span: Some(span),
+            span,
         })
         .collect::<Vec<_>>();
+    validate_compact_target_coverage(initialization, y_upper_bound, direct_ranges)
+}
+
+fn validate_compact_target_coverage(
+    initialization: &InitializationSolveSystem,
+    y_upper_bound: usize,
+    direct_ranges: Vec<InitializationTargetRange>,
+) -> Result<(), SolveProblemShapeContractError> {
     let required = normalized_ranges(
         &initialization.required_target_ranges,
         y_upper_bound,
         "invalid required target range",
     )?;
-    let complete_required = if y_upper_bound == 0 {
-        Vec::new()
-    } else {
-        vec![InitializationTargetRange {
-            start: 0,
-            end: y_upper_bound,
-            span: required.first().and_then(|range| range.span),
-        }]
-    };
-    if !same_target_coverage(&required, &complete_required) {
+    if !covers_complete_target_range(&required, y_upper_bound) {
         return Err(initialization_range_error_at(
             "incomplete required target coverage of the solver Y vector",
-            required.first().and_then(|range| range.span),
+            required.first().map(|range| range.span),
         ));
     }
     let fixed = normalized_ranges(
@@ -146,11 +146,86 @@ pub(super) fn validate_initialization_direct_families(
             "incomplete direct plus fixed-start target union",
             actual
                 .first()
-                .and_then(|range| range.span)
-                .or_else(|| required.first().and_then(|range| range.span)),
+                .map(|range| range.span)
+                .or_else(|| required.first().map(|range| range.span)),
         ));
     }
     Ok(())
+}
+
+fn validate_compact_direct_projection_plan(
+    initialization: &InitializationSolveSystem,
+) -> Result<(), SolveProblemShapeContractError> {
+    if !initialization.projection_indices.is_empty() {
+        return Err(compact_projection_error(
+            initialization,
+            0,
+            "compact direct projection must not recover scalar projection indices",
+        ));
+    }
+    if initialization.projection_plan.blocks.len() != initialization.direct_families.len() {
+        return Err(compact_projection_error(
+            initialization,
+            0,
+            "compact direct projection must own every direct family exactly once",
+        ));
+    }
+    let mut seen = vec![false; initialization.direct_families.len()];
+    for (block_index, block) in initialization.projection_plan.blocks.iter().enumerate() {
+        let [family_index] = block.rows.as_slice() else {
+            return Err(compact_projection_error(
+                initialization,
+                block_index,
+                "compact direct projection block must name exactly one family",
+            ));
+        };
+        let Some(family) = initialization.direct_families.get(*family_index) else {
+            return Err(compact_projection_error(
+                initialization,
+                block_index,
+                "compact direct projection family index is out of bounds",
+            ));
+        };
+        if std::mem::replace(&mut seen[*family_index], true) {
+            return Err(compact_projection_error(
+                initialization,
+                block_index,
+                "compact direct projection family ownership is duplicated",
+            ));
+        }
+        if block.y_indices.as_slice() != [family.targets.start] || !block.causal_steps.is_empty() {
+            return Err(compact_projection_error(
+                initialization,
+                block_index,
+                "compact direct projection block has an invalid target anchor",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn compact_projection_error(
+    initialization: &InitializationSolveSystem,
+    block_index: usize,
+    dimension: &'static str,
+) -> SolveProblemShapeContractError {
+    let span = initialization
+        .projection_plan
+        .blocks
+        .get(block_index)
+        .and_then(|block| block.rows.first())
+        .and_then(|family_index| initialization.direct_families.get(*family_index))
+        .or_else(|| initialization.direct_families.first())
+        .map(|family| family.span);
+    let Some(span) = span else {
+        return initialization_range_error(dimension);
+    };
+    SolveProblemShapeContractError::ZeroTensorDimension {
+        context: "initialization.projection_plan".to_string(),
+        node_index: block_index,
+        dimension,
+        span,
+    }
 }
 
 fn validate_initialization_without_direct_families(
@@ -179,8 +254,8 @@ fn validate_initialization_without_direct_families(
                 "incomplete fixed-start target union",
                 fixed
                     .first()
-                    .and_then(|range| range.span)
-                    .or_else(|| required.first().and_then(|range| range.span)),
+                    .map(|range| range.span)
+                    .or_else(|| required.first().map(|range| range.span)),
             ));
         }
     } else if !initialization.required_target_ranges.is_empty()
@@ -202,14 +277,20 @@ fn normalized_ranges(
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
     let mut normalized: Vec<InitializationTargetRange> = Vec::with_capacity(ranges.len());
     for range in ranges {
+        if range.span.is_dummy() {
+            return Err(initialization_range_error_at(
+                "initialization target range requires a non-dummy source span",
+                None,
+            ));
+        }
         if range.start >= range.end || range.end > upper_bound {
-            return Err(initialization_range_error_at(error, range.span));
+            return Err(initialization_range_error_at(error, Some(range.span)));
         }
         if let Some(last) = normalized.last_mut() {
             if range.start < last.end {
                 return Err(initialization_range_error_at(
                     "overlapping initialization target ranges",
-                    range.span.or(last.span),
+                    Some(range.span),
                 ));
             }
             if range.start == last.end {
@@ -244,10 +325,26 @@ fn same_target_coverage(
             .all(|(left, right)| left.start == right.start && left.end == right.end)
 }
 
+fn covers_complete_target_range(ranges: &[InitializationTargetRange], upper_bound: usize) -> bool {
+    match (upper_bound, ranges) {
+        (0, []) => true,
+        (_, [range]) => range.start == 0 && range.end == upper_bound,
+        _ => false,
+    }
+}
+
 fn validate_initialization_direct_family(
     initialization: &InitializationSolveSystem,
     family: &InitializationDirectFamily,
 ) -> Result<std::ops::Range<usize>, SolveProblemShapeContractError> {
+    if !matches!(family.residual_sign, -1 | 1) {
+        return Err(SolveProblemShapeContractError::ZeroTensorDimension {
+            context: "initialization.direct_families".to_string(),
+            node_index: family.node_index,
+            dimension: "direct-family residual sign must be -1 or +1",
+            span: family.span,
+        });
+    }
     let Some(node) = initialization.residual.nodes.get(family.node_index) else {
         return Err(SolveProblemShapeContractError::ZeroTensorDimension {
             context: "initialization.direct_families".to_string(),
