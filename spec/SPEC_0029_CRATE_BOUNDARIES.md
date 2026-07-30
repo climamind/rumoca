@@ -119,7 +119,9 @@ structural-parameter values are available only after instantiation.
 
 ### 5. Evaluation Decoupled from Representation
 
-Evaluation crates are aligned to IR ownership: `rumoca-eval-ast`, `rumoca-eval-flat`, and `rumoca-eval-dae`. `rumoca-eval-solve` builds on DAE evaluation primitives for solver-facing row evaluation. This keeps evaluation entry points explicit per representation and avoids cross-layer helper crates that hide where behavior lives.
+Evaluation follows IR ownership: `rumoca-eval-ast`, `rumoca-eval-flat`,
+`rumoca-eval-dae`, and solver-facing `rumoca-eval-solve`. Entry points stay
+representation-specific; cross-layer helpers must not hide ownership.
 
 Phase crates MAY depend on the evaluation crate for the IR they are actively processing
 when the phase needs compile-time evaluation of that representation. For example,
@@ -241,6 +243,8 @@ compiler/session → DAE structural → solve-IR lowering → runtime contracts 
 | DAE structural analysis (Pantelides, BLT, tearing, demotion) | `rumoca-phase-structural` | SPEC_0007 §Structural Transformation Scope |
 | Solver-facing prepared data + row ops | `rumoca-ir-solve` | Backend-neutral execution IR |
 | DAE → solve-IR lowering | `rumoca-phase-solve` | Lowering only, not structural mutation |
+| Compact Map evaluation | `rumoca-eval-solve` | Backend-neutral; no scalar reconstruction |
+| GPU initialization settlement | `rumoca-sim` | Orchestration; no solver dependency |
 | Optimization/training orchestration | `rumoca-opt` | Consumes Solve/eval APIs; no Modelica semantics |
 | Textual generated artifacts and templates | `rumoca-phase-codegen` | Jinja/minijinja rendering owns generated C, Rust, CUDA C, MLIR, FMI/eFMI and FMU/eFMU packaging text |
 | GALEC `.alg` text (recorded exception) | `rumoca-ir-galec` | Typed AST printing per eFMI conformance; routed via template context (SPEC_0034 GAL-009) |
