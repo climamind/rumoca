@@ -465,6 +465,94 @@ fn test_orphan_drop_rejects_structured_lhs_with_cached_scalar_spelling() {
 }
 
 #[test]
+fn test_orphan_drop_rejects_unproven_structured_lhs_projections() {
+    let span = test_span();
+    let cases = [
+        (
+            "missing base metadata",
+            "missing_metadata",
+            None,
+            Vec::new(),
+            1,
+            "missing_metadata[1]",
+        ),
+        (
+            "selector rank mismatch",
+            "rank_target",
+            Some(vec![2, 2]),
+            vec![rumoca_core::Subscript::Index { value: 1, span }],
+            1,
+            "rank_target[1,1]",
+        ),
+        (
+            "invalid aggregate dimensions",
+            "invalid_dimensions_target",
+            Some(vec![0]),
+            vec![rumoca_core::Subscript::Colon { span }],
+            1,
+            "invalid_dimensions_target[1]",
+        ),
+        (
+            "out-of-range selector",
+            "out_of_range_target",
+            Some(vec![2]),
+            vec![rumoca_core::Subscript::Index { value: 3, span }],
+            1,
+            "out_of_range_target[1]",
+        ),
+        (
+            "missing projected leaf",
+            "incomplete_projection_target",
+            Some(vec![2]),
+            vec![rumoca_core::Subscript::Colon { span }],
+            2,
+            "incomplete_projection_target[1]",
+        ),
+    ];
+
+    for (case, base_name, dims, selectors, scalar_count, scalar_leaf) in cases {
+        let mut dae = Dae::new();
+        if let Some(dims) = dims {
+            let mut metadata = component_var(base_name);
+            metadata.dims = dims;
+            dae.variables
+                .inputs
+                .insert(VarName::new(base_name), metadata);
+        }
+        dae.variables
+            .algebraics
+            .insert(VarName::new(scalar_leaf), component_var(scalar_leaf));
+        dae.continuous
+            .equations
+            .push(dae::Equation::explicit_with_scalar_count(
+                Reference::with_component_reference(
+                    base_name,
+                    rumoca_core::ComponentReference {
+                        local: false,
+                        span,
+                        parts: vec![rumoca_core::ComponentRefPart {
+                            ident: base_name.to_string(),
+                            span,
+                            subs: selectors,
+                        }],
+                        def_id: None,
+                    },
+                ),
+                lit(0.0),
+                span,
+                format!("{case} must fail closed"),
+                scalar_count,
+            ));
+
+        drop_unreferenced_continuous_unknowns(&mut dae);
+        assert!(
+            dae.variables.algebraics.is_empty(),
+            "{case} must not retain its scalar leaf `{scalar_leaf}`"
+        );
+    }
+}
+
+#[test]
 fn test_orphan_drop_keeps_shaped_singleton_base_lhs_owner() {
     let mut dae = Dae::new();
     let span = test_span();
