@@ -34,16 +34,19 @@ fn collect_continuous_exact_references(dae: &Dae) -> Vec<VarName> {
     let mut refs = Vec::new();
     for equation in &dae.continuous.equations {
         if let Some(lhs) = &equation.lhs {
-            collect_exact_reference_expr_names_in_dae(
-                dae,
-                &Expression::VarRef {
-                    name: lhs.clone(),
-                    subscripts: Vec::new(),
-                    span: equation.span,
-                },
-                &mut refs,
-            );
-            collect_scalarized_lhs_owners(dae, lhs, equation.scalar_count, &mut refs);
+            if lhs.component_ref().is_none() {
+                collect_exact_reference_expr_names_in_dae(
+                    dae,
+                    &Expression::VarRef {
+                        name: lhs.clone(),
+                        subscripts: Vec::new(),
+                        span: equation.span,
+                    },
+                    &mut refs,
+                );
+            } else {
+                collect_scalarized_lhs_owners(dae, lhs, equation.scalar_count, &mut refs);
+            }
         }
         collect_exact_reference_expr_names_in_dae(dae, &equation.rhs, &mut refs);
     }
@@ -61,6 +64,10 @@ fn collect_scalarized_lhs_owners(
     if scalar_count == 0 {
         return;
     }
+    if let Some(exact) = exact_structured_scalar_lhs_owner(dae, lhs, scalar_count) {
+        out.push(exact);
+        return;
+    }
     let Some((base, selectors)) = lhs_base_and_selectors(lhs) else {
         return;
     };
@@ -73,6 +80,31 @@ fn collect_scalarized_lhs_owners(
         return;
     };
     out.extend(owned);
+}
+
+fn exact_structured_scalar_lhs_owner(
+    dae: &Dae,
+    lhs: &Reference,
+    scalar_count: usize,
+) -> Option<VarName> {
+    if scalar_count != 1 {
+        return None;
+    }
+    let mut component_ref = lhs.component_ref()?.clone();
+    for part in &mut component_ref.parts {
+        for subscript in &mut part.subs {
+            let value = exact_subscript_index_in_dae(dae, subscript)?;
+            let span = match subscript {
+                Subscript::Index { span, .. }
+                | Subscript::Expr { span, .. }
+                | Subscript::Colon { span } => *span,
+            };
+            *subscript = Subscript::Index { value, span };
+        }
+    }
+    let name = component_ref.to_var_name();
+    let variable = crate::variable_scope::DaeVariableScope::new(dae).exact(&name)?;
+    (scalar_count_from_dims(&name, &variable.dims).ok()? == 1).then_some(name)
 }
 
 fn lhs_base_and_selectors(lhs: &Reference) -> Option<(VarName, &[Subscript])> {

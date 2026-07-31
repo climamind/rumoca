@@ -412,6 +412,59 @@ fn test_orphan_drop_keeps_exact_scalarized_slice_lhs_owners() {
 }
 
 #[test]
+fn test_orphan_drop_rejects_structured_lhs_with_cached_scalar_spelling() {
+    let mut dae = Dae::new();
+    let span = test_span();
+
+    let mut aggregate_metadata = component_var("cached_target");
+    aggregate_metadata.dims = vec![2, 2];
+    dae.variables
+        .inputs
+        .insert(VarName::new("cached_target"), aggregate_metadata);
+    for name in ["cached_target[1,1]", "cached_target[2,1]"] {
+        dae.variables
+            .algebraics
+            .insert(VarName::new(name), component_var(name));
+    }
+
+    let lhs = Reference::with_component_reference(
+        "cached_target[1,1]",
+        rumoca_core::ComponentReference {
+            local: false,
+            span,
+            parts: vec![rumoca_core::ComponentRefPart {
+                ident: "cached_target".to_string(),
+                span,
+                subs: vec![
+                    rumoca_core::Subscript::Expr {
+                        expr: Box::new(var_ref("dynamic_selector")),
+                        span,
+                    },
+                    rumoca_core::Subscript::Index { value: 1, span },
+                ],
+            }],
+            def_id: None,
+        },
+    );
+    dae.continuous
+        .equations
+        .push(dae::Equation::explicit_with_scalar_count(
+            lhs,
+            lit(0.0),
+            span,
+            "dynamic selector must fail closed despite cached scalar spelling",
+            1,
+        ));
+
+    drop_unreferenced_continuous_unknowns(&mut dae);
+
+    assert!(
+        dae.variables.algebraics.is_empty(),
+        "structured LHS owner preservation must not trust cached scalar spelling"
+    );
+}
+
+#[test]
 fn test_orphan_drop_keeps_structured_fixed_singleton_lhs_owner() {
     let mut dae = Dae::new();
     let span = test_span();
