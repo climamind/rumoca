@@ -139,20 +139,6 @@ fn validate_assignment_shape(
     initialization: &solve::InitializationSolveSystem,
     y_len: usize,
 ) -> Result<(), GpuInitializationError> {
-    for family in &initialization.direct_families {
-        let Some(solve::ComputeNode::Map { base_ops, .. }) =
-            initialization.residual.nodes.get(family.node_index)
-        else {
-            continue;
-        };
-        if has_random_or_impure_ops(base_ops) {
-            return Err(GpuInitializationError::Unsupported {
-                feature: "random or impure direct initial operations",
-                row: family.node_index,
-                span: Some(family.span),
-            });
-        }
-    }
     solve::validate_compact_gpu_initialization(initialization, y_len).map_err(|error| {
         GpuInitializationError::Malformed {
             message: error.to_string(),
@@ -278,20 +264,6 @@ fn execute_direct_family(
         .temporary_values
         .max(evaluation.temporary_values);
     Ok(())
-}
-
-fn has_random_or_impure_ops(ops: &[solve::LinearOp]) -> bool {
-    ops.iter().any(|op| {
-        matches!(
-            op,
-            solve::LinearOp::RandomInitialState { .. }
-                | solve::LinearOp::RandomResult { .. }
-                | solve::LinearOp::RandomState { .. }
-                | solve::LinearOp::ImpureRandomInit { .. }
-                | solve::LinearOp::ImpureRandom { .. }
-                | solve::LinearOp::ImpureRandomInteger { .. }
-        )
-    })
 }
 
 fn direct_map_index(
@@ -972,24 +944,47 @@ mod tests {
     }
 
     #[test]
-    fn settlement_admission_rejects_random_direct_initial_operations_with_span() {
+    fn settlement_semantic_gate_rejects_malformed_random_with_owner_span() {
         let mut model = direct_model();
-        let solve::ComputeNode::Map { base_ops, .. } =
-            &mut model.problem.initialization.residual.nodes[0]
+        let solve::ComputeNode::Map {
+            base_ops,
+            const_strides,
+            ..
+        } = &mut model.problem.initialization.residual.nodes[0]
         else {
             unreachable!()
         };
-        base_ops.insert(0, LinearOp::ImpureRandomInit { dst: 6, seed: 1 });
+        *base_ops = vec![
+            LinearOp::LoadY { dst: 0, index: 0 },
+            LinearOp::Const { dst: 1, value: 1.0 },
+            LinearOp::Const { dst: 2, value: 2.0 },
+            LinearOp::RandomInitialState {
+                dst: 3,
+                generator: solve::RandomGenerator::Xorshift64Star,
+                local_seed: 1,
+                global_seed: 2,
+                state_len: 0,
+                state_index: 0,
+            },
+            LinearOp::Binary {
+                dst: 4,
+                op: BinaryOp::Sub,
+                lhs: 0,
+                rhs: 3,
+            },
+            LinearOp::StoreOutput { src: 4 },
+        ];
+        const_strides.clear();
 
         let error = settle_gpu_initial_conditions(&model, 0.0)
-            .expect_err("random initialization cannot be replayed for residual verification");
+            .expect_err("malformed random initialization must fail shared semantic admission");
         assert!(matches!(
             error,
-            GpuInitializationError::Unsupported {
-                feature: "random or impure direct initial operations",
+            GpuInitializationError::Malformed {
+                ref message,
                 span: Some(actual),
                 ..
-            } if actual == span()
+            } if message.contains("random or impure direct Map operation") && actual == span()
         ));
     }
 
