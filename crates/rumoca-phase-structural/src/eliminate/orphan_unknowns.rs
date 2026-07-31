@@ -104,7 +104,7 @@ fn exact_structured_scalar_lhs_owner(
     }
     let name = component_ref.to_var_name();
     let variable = crate::variable_scope::DaeVariableScope::new(dae).exact(&name)?;
-    (scalar_count_from_dims(&name, &variable.dims).ok()? == 1).then_some(name)
+    variable.dims.is_empty().then_some(name)
 }
 
 fn lhs_base_and_selectors(lhs: &Reference) -> Option<(VarName, &[Subscript])> {

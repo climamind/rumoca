@@ -465,6 +465,54 @@ fn test_orphan_drop_rejects_structured_lhs_with_cached_scalar_spelling() {
 }
 
 #[test]
+fn test_orphan_drop_keeps_shaped_singleton_base_lhs_owner() {
+    let mut dae = Dae::new();
+    let span = test_span();
+
+    let mut aggregate_metadata = component_var("singleton_target");
+    aggregate_metadata.dims = vec![1, 1];
+    dae.variables
+        .inputs
+        .insert(VarName::new("singleton_target"), aggregate_metadata);
+    dae.variables.algebraics.insert(
+        VarName::new("singleton_target[1,1]"),
+        component_var("singleton_target[1,1]"),
+    );
+
+    let lhs = Reference::with_component_reference(
+        "singleton_target",
+        rumoca_core::ComponentReference {
+            local: false,
+            span,
+            parts: vec![rumoca_core::ComponentRefPart {
+                ident: "singleton_target".to_string(),
+                span,
+                subs: Vec::new(),
+            }],
+            def_id: None,
+        },
+    );
+    dae.continuous
+        .equations
+        .push(dae::Equation::explicit_with_scalar_count(
+            lhs,
+            lit(0.0),
+            span,
+            "shaped singleton base lhs",
+            1,
+        ));
+
+    drop_unreferenced_continuous_unknowns(&mut dae);
+
+    assert!(
+        dae.variables
+            .algebraics
+            .contains_key(&VarName::new("singleton_target[1,1]")),
+        "a shaped singleton base lhs must keep its scalar projection"
+    );
+}
+
+#[test]
 fn test_orphan_drop_keeps_structured_fixed_singleton_lhs_owner() {
     let mut dae = Dae::new();
     let span = test_span();
