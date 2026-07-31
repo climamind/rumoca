@@ -1,4 +1,5 @@
 use super::*;
+use crate::direct_map_semantics::validate_direct_map_semantics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct InitializationTargetRange {
@@ -463,94 +464,6 @@ fn validate_initialization_direct_family(
     Ok(family.targets.start..end)
 }
 
-fn validate_direct_map_semantics(
-    family: &InitializationDirectFamily,
-    base_ops: &[LinearOp],
-    load_strides: &[AffineStencilLoadStride],
-) -> Result<(), SolveProblemShapeContractError> {
-    let mut target_loads = base_ops
-        .iter()
-        .enumerate()
-        .filter_map(|(position, op)| match op {
-            LinearOp::LoadY { dst, index } if *index == family.targets.start => {
-                Some((position, *dst))
-            }
-            _ => None,
-        });
-    let Some((target_position, target_register)) = target_loads.next() else {
-        return Err(direct_semantic_error(
-            family,
-            "direct Map is missing its target LoadY",
-        ));
-    };
-    if target_loads.next().is_some() {
-        return Err(direct_semantic_error(
-            family,
-            "direct Map has more than one target LoadY",
-        ));
-    }
-    let mut target_terms = Vec::new();
-    for stride in load_strides
-        .iter()
-        .filter(|stride| stride.op_position == target_position)
-    {
-        target_terms.extend(stride.terms.iter().cloned());
-    }
-    target_terms.sort_unstable_by_key(|term| term.dimension);
-    let mut expected_terms = family.targets.strides.clone();
-    expected_terms.sort_unstable_by_key(|term| term.dimension);
-    if target_terms != expected_terms {
-        return Err(direct_semantic_error(
-            family,
-            "direct target LoadY affine map does not match family.targets",
-        ));
-    }
-    let Some(LinearOp::StoreOutput { src }) = base_ops.last() else {
-        return Err(direct_semantic_error(
-            family,
-            "direct Map is missing terminal StoreOutput",
-        ));
-    };
-    let mut producers = base_ops.iter().filter_map(|op| match op {
-        LinearOp::Binary {
-            op: BinaryOp::Sub,
-            lhs,
-            rhs,
-            dst,
-        } if dst == src => Some((*lhs, *rhs)),
-        _ => None,
-    });
-    let Some((lhs, rhs)) = producers.next() else {
-        return Err(direct_semantic_error(
-            family,
-            "direct Map terminal residual is not a subtraction",
-        ));
-    };
-    if producers.next().is_some() {
-        return Err(direct_semantic_error(
-            family,
-            "direct Map terminal residual has ambiguous producers",
-        ));
-    }
-    let actual_sign = if lhs == target_register {
-        1
-    } else if rhs == target_register {
-        -1
-    } else {
-        return Err(direct_semantic_error(
-            family,
-            "direct Map terminal residual does not contain its target load",
-        ));
-    };
-    if actual_sign != family.residual_sign {
-        return Err(direct_semantic_error(
-            family,
-            "direct Map residual direction disagrees with residual_sign",
-        ));
-    }
-    Ok(())
-}
-
 fn direct_family_dependencies(
     initialization: &InitializationSolveSystem,
     family: &InitializationDirectFamily,
@@ -641,7 +554,7 @@ fn ranges_overlap(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>)
     left.start < right.end && right.start < left.end
 }
 
-fn direct_semantic_error(
+pub(super) fn direct_semantic_error(
     family: &InitializationDirectFamily,
     dimension: &'static str,
 ) -> SolveProblemShapeContractError {

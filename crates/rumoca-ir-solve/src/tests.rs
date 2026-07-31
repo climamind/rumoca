@@ -266,6 +266,26 @@ fn compact_initialization_json_and_bincode_reject_constant_zero_map() {
 }
 
 #[test]
+fn compact_initialization_json_and_bincode_reject_output_register_overwrite() {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map { base_ops, .. } = &mut initialization.residual.nodes[0] else {
+        unreachable!()
+    };
+    base_ops.insert(3, LinearOp::Const { dst: 2, value: 0.0 });
+    assert_compact_wire_rejects(initialization, "defined more than once");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_target_register_overwrite() {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map { base_ops, .. } = &mut initialization.residual.nodes[0] else {
+        unreachable!()
+    };
+    base_ops.insert(1, LinearOp::Const { dst: 0, value: 0.0 });
+    assert_compact_wire_rejects(initialization, "defined more than once");
+}
+
+#[test]
 fn compact_initialization_json_and_bincode_reject_wrong_target_load_and_sign() {
     let mut wrong_load = complete_compact_initialization();
     let ComputeNode::Map { base_ops, .. } = &mut wrong_load.residual.nodes[0] else {

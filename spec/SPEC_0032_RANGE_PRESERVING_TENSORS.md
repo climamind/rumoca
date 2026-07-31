@@ -99,7 +99,10 @@ Direct-family `LoadY` dependencies form a compact causal projection
 order in the existing initialization projection envelope. Cycles, unavailable
 interiors, non-affine values, and random/impure operations fail closed at the
 first owning source span; executing a self-consistent but unproven
-reconstruction is forbidden.
+reconstruction is forbidden. Wire and runtime admission require SSA register
+flow, definition-before-use, and a terminal `StoreOutput` whose reaching
+definition is the verified target-`LoadY` subtraction; register overwrites fail
+closed.
 
 ### 5. Ownership Boundaries
 

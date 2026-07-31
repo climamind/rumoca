@@ -727,6 +727,42 @@ mod tests {
     }
 
     #[test]
+    fn settlement_semantic_gate_rejects_output_register_overwrite() {
+        let mut model = direct_model();
+        let solve::ComputeNode::Map { base_ops, .. } =
+            &mut model.problem.initialization.residual.nodes[0]
+        else {
+            unreachable!()
+        };
+        base_ops.insert(3, LinearOp::Const { dst: 2, value: 0.0 });
+
+        let error = settle_gpu_initial_conditions(&model, 0.0)
+            .expect_err("overwritten residual cannot return an unsettled y");
+        assert!(
+            error.to_string().contains("defined more than once"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn settlement_semantic_gate_rejects_target_register_overwrite() {
+        let mut model = direct_model();
+        let solve::ComputeNode::Map { base_ops, .. } =
+            &mut model.problem.initialization.residual.nodes[0]
+        else {
+            unreachable!()
+        };
+        base_ops.insert(2, LinearOp::Move { dst: 0, src: 1 });
+
+        let error = settle_gpu_initial_conditions(&model, 0.0)
+            .expect_err("overwritten target load cannot return an unsettled y");
+        assert!(
+            error.to_string().contains("defined more than once"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn settlement_semantic_gate_rejects_dependency_reorder_and_cycle() {
         let mut reordered = direct_model();
         let span = span();
