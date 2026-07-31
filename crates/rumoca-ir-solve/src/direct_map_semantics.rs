@@ -8,6 +8,7 @@ pub(super) fn validate_direct_map_semantics(
     load_strides: &[AffineStencilLoadStride],
 ) -> Result<(), SolveProblemShapeContractError> {
     let definitions = validate_ssa_register_flow(family, base_ops)?;
+    let output_register = validate_terminal_store_output(family, base_ops)?;
     let mut target_loads = base_ops
         .iter()
         .enumerate()
@@ -36,13 +37,7 @@ pub(super) fn validate_direct_map_semantics(
         ));
     }
     validate_target_affine_map(family, target_position, load_strides)?;
-    let Some(LinearOp::StoreOutput { src }) = base_ops.last() else {
-        return Err(direct_semantic_error(
-            family,
-            "direct Map is missing terminal StoreOutput",
-        ));
-    };
-    let Some(producer_position) = definitions.get(src).copied() else {
+    let Some(producer_position) = definitions.get(&output_register).copied() else {
         return Err(direct_semantic_error(
             family,
             "direct Map terminal output reads an undefined register",
@@ -60,21 +55,111 @@ pub(super) fn validate_direct_map_semantics(
             "direct Map terminal residual reaching definition is not a subtraction",
         ));
     };
-    let actual_sign = if lhs == target_register {
-        1
-    } else if rhs == target_register {
-        -1
-    } else {
-        return Err(direct_semantic_error(
-            family,
-            "direct Map terminal residual does not contain its target load",
-        ));
+    let (non_target_register, actual_sign) = match (lhs == target_register, rhs == target_register)
+    {
+        (true, false) => (rhs, 1),
+        (false, true) => (lhs, -1),
+        (true, true) => {
+            return Err(direct_semantic_error(
+                family,
+                "direct Map non-target residual operand depends on target LoadY",
+            ));
+        }
+        (false, false) => {
+            return Err(direct_semantic_error(
+                family,
+                "direct Map terminal residual does not contain its target load",
+            ));
+        }
     };
+    validate_target_independent_operand(
+        family,
+        non_target_register,
+        target_register,
+        &definitions,
+        base_ops,
+    )?;
     if actual_sign != family.residual_sign {
         return Err(direct_semantic_error(
             family,
             "direct Map residual direction disagrees with residual_sign",
         ));
+    }
+    Ok(())
+}
+
+fn validate_terminal_store_output(
+    family: &InitializationDirectFamily,
+    base_ops: &[LinearOp],
+) -> Result<Reg, SolveProblemShapeContractError> {
+    let mut stores = base_ops
+        .iter()
+        .enumerate()
+        .filter_map(|(position, op)| match op {
+            LinearOp::StoreOutput { src } => Some((position, *src)),
+            _ => None,
+        });
+    let Some((position, src)) = stores.next() else {
+        return Err(direct_semantic_error(
+            family,
+            "direct Map is missing terminal StoreOutput",
+        ));
+    };
+    if stores.next().is_some() {
+        return Err(direct_semantic_error(
+            family,
+            "direct Map must contain exactly one StoreOutput",
+        ));
+    }
+    if position.checked_add(1) != Some(base_ops.len()) {
+        return Err(direct_semantic_error(
+            family,
+            "direct Map StoreOutput is not terminal",
+        ));
+    }
+    Ok(src)
+}
+
+fn validate_target_independent_operand(
+    family: &InitializationDirectFamily,
+    start: Reg,
+    target_register: Reg,
+    definitions: &BTreeMap<Reg, usize>,
+    base_ops: &[LinearOp],
+) -> Result<(), SolveProblemShapeContractError> {
+    let mut pending = BTreeSet::from([start]);
+    let mut visited = BTreeSet::new();
+    while let Some(register) = pending.pop_first() {
+        if register == target_register {
+            return Err(direct_semantic_error(
+                family,
+                "direct Map non-target residual operand depends on target LoadY",
+            ));
+        }
+        if !visited.insert(register) {
+            continue;
+        }
+        let Some(position) = definitions.get(&register).copied() else {
+            return Err(direct_semantic_error(
+                family,
+                "direct Map dependency closure reaches an undefined register",
+            ));
+        };
+        let Some(op) = base_ops.get(position) else {
+            return Err(direct_semantic_error(
+                family,
+                "direct Map dependency closure reaches an invalid definition",
+            ));
+        };
+        if !source_registers_satisfy(op, &mut |source| {
+            pending.insert(source);
+            true
+        }) {
+            return Err(direct_semantic_error(
+                family,
+                "direct Map dependency closure contains malformed register sources",
+            ));
+        }
     }
     Ok(())
 }
@@ -108,7 +193,7 @@ fn validate_ssa_register_flow(
     let mut definitions = BTreeMap::new();
     let mut defined = BTreeSet::new();
     for (position, op) in base_ops.iter().enumerate() {
-        if !sources_are_defined(op, &defined) {
+        if !source_registers_satisfy(op, &mut |source| defined.contains(&source)) {
             return Err(direct_semantic_error(
                 family,
                 "direct Map reads a register before definition",
@@ -127,7 +212,7 @@ fn validate_ssa_register_flow(
     Ok(definitions)
 }
 
-fn sources_are_defined(op: &LinearOp, defined: &BTreeSet<Reg>) -> bool {
+fn source_registers_satisfy(op: &LinearOp, predicate: &mut impl FnMut(Reg) -> bool) -> bool {
     match *op {
         LinearOp::Const { .. }
         | LinearOp::LoadTime { .. }
@@ -138,16 +223,16 @@ fn sources_are_defined(op: &LinearOp, defined: &BTreeSet<Reg>) -> bool {
         | LinearOp::Unary { arg: src, .. }
         | LinearOp::LoadIndexedP { index: src, .. }
         | LinearOp::LoadIndexedSeed { index: src, .. }
-        | LinearOp::StoreOutput { src } => defined.contains(&src),
+        | LinearOp::StoreOutput { src } => predicate(src),
         LinearOp::Binary { lhs, rhs, .. } | LinearOp::Compare { lhs, rhs, .. } => {
-            defined.contains(&lhs) && defined.contains(&rhs)
+            predicate(lhs) && predicate(rhs)
         }
         LinearOp::Select {
             cond,
             if_true,
             if_false,
             ..
-        } => defined.contains(&cond) && defined.contains(&if_true) && defined.contains(&if_false),
+        } => predicate(cond) && predicate(if_true) && predicate(if_false),
         LinearOp::LinearSolveComponent {
             matrix_start,
             rhs_start,
@@ -159,10 +244,10 @@ fn sources_are_defined(op: &LinearOp, defined: &BTreeSet<Reg>) -> bool {
                 return false;
             };
             component < n
-                && register_range_is_defined(defined, matrix_start, matrix_len)
-                && register_range_is_defined(defined, rhs_start, n)
+                && register_range_satisfies(matrix_start, matrix_len, predicate)
+                && register_range_satisfies(rhs_start, n, predicate)
         }
-        LinearOp::TableBounds { table_id, .. } => defined.contains(&table_id),
+        LinearOp::TableBounds { table_id, .. } => predicate(table_id),
         LinearOp::TableLookup {
             table_id,
             column,
@@ -174,15 +259,13 @@ fn sources_are_defined(op: &LinearOp, defined: &BTreeSet<Reg>) -> bool {
             column,
             input,
             ..
-        } => defined.contains(&table_id) && defined.contains(&column) && defined.contains(&input),
-        LinearOp::TableNextEvent { table_id, time, .. } => {
-            defined.contains(&table_id) && defined.contains(&time)
-        }
+        } => predicate(table_id) && predicate(column) && predicate(input),
+        LinearOp::TableNextEvent { table_id, time, .. } => predicate(table_id) && predicate(time),
         LinearOp::RandomInitialState {
             local_seed,
             global_seed,
             ..
-        } => defined.contains(&local_seed) && defined.contains(&global_seed),
+        } => predicate(local_seed) && predicate(global_seed),
         LinearOp::RandomResult {
             state_start,
             state_len,
@@ -192,25 +275,23 @@ fn sources_are_defined(op: &LinearOp, defined: &BTreeSet<Reg>) -> bool {
             state_start,
             state_len,
             ..
-        } => register_range_is_defined(defined, state_start, state_len),
-        LinearOp::ImpureRandomInit { seed, .. } => defined.contains(&seed),
-        LinearOp::ImpureRandom { id, .. } => defined.contains(&id),
+        } => register_range_satisfies(state_start, state_len, predicate),
+        LinearOp::ImpureRandomInit { seed, .. } => predicate(seed),
+        LinearOp::ImpureRandom { id, .. } => predicate(id),
         LinearOp::ImpureRandomInteger { id, imin, imax, .. } => {
-            defined.contains(&id) && defined.contains(&imin) && defined.contains(&imax)
+            predicate(id) && predicate(imin) && predicate(imax)
         }
         LinearOp::ExternalCall {
             args, arg_count, ..
-        } => {
-            arg_count <= args.len()
-                && args
-                    .iter()
-                    .take(arg_count)
-                    .all(|argument| defined.contains(argument))
-        }
+        } => arg_count <= args.len() && args.iter().take(arg_count).copied().all(predicate),
     }
 }
 
-fn register_range_is_defined(defined: &BTreeSet<Reg>, start: Reg, len: usize) -> bool {
+fn register_range_satisfies(
+    start: Reg,
+    len: usize,
+    predicate: &mut impl FnMut(Reg) -> bool,
+) -> bool {
     if len == 0 {
         return true;
     }
@@ -220,5 +301,5 @@ fn register_range_is_defined(defined: &BTreeSet<Reg>, start: Reg, len: usize) ->
     else {
         return false;
     };
-    defined.range(start..=last).count() == len
+    (start..=last).all(predicate)
 }

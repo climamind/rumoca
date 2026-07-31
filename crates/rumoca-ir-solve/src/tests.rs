@@ -252,6 +252,102 @@ fn assert_compact_wire_rejects(initialization: InitializationSolveSystem, expect
     );
 }
 
+fn compact_initialization_with_base_ops(base_ops: Vec<LinearOp>) -> InitializationSolveSystem {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map {
+        base_ops: actual, ..
+    } = &mut initialization.residual.nodes[0]
+    else {
+        unreachable!()
+    };
+    *actual = base_ops;
+    initialization
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_target_minus_target() {
+    let initialization = compact_initialization_with_base_ops(vec![
+        LinearOp::LoadY { dst: 0, index: 0 },
+        LinearOp::Binary {
+            dst: 1,
+            op: BinaryOp::Sub,
+            lhs: 0,
+            rhs: 0,
+        },
+        LinearOp::StoreOutput { src: 1 },
+    ]);
+
+    assert_compact_wire_rejects(initialization, "depends on target LoadY");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_target_dependency_through_move() {
+    let initialization = compact_initialization_with_base_ops(vec![
+        LinearOp::LoadY { dst: 0, index: 0 },
+        LinearOp::Move { dst: 1, src: 0 },
+        LinearOp::Binary {
+            dst: 2,
+            op: BinaryOp::Sub,
+            lhs: 0,
+            rhs: 1,
+        },
+        LinearOp::StoreOutput { src: 2 },
+    ]);
+
+    assert_compact_wire_rejects(initialization, "depends on target LoadY");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_deep_target_dependency() {
+    let initialization = compact_initialization_with_base_ops(vec![
+        LinearOp::LoadY { dst: 0, index: 0 },
+        LinearOp::Const { dst: 1, value: 0.0 },
+        LinearOp::Unary {
+            dst: 2,
+            op: UnaryOp::Neg,
+            arg: 0,
+        },
+        LinearOp::Compare {
+            dst: 3,
+            op: CompareOp::Eq,
+            lhs: 1,
+            rhs: 1,
+        },
+        LinearOp::Select {
+            dst: 4,
+            cond: 3,
+            if_true: 2,
+            if_false: 1,
+        },
+        LinearOp::Binary {
+            dst: 5,
+            op: BinaryOp::Add,
+            lhs: 4,
+            rhs: 1,
+        },
+        LinearOp::Binary {
+            dst: 6,
+            op: BinaryOp::Sub,
+            lhs: 0,
+            rhs: 5,
+        },
+        LinearOp::StoreOutput { src: 6 },
+    ]);
+
+    assert_compact_wire_rejects(initialization, "depends on target LoadY");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_multiple_store_outputs() {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map { base_ops, .. } = &mut initialization.residual.nodes[0] else {
+        unreachable!()
+    };
+    base_ops.insert(3, LinearOp::StoreOutput { src: 2 });
+
+    assert_compact_wire_rejects(initialization, "exactly one StoreOutput");
+}
+
 #[test]
 fn compact_initialization_json_and_bincode_reject_constant_zero_map() {
     let mut initialization = complete_compact_initialization();
