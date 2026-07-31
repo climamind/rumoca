@@ -482,7 +482,7 @@ fn test_orphan_drop_rejects_unproven_structured_lhs_projections() {
             Some(vec![2, 2]),
             vec![rumoca_core::Subscript::Index { value: 1, span }],
             1,
-            "rank_target[1,1]",
+            "rank_target[1]",
         ),
         (
             "invalid aggregate dimensions",
@@ -498,7 +498,7 @@ fn test_orphan_drop_rejects_unproven_structured_lhs_projections() {
             Some(vec![2]),
             vec![rumoca_core::Subscript::Index { value: 3, span }],
             1,
-            "out_of_range_target[1]",
+            "out_of_range_target[3]",
         ),
         (
             "missing projected leaf",
