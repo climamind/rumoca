@@ -521,6 +521,119 @@ fn gpu_preparation_accepts_descending_singleton_structured_domain() {
     assert_eq!(domain.binders[0].step, 1);
 }
 
+fn replay_gpu_direct_family(gpu: &solve::SolveProblem) -> Vec<f64> {
+    let family = &gpu.initialization.direct_families[0];
+    let node = &gpu.initialization.residual.nodes[family.node_index];
+    let mut y = vec![0.0; gpu.layout.y_scalars()];
+    rumoca_eval_solve::eval_map_elements_with_context(
+        node,
+        &mut y,
+        &[],
+        0.0,
+        rumoca_eval_solve::RowEvalContext::default(),
+        |ordinal, residual, y| {
+            let offset = family
+                .targets
+                .strides
+                .iter()
+                .try_fold(0isize, |offset, term| {
+                    offset.checked_add(
+                        term
+                            .stride
+                            .checked_mul(isize::try_from(ordinal[term.dimension]).ok()?)?,
+                    )
+                })
+                .expect("fixture target map must remain in host range");
+            let target = family
+                .targets
+                .start
+                .checked_add_signed(offset)
+                .expect("fixture target must remain in Y");
+            y[target] -= f64::from(family.residual_sign) * residual;
+            Ok(())
+        },
+    )
+    .expect("emitted direct family must replay natively");
+    y
+}
+
+#[test]
+fn gpu_preparation_canonicalizes_nondivisible_descending_domain_without_changing_values() {
+    let spans = [
+        solve_numbered_span(316, 10, 20),
+        solve_numbered_span(316, 30, 40),
+    ];
+    let mut dae_model =
+        gpu_initial_family_fixture_at(&[40, 20], &spans, &[2], vec![vec![2], vec![1]]);
+    let binder = &mut dae_model.initialization.structured_equations[0]
+        .domain
+        .binders[0];
+    binder.lower = 4;
+    binder.upper = 1;
+    binder.step = -2;
+
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        2,
+        Some(spans[0]),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("nondivisible descending domain must retain its source value set");
+    let solve::ComputeNode::Map { domain, .. } = &gpu.initialization.residual.nodes[0] else {
+        panic!("descending direct family must remain a Map")
+    };
+    assert_eq!(
+        (
+            domain.binders[0].lower,
+            domain.binders[0].step,
+            domain.binders[0].upper,
+        ),
+        (2, 2, 4),
+        "canonical domain must enumerate exactly the source values [2, 4]"
+    );
+    assert_eq!(gpu.initialization.direct_families[0].targets.start, 0);
+    assert_eq!(
+        gpu.initialization.direct_families[0].targets.strides,
+        vec![solve::AffineStencilIndexStrideTerm {
+            dimension: 0,
+            stride: 1,
+        }]
+    );
+    assert_eq!(replay_gpu_direct_family(&gpu), vec![20.0, 40.0]);
+}
+
+#[test]
+fn gpu_preparation_canonicalizes_wide_step_descending_singleton_at_source_lower() {
+    let span = solve_numbered_span(317, 10, 20);
+    let mut dae_model = gpu_initial_family_fixture_at(&[30], &[span], &[1], vec![vec![1]]);
+    let binder = &mut dae_model.initialization.structured_equations[0]
+        .domain
+        .binders[0];
+    binder.lower = 3;
+    binder.upper = 1;
+    binder.step = -5;
+
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        1,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("wide-step descending singleton must retain source lower");
+    let solve::ComputeNode::Map { domain, .. } = &gpu.initialization.residual.nodes[0] else {
+        panic!("descending singleton must remain a Map")
+    };
+    assert_eq!(
+        (
+            domain.binders[0].lower,
+            domain.binders[0].step,
+            domain.binders[0].upper,
+        ),
+        (3, 5, 3)
+    );
+    assert_eq!(replay_gpu_direct_family(&gpu), vec![30.0]);
+}
+
 #[test]
 fn gpu_preparation_skips_empty_structured_domain_without_a_direct_node() {
     let span = solve_numbered_span(313, 10, 20);
@@ -710,6 +823,46 @@ fn gpu_preparation_builds_projection_plan_for_reverse_ordered_direct_dependencie
 }
 
 #[test]
+fn gpu_preparation_rejects_direct_family_dependency_cycle() {
+    let span = solve_numbered_span(318, 10, 20);
+    let mut dae_model = reverse_ordered_direct_dependency_fixture(span);
+    for (offset, index) in (1..=2).enumerate() {
+        dae_model.initialization.equations[2 + offset] = dae::Equation::residual(
+            binary(
+                rumoca_core::OpBinary::Sub,
+                gpu_indexed_var("b", index, span),
+                binary(
+                    rumoca_core::OpBinary::Add,
+                    gpu_indexed_var("a", index, span),
+                    int_expr(1),
+                ),
+            ),
+            span,
+            "b depends on a",
+        );
+    }
+    dae_model.initialization.structured_equations[1].template =
+        Some(rumoca_core::ComprehensionTemplate {
+            body: vec![dae_model.initialization.equations[2].rhs.clone()],
+        });
+
+    let error = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        4,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect_err("cyclic direct-family ownership must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("cyclic direct-family dependency"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(error.source_span(), Some(span));
+}
+
+#[test]
 fn gpu_initial_projection_handles_negative_binder_steps() {
     // Source binder traversal may descend. Target maps remain canonical dense
     // positive-stride maps; Solve-IR validation rejects negative target strides.
@@ -729,6 +882,7 @@ fn gpu_initial_projection_handles_negative_binder_steps() {
 #[test]
 fn gpu_affine_proof_does_not_materialize_all_family_rows() {
     let implementation = include_str!("../gpu_initialization.rs");
+    let visitor_implementation = include_str!("../lower/expression_rows.rs");
     assert!(
         !implementation.contains(".index_tuples()"),
         "GPU proof must reuse one ordinal buffer instead of materializing every tuple"
@@ -737,10 +891,29 @@ fn gpu_affine_proof_does_not_materialize_all_family_rows() {
         !implementation.contains("lower_initial_residual_cells("),
         "GPU proof must lower and release one scalar proof row at a time"
     );
+    let visitor = visitor_implementation
+        .split("pub(super) fn visit_initial_residual_cells")
+        .nth(1)
+        .and_then(|source| source.split("fn lower_residual_rows_from_equations_core").next())
+        .expect("structured proof visitor source");
+    assert!(
+        !visitor.contains("build_indexed_binding_map(layout)"),
+        "structured proof visitor must borrow indexed layout metadata instead of cloning every element"
+    );
+
+    let small_span = solve_numbered_span(315, 1, 2);
+    lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &gpu_initial_family_fixture(&[1], &[small_span]),
+        1,
+        Some(small_span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("singleton affine family should use the same borrowed proof context");
+    let small_metrics = gpu_initialization_proof_metrics();
 
     let values = (1..=128).collect::<Vec<_>>();
     let spans = (0..values.len())
-        .map(|index| solve_numbered_span(315, index * 2 + 1, index * 2 + 2))
+        .map(|index| solve_numbered_span(319, index * 2 + 1, index * 2 + 2))
         .collect::<Vec<_>>();
     lower_solve_problem_with_solver_len_and_model_span_and_profile(
         &gpu_initial_family_fixture(&values, &spans),
@@ -751,8 +924,17 @@ fn gpu_affine_proof_does_not_materialize_all_family_rows() {
     .expect("large affine family should stream through proof lowering");
     let metrics = gpu_initialization_proof_metrics();
     assert_eq!(metrics.cells, values.len());
+    assert_eq!(small_metrics.peak_owned_rows, 1);
     assert_eq!(metrics.peak_owned_rows, 1);
     assert_eq!(metrics.ordinal_slots, 1);
+    assert_eq!(
+        (
+            small_metrics.retained_indexed_context_entries,
+            metrics.retained_indexed_context_entries,
+        ),
+        (0, 0),
+        "borrowed layout metadata must retain zero new context entries at N=1 and N=128"
+    );
 }
 
 #[test]

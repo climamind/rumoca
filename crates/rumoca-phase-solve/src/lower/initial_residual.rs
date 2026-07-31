@@ -47,7 +47,7 @@ pub(crate) fn visit_initial_residual_cells<'a>(
     layout: &VarLayout,
     equations: impl IntoIterator<Item = (usize, &'a dae::Equation)>,
     visit: impl FnMut(&dae::Equation, &[LinearOp]) -> Result<(), super::LowerError>,
-) -> Result<(), super::LowerError> {
+) -> Result<super::InitialResidualVisitMetrics, super::LowerError> {
     expression_rows::visit_initial_residual_cells(dae_model, layout, equations, visit)
 }
 
