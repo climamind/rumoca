@@ -51,9 +51,10 @@ cargo --version
 
 MSL parity uses the exact OpenModelica Debian package recorded in
 `toolchains/openmodelica-version`. CI installs that package by exact equality,
-and local installations and CI must report the exact `major.minor.patch`
-release implied by the package pin before a full MSL result is comparable. The
-CI installer rejects older, silently upgraded, pre-release, and build outputs.
+and local installations and CI must report the exact runtime identity formed by
+removing only the package pin's trailing Debian revision before a full MSL
+result is comparable. The CI installer rejects older, silently upgraded,
+pre-release, and build outputs.
 
 Run the reusable preflight before diagnosing MSL parity failures:
 

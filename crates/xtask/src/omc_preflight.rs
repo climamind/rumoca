@@ -17,7 +17,7 @@ pub(crate) fn run(root: &Path) -> Result<()> {
 }
 
 fn run_with_program(root: &Path, program: &Path) -> Result<()> {
-    let expected_release = pinned_release(root)?;
+    let expected_identity = pinned_runtime_identity(root)?;
     let version = run_version_command(program)?;
     let version_output = captured_output(&version);
     ensure!(
@@ -27,40 +27,60 @@ fn run_with_program(root: &Path, program: &Path) -> Result<()> {
         failure_guidance(&version_output),
     );
 
-    let observed_release = release_from_version_output(&version_output).with_context(|| {
-        format!(
-            "could not identify an OpenModelica major.minor.patch release from:{}",
-            format_output(&version_output)
-        )
-    })?;
+    let observed_identity =
+        runtime_identity_from_version_output(&version_output).with_context(|| {
+            format!(
+                "could not identify an exact OpenModelica runtime identity from:{}",
+                format_output(&version_output)
+            )
+        })?;
     ensure!(
-        observed_release == expected_release,
-        "OpenModelica release mismatch: expected {expected_release}, observed {observed_release}.{}",
+        observed_identity == expected_identity,
+        "OpenModelica runtime identity mismatch: expected {expected_identity}, observed {observed_identity}.{}",
         format_output(&version_output),
     );
 
     run_workspace_smoke(root, program)
 }
 
-fn pinned_release(root: &Path) -> Result<String> {
+fn pinned_runtime_identity(root: &Path) -> Result<String> {
     let pin_path = root.join(PIN_PATH);
     let pin = fs::read_to_string(&pin_path)
         .with_context(|| format!("failed to read OpenModelica pin {}", pin_path.display()))?;
-    canonical_release(&pin)
+    runtime_identity_from_package_pin(&pin)
         .with_context(|| format!("invalid OpenModelica pin {}", pin_path.display()))
 }
 
-fn canonical_release(raw: &str) -> Result<String> {
-    let release = raw.trim().split('~').next().unwrap_or_default();
+fn runtime_identity_from_package_pin(raw: &str) -> Result<String> {
+    let package_pin = raw.trim();
+    let (identity, debian_revision) = package_pin
+        .rsplit_once('-')
+        .context("expected a Debian package revision suffix")?;
+    ensure!(
+        !debian_revision.is_empty() && debian_revision.bytes().all(|byte| byte.is_ascii_digit()),
+        "invalid Debian package revision `{debian_revision}`"
+    );
+    parse_runtime_identity(identity)?;
+    Ok(identity.to_owned())
+}
+
+fn parse_runtime_identity(identity: &str) -> Result<()> {
+    let (release, git_revision) = identity
+        .split_once("~1-g")
+        .context("expected `major.minor.patch~1-g<git-revision>`")?;
     let mut components = split_path_with_indices(release).into_iter();
-    let major = release_component(components.next(), "major")?;
-    let minor = release_component(components.next(), "minor")?;
-    let patch = release_component(components.next(), "patch")?;
+    release_component(components.next(), "major")?;
+    release_component(components.next(), "minor")?;
+    release_component(components.next(), "patch")?;
     ensure!(
         components.next().is_none(),
         "expected exactly major.minor.patch, got `{release}`"
     );
-    Ok(format!("{major}.{minor}.{patch}"))
+    ensure!(
+        !git_revision.is_empty() && git_revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid OpenModelica git revision `{git_revision}`"
+    );
+    Ok(())
 }
 
 fn release_component(component: Option<&str>, label: &str) -> Result<u64> {
@@ -90,7 +110,7 @@ fn run_version_command(program: &Path) -> Result<Output> {
         })
 }
 
-fn release_from_version_output(output: &str) -> Result<String> {
+fn runtime_identity_from_version_output(output: &str) -> Result<String> {
     let line = output
         .lines()
         .find(|line| line.trim_start().starts_with("OpenModelica"))
@@ -100,13 +120,9 @@ fn release_from_version_output(output: &str) -> Result<String> {
         .strip_prefix("OpenModelica")
         .unwrap_or_default()
         .trim_start();
-    let token = version.split_whitespace().next().unwrap_or_default();
-    let semver = token
-        .trim_start_matches('v')
-        .split(|character: char| !character.is_ascii_digit() && character != '.')
-        .next()
-        .unwrap_or_default();
-    canonical_release(semver)
+    let identity = version.split_whitespace().next().unwrap_or_default();
+    parse_runtime_identity(identity)?;
+    Ok(identity.to_owned())
 }
 
 fn run_workspace_smoke(root: &Path, program: &Path) -> Result<()> {
@@ -208,14 +224,14 @@ mod tests {
             "healthy-omc",
             r#"
 if [ "$1" = "--version" ]; then
-  printf '%s\\n' 'OpenModelica 1.27.0'
+  printf '%s\n' 'OpenModelica 1.27.0~1-gd7e2907'
   exit 0
 fi
 case "$1" in
   "$PWD"/*.mos) ;;
-  *) printf '%s\\n' 'smoke script was not workspace-local' >&2; exit 13 ;;
+  *) printf '%s\n' 'smoke script was not workspace-local' >&2; exit 13 ;;
 esac
-printf '%s\\n' 'OMC_PREFLIGHT_OK'
+printf '%s\n' 'OMC_PREFLIGHT_OK'
 "#,
         );
 
@@ -238,7 +254,7 @@ printf '%s\\n' 'OMC_PREFLIGHT_OK'
             root.path(),
             "storage-io-omc",
             r#"
-printf '%s\\n' 'docker: failed to create task: containerd: input/output error' >&2
+printf '%s\n' 'docker: failed to create task: containerd: input/output error' >&2
 exit 23
 "#,
         );
@@ -264,19 +280,28 @@ exit 23
             "wrong-release-omc",
             r#"
 if [ "$1" = "--version" ]; then
-  printf '%s\\n' 'OpenModelica 1.26.3'
+  printf '%s\n' 'OpenModelica 1.26.3~1-gd7e2907'
   exit 0
 fi
-printf '%s\\n' 'OMC_PREFLIGHT_OK'
+printf '%s\n' 'OMC_PREFLIGHT_OK'
 "#,
         );
 
         let error =
             run_with_program(root.path(), &omc).expect_err("wrong OMC release must fail preflight");
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("release mismatch"), "{diagnostic}");
-        assert!(diagnostic.contains("expected 1.27.0"), "{diagnostic}");
-        assert!(diagnostic.contains("observed 1.26.3"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("runtime identity mismatch"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("expected 1.27.0~1-gd7e2907"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("observed 1.26.3~1-gd7e2907"),
+            "{diagnostic}"
+        );
     }
 
     #[test]
@@ -287,10 +312,10 @@ printf '%s\\n' 'OMC_PREFLIGHT_OK'
             "smoke-failure-omc",
             r#"
 if [ "$1" = "--version" ]; then
-  printf '%s\\n' 'OpenModelica 1.27.0'
+  printf '%s\n' 'OpenModelica 1.27.0~1-gd7e2907'
   exit 0
 fi
-printf '%s\\n' 'fake smoke failure' >&2
+printf '%s\n' 'fake smoke failure' >&2
 exit 19
 "#,
         );
@@ -300,5 +325,76 @@ exit 19
         let diagnostic = format!("{error:#}");
         assert!(diagnostic.contains("smoke script failed"), "{diagnostic}");
         assert!(diagnostic.contains("fake smoke failure"), "{diagnostic}");
+    }
+
+    #[test]
+    fn rejects_plain_semver_version_output() {
+        let root = test_root();
+        let omc = write_omc(
+            root.path(),
+            "plain-semver-omc",
+            r#"
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'OpenModelica 1.27.0'
+  exit 0
+fi
+printf '%s\n' 'OMC_PREFLIGHT_OK'
+"#,
+        );
+
+        let error = run_with_program(root.path(), &omc)
+            .expect_err("plain semver must not satisfy the pinned runtime identity");
+        assert!(
+            format!("{error:#}").contains("OpenModelica 1.27.0"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_wrong_openmodelica_git_revision() {
+        let root = test_root();
+        let omc = write_omc(
+            root.path(),
+            "wrong-revision-omc",
+            r#"
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'OpenModelica 1.27.0~1-gbadc0de'
+  exit 0
+fi
+printf '%s\n' 'OMC_PREFLIGHT_OK'
+"#,
+        );
+
+        let error = run_with_program(root.path(), &omc)
+            .expect_err("wrong git revision must not satisfy the pinned runtime identity");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("runtime identity mismatch"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("gbadc0de"), "{diagnostic}");
+    }
+
+    #[test]
+    fn rejects_a_development_openmodelica_build() {
+        let root = test_root();
+        let omc = write_omc(
+            root.path(),
+            "development-build-omc",
+            r#"
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'OpenModelica 1.27.0~dev-123'
+  exit 0
+fi
+printf '%s\n' 'OMC_PREFLIGHT_OK'
+"#,
+        );
+
+        let error = run_with_program(root.path(), &omc)
+            .expect_err("development build must not satisfy the pinned runtime identity");
+        assert!(
+            format!("{error:#}").contains("OpenModelica 1.27.0~dev-123"),
+            "{error:#}"
+        );
     }
 }

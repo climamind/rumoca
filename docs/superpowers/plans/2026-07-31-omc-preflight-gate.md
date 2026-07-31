@@ -20,8 +20,9 @@ stack rather than OMC or Rumoca semantics.
   Cargo-native and expose the underlying Cargo test while allowing `xtask` to
   orchestrate reusable repository gates.
 - `toolchains/openmodelica-version`: canonical OpenModelica package pin.
-- `CONTRIBUTING.md`: local and CI OpenModelica versions must match the pinned
-  major.minor.patch release before parity results are comparable.
+- `CONTRIBUTING.md`: local and CI OpenModelica versions must match the exact
+  runtime identity formed by removing only the pinned package's trailing Debian
+  revision before parity results are comparable.
 
 ## Global Constraints
 
@@ -77,8 +78,9 @@ stack rather than OMC or Rumoca semantics.
 
 1. Implement one OMC preflight module owned by `xtask`:
    - read and canonicalize `toolchains/openmodelica-version`;
-   - run `omc --version`, capture status/stdout/stderr, and require the pinned
-     major.minor.patch release;
+   - run `omc --version`, capture status/stdout/stderr, and require the exact
+     runtime identity formed by removing only the package pin's trailing Debian
+     revision;
    - create a temporary workspace-local `.mos` script, execute it with `omc`,
      and require an unambiguous successful result;
    - classify container-runtime storage I/O failures and render the safe
