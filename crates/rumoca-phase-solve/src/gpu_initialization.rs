@@ -6,6 +6,7 @@ pub(super) struct GpuInitializationProofMetrics {
     pub cells: usize,
     pub peak_owned_rows: usize,
     pub ordinal_slots: usize,
+    pub retained_indexed_context_entries: usize,
 }
 
 #[cfg(test)]
@@ -15,6 +16,7 @@ thread_local! {
             cells: 0,
             peak_owned_rows: 0,
             ordinal_slots: 0,
+            retained_indexed_context_entries: 0,
         }) };
 }
 
@@ -576,7 +578,7 @@ fn prove_gpu_direct_family_affine(
     });
     let mut ordinals = vec![0usize; family.domain.binders.len()];
     let mut cell = 0usize;
-    visit_initial_residual_cells(dae_model, layout, equations, |equation, ops| {
+    let visit_metrics = visit_initial_residual_cells(dae_model, layout, equations, |equation, ops| {
         gpu_canonical_ordinals_for_cell(&family.domain, cell, &mut ordinals, family.span)?;
         prove_gpu_direct_family_cell(&proof, &ordinals, equation, ops)?;
         #[cfg(test)]
@@ -584,13 +586,29 @@ fn prove_gpu_direct_family_affine(
             let metrics = working_set.get();
             working_set.set(GpuInitializationProofMetrics {
                 cells: metrics.cells.saturating_add(1),
-                peak_owned_rows: metrics.peak_owned_rows.max(1),
+                peak_owned_rows: metrics.peak_owned_rows,
                 ordinal_slots: metrics.ordinal_slots.max(ordinals.len()),
+                retained_indexed_context_entries: metrics.retained_indexed_context_entries,
             });
         });
         cell += 1;
         Ok(())
     })?;
+    #[cfg(test)]
+    GPU_INITIALIZATION_PROOF_METRICS.with(|working_set| {
+        let metrics = working_set.get();
+        working_set.set(GpuInitializationProofMetrics {
+            peak_owned_rows: metrics
+                .peak_owned_rows
+                .max(visit_metrics.peak_owned_rows),
+            retained_indexed_context_entries: metrics
+                .retained_indexed_context_entries
+                .max(visit_metrics.retained_indexed_context_entries),
+            ..metrics
+        });
+    });
+    #[cfg(not(test))]
+    let _ = visit_metrics;
     if cell != cells {
         return Err(LowerError::contract_violation(
             "GPU initial affine proof did not visit every family cell",
@@ -965,13 +983,40 @@ fn canonical_gpu_initial_domain(
     let mut canonical = domain.clone();
     for binder in &mut canonical.binders {
         if binder.step < 0 {
-            std::mem::swap(&mut binder.lower, &mut binder.upper);
-            binder.step = binder.step.checked_neg().ok_or_else(|| {
+            let source_lower = binder.lower;
+            let count = gpu_binder_value_count(binder, span)?;
+            let positive_step = binder.step.checked_neg().ok_or_else(|| {
                 LowerError::contract_violation("GPU initial binder step overflows", span)
             })?;
+            if count == 0 {
+                std::mem::swap(&mut binder.lower, &mut binder.upper);
+            } else {
+                let final_source_value =
+                    gpu_initial_final_source_value(binder, count, span)?;
+                binder.lower = final_source_value;
+                binder.upper = source_lower;
+            }
+            binder.step = positive_step;
         }
     }
     Ok(canonical)
+}
+
+fn gpu_initial_final_source_value(
+    binder: &rumoca_core::StructuredIndexBinder,
+    count: usize,
+    span: rumoca_core::Span,
+) -> Result<i64, LowerError> {
+    let arithmetic_error =
+        || LowerError::contract_violation("GPU initial binder value overflows", span);
+    let prior_steps = i128::try_from(count - 1).map_err(|_| arithmetic_error())?;
+    let offset = i128::from(binder.step)
+        .checked_mul(prior_steps)
+        .ok_or_else(arithmetic_error)?;
+    let final_value = i128::from(binder.lower)
+        .checked_add(offset)
+        .ok_or_else(arithmetic_error)?;
+    i64::try_from(final_value).map_err(|_| arithmetic_error())
 }
 
 fn gpu_binder_value_count(
