@@ -54,7 +54,7 @@ DAE lowering, structural rewrites, or template policy.
 
 ### Stage 1 — AST (`rumoca-ir-ast`)
 
-**What it is:** The parser output: concrete syntax with comments and spans.
+**What it is:** Parser output: concrete syntax, comments, and spans.
 
 **Contract:**
 - Represents source text structure, not language semantics.
@@ -62,9 +62,9 @@ DAE lowering, structural rewrites, or template policy.
 - Every node carries a source `Span`; later AST merges must preserve parser
   provenance instead of rewriting source ids.
 
-**What to do here:** Parsing, formatting, early syntax diagnostics.
+**Do here:** Parsing, formatting, early syntax diagnostics.
 
-**What NOT to do here:** Name lookup, class instantiation, type inference,
+**Do NOT here:** Name lookup, class instantiation, type inference,
 equation manipulation.
 
 ---
@@ -196,8 +196,8 @@ signs, and direct family/target ownership without scalar rows. Solve-IR owns the
 shared target/map/sign/dependency gate. Direct Maps require SSA
 definition-before-use, one terminal `StoreOutput`, and a reaching `Sub` whose
 sole target-`LoadY` operand has an opposite definition closure independent of
-that load. Structural fallback excludes event/discrete and user/structured
-initialization.
+that load. Structural fallback is limited to direct-ineligible models without
+event/discrete or user/structured initialization.
 
 `ComputeNode::AffineStencil` requires a preserved DAE domain plus affine-operand
 proof; unstructured-row recovery is forbidden.

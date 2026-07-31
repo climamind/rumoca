@@ -234,11 +234,7 @@ fn complete_compact_initialization() -> InitializationSolveSystem {
 }
 
 fn assert_compact_wire_rejects(initialization: InitializationSolveSystem, expected: &str) {
-    let problem = SolveProblem {
-        layout: make_layout(&[("x", vec![3])], &[]),
-        initialization,
-        ..Default::default()
-    };
+    let problem = compact_problem(initialization);
     let json = serde_json::to_string(&problem).expect("serialize invalid compact JSON");
     let json_error = serde_json::from_str::<SolveProblem>(&json)
         .expect_err("invalid compact JSON must fail semantic admission");
@@ -252,6 +248,14 @@ fn assert_compact_wire_rejects(initialization: InitializationSolveSystem, expect
     );
 }
 
+fn compact_problem(initialization: InitializationSolveSystem) -> SolveProblem {
+    SolveProblem {
+        layout: make_layout(&[("x", vec![3])], &[]),
+        initialization,
+        ..Default::default()
+    }
+}
+
 fn compact_initialization_with_base_ops(base_ops: Vec<LinearOp>) -> InitializationSolveSystem {
     let mut initialization = complete_compact_initialization();
     let ComputeNode::Map {
@@ -262,6 +266,126 @@ fn compact_initialization_with_base_ops(base_ops: Vec<LinearOp>) -> Initializati
     };
     *actual = base_ops;
     initialization
+}
+
+fn malformed_random_initialization() -> InitializationSolveSystem {
+    compact_initialization_with_base_ops(vec![
+        LinearOp::LoadY { dst: 0, index: 0 },
+        LinearOp::Const { dst: 1, value: 1.0 },
+        LinearOp::Const { dst: 2, value: 2.0 },
+        LinearOp::RandomInitialState {
+            dst: 3,
+            generator: RandomGenerator::Xorshift64Star,
+            local_seed: 1,
+            global_seed: 2,
+            state_len: 0,
+            state_index: 0,
+        },
+        LinearOp::Binary {
+            dst: 4,
+            op: BinaryOp::Sub,
+            lhs: 0,
+            rhs: 3,
+        },
+        LinearOp::StoreOutput { src: 4 },
+    ])
+}
+
+#[test]
+fn compact_initialization_json_rejects_reachable_malformed_random_initial_state() {
+    let problem = compact_problem(malformed_random_initialization());
+    let json = serde_json::to_string(&problem).expect("serialize malformed random JSON");
+
+    let error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("malformed random JSON must fail semantic admission");
+    assert!(
+        error
+            .to_string()
+            .contains("random or impure direct Map operation"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_reachable_malformed_random_initial_state() {
+    let problem = compact_problem(malformed_random_initialization());
+    let bytes = bincode::serialize(&problem).expect("serialize malformed random bincode");
+
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("malformed random bincode must fail semantic admission");
+    assert!(
+        error
+            .to_string()
+            .contains("random or impure direct Map operation"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_rejects_every_random_and_impure_variant_with_owner_span() {
+    let variants = [
+        LinearOp::RandomInitialState {
+            dst: 4,
+            generator: RandomGenerator::Xorshift64Star,
+            local_seed: 1,
+            global_seed: 2,
+            state_len: 2,
+            state_index: 0,
+        },
+        LinearOp::RandomResult {
+            dst: 4,
+            generator: RandomGenerator::Xorshift128Plus,
+            state_start: 1,
+            state_len: 3,
+        },
+        LinearOp::RandomState {
+            dst: 4,
+            generator: RandomGenerator::Xorshift1024Star,
+            state_start: 1,
+            state_len: 3,
+            state_index: 2,
+        },
+        LinearOp::ImpureRandomInit { dst: 4, seed: 1 },
+        LinearOp::ImpureRandom {
+            dst: 4,
+            id: 1,
+            call_site: 7,
+        },
+        LinearOp::ImpureRandomInteger {
+            dst: 4,
+            id: 1,
+            imin: 2,
+            imax: 3,
+            call_site: 11,
+        },
+    ];
+
+    for random_op in variants {
+        let initialization = compact_initialization_with_base_ops(vec![
+            LinearOp::LoadY { dst: 0, index: 0 },
+            LinearOp::Const { dst: 1, value: 1.0 },
+            LinearOp::Const { dst: 2, value: 2.0 },
+            LinearOp::Const { dst: 3, value: 3.0 },
+            random_op,
+            LinearOp::Binary {
+                dst: 5,
+                op: BinaryOp::Sub,
+                lhs: 0,
+                rhs: 4,
+            },
+            LinearOp::StoreOutput { src: 5 },
+        ]);
+
+        let error = validate_compact_gpu_initialization(&initialization, 3)
+            .expect_err("random and impure direct Maps must fail semantic admission");
+        assert!(
+            error
+                .to_string()
+                .contains("random or impure direct Map operation"),
+            "{error}"
+        );
+        assert_eq!(error.source_span(), Some(fixture_span()));
+    }
 }
 
 #[test]

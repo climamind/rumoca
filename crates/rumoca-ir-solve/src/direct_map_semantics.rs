@@ -193,6 +193,7 @@ fn validate_ssa_register_flow(
     let mut definitions = BTreeMap::new();
     let mut defined = BTreeSet::new();
     for (position, op) in base_ops.iter().enumerate() {
+        validate_direct_map_op_eligibility(family, op)?;
         if !source_registers_satisfy(op, &mut |source| defined.contains(&source)) {
             return Err(direct_semantic_error(
                 family,
@@ -210,6 +211,24 @@ fn validate_ssa_register_flow(
         }
     }
     Ok(definitions)
+}
+
+fn validate_direct_map_op_eligibility(
+    family: &InitializationDirectFamily,
+    op: &LinearOp,
+) -> Result<(), SolveProblemShapeContractError> {
+    match op {
+        LinearOp::RandomInitialState { .. }
+        | LinearOp::RandomResult { .. }
+        | LinearOp::RandomState { .. }
+        | LinearOp::ImpureRandomInit { .. }
+        | LinearOp::ImpureRandom { .. }
+        | LinearOp::ImpureRandomInteger { .. } => Err(direct_semantic_error(
+            family,
+            "random or impure direct Map operation is not eligible",
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn source_registers_satisfy(op: &LinearOp, predicate: &mut impl FnMut(Reg) -> bool) -> bool {
