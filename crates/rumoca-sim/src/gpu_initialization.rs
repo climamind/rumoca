@@ -763,6 +763,101 @@ mod tests {
     }
 
     #[test]
+    fn settlement_semantic_gate_rejects_target_minus_target_before_returning_y0() {
+        let mut model = direct_model();
+        let original_y0 = model.initial_y.clone();
+        let solve::ComputeNode::Map {
+            base_ops,
+            const_strides,
+            ..
+        } = &mut model.problem.initialization.residual.nodes[0]
+        else {
+            unreachable!()
+        };
+        *base_ops = vec![
+            LinearOp::LoadY { dst: 0, index: 0 },
+            LinearOp::Binary {
+                dst: 1,
+                op: BinaryOp::Sub,
+                lhs: 0,
+                rhs: 0,
+            },
+            LinearOp::StoreOutput { src: 1 },
+        ];
+        const_strides.clear();
+
+        let result = settle_gpu_initial_conditions(&model, 0.0);
+        if let Ok(success) = &result {
+            assert_ne!(
+                success.y0, original_y0,
+                "target - target must not return the original unsettled y0 as success"
+            );
+        }
+        let error = result.expect_err("target - target must fail semantic admission");
+        assert!(
+            error.to_string().contains("depends on target LoadY"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn settlement_semantic_gate_rejects_transitive_target_dependency_before_returning_y0() {
+        let mut model = direct_model();
+        let original_y0 = model.initial_y.clone();
+        let solve::ComputeNode::Map {
+            base_ops,
+            const_strides,
+            ..
+        } = &mut model.problem.initialization.residual.nodes[0]
+        else {
+            unreachable!()
+        };
+        *base_ops = vec![
+            LinearOp::LoadY { dst: 0, index: 0 },
+            LinearOp::Move { dst: 1, src: 0 },
+            LinearOp::Unary {
+                dst: 2,
+                op: solve::UnaryOp::Neg,
+                arg: 1,
+            },
+            LinearOp::Const { dst: 3, value: 0.0 },
+            LinearOp::Compare {
+                dst: 4,
+                op: solve::CompareOp::Eq,
+                lhs: 3,
+                rhs: 3,
+            },
+            LinearOp::Select {
+                dst: 5,
+                cond: 4,
+                if_true: 2,
+                if_false: 3,
+            },
+            LinearOp::Binary {
+                dst: 6,
+                op: BinaryOp::Sub,
+                lhs: 0,
+                rhs: 5,
+            },
+            LinearOp::StoreOutput { src: 6 },
+        ];
+        const_strides.clear();
+
+        let result = settle_gpu_initial_conditions(&model, 0.0);
+        if let Ok(success) = &result {
+            assert_ne!(
+                success.y0, original_y0,
+                "transitive target dependency must not return the original unsettled y0 as success"
+            );
+        }
+        let error = result.expect_err("transitive target dependency must fail semantic admission");
+        assert!(
+            error.to_string().contains("depends on target LoadY"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn settlement_semantic_gate_rejects_dependency_reorder_and_cycle() {
         let mut reordered = direct_model();
         let span = span();
