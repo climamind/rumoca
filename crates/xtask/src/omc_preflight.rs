@@ -1,0 +1,304 @@
+use anyhow::{Context, Result, bail, ensure};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::Path;
+use std::process::{Command, Output};
+
+use crate::util::split_path_with_indices;
+
+const PIN_PATH: &str = "toolchains/openmodelica-version";
+const SMOKE_MARKER: &str = "OMC_PREFLIGHT_OK";
+const SMOKE_SCRIPT: &str = r#"getVersion();
+print("OMC_PREFLIGHT_OK\n");
+"#;
+
+pub(crate) fn run(root: &Path) -> Result<()> {
+    run_with_program(root, Path::new("omc"))
+}
+
+fn run_with_program(root: &Path, program: &Path) -> Result<()> {
+    let expected_release = pinned_release(root)?;
+    let version = run_version_command(program)?;
+    let version_output = captured_output(&version);
+    ensure!(
+        version.status.success(),
+        "OpenModelica version command failed (status={}).{}",
+        version.status,
+        failure_guidance(&version_output),
+    );
+
+    let observed_release = release_from_version_output(&version_output).with_context(|| {
+        format!(
+            "could not identify an OpenModelica major.minor.patch release from:{}",
+            format_output(&version_output)
+        )
+    })?;
+    ensure!(
+        observed_release == expected_release,
+        "OpenModelica release mismatch: expected {expected_release}, observed {observed_release}.{}",
+        format_output(&version_output),
+    );
+
+    run_workspace_smoke(root, program)
+}
+
+fn pinned_release(root: &Path) -> Result<String> {
+    let pin_path = root.join(PIN_PATH);
+    let pin = fs::read_to_string(&pin_path)
+        .with_context(|| format!("failed to read OpenModelica pin {}", pin_path.display()))?;
+    canonical_release(&pin)
+        .with_context(|| format!("invalid OpenModelica pin {}", pin_path.display()))
+}
+
+fn canonical_release(raw: &str) -> Result<String> {
+    let release = raw.trim().split('~').next().unwrap_or_default();
+    let mut components = split_path_with_indices(release).into_iter();
+    let major = release_component(components.next(), "major")?;
+    let minor = release_component(components.next(), "minor")?;
+    let patch = release_component(components.next(), "patch")?;
+    ensure!(
+        components.next().is_none(),
+        "expected exactly major.minor.patch, got `{release}`"
+    );
+    Ok(format!("{major}.{minor}.{patch}"))
+}
+
+fn release_component(component: Option<&str>, label: &str) -> Result<u64> {
+    let component = component.unwrap_or_default();
+    ensure!(
+        !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit()),
+        "invalid {label} release component `{component}`"
+    );
+    component
+        .parse::<u64>()
+        .with_context(|| format!("invalid {label} release component `{component}`"))
+}
+
+fn run_version_command(program: &Path) -> Result<Output> {
+    Command::new(program)
+        .arg("--version")
+        .output()
+        .map_err(|error| match error.kind() {
+            ErrorKind::NotFound => anyhow::anyhow!(
+                "OpenModelica executable `{}` was not found. Install the pinned OpenModelica release, then run `cargo xtask verify omc`.",
+                program.display()
+            ),
+            _ => anyhow::anyhow!(
+                "failed to start OpenModelica executable `{}` for `--version`: {error}",
+                program.display()
+            ),
+        })
+}
+
+fn release_from_version_output(output: &str) -> Result<String> {
+    let line = output
+        .lines()
+        .find(|line| line.trim_start().starts_with("OpenModelica"))
+        .unwrap_or_default();
+    let version = line
+        .trim_start()
+        .strip_prefix("OpenModelica")
+        .unwrap_or_default()
+        .trim_start();
+    let token = version.split_whitespace().next().unwrap_or_default();
+    let semver = token
+        .trim_start_matches('v')
+        .split(|character: char| !character.is_ascii_digit() && character != '.')
+        .next()
+        .unwrap_or_default();
+    canonical_release(semver)
+}
+
+fn run_workspace_smoke(root: &Path, program: &Path) -> Result<()> {
+    let workspace_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize workspace root {}", root.display()))?;
+    let smoke_dir = tempfile::tempdir_in(&workspace_root).with_context(|| {
+        format!(
+            "failed to create workspace-local OMC smoke directory in {}",
+            workspace_root.display()
+        )
+    })?;
+    let script = smoke_dir.path().join("rumoca-omc-preflight.mos");
+    fs::write(&script, SMOKE_SCRIPT)
+        .with_context(|| format!("failed to write OMC smoke script {}", script.display()))?;
+    let output = Command::new(program)
+        .arg(&script)
+        .current_dir(&workspace_root)
+        .output()
+        .with_context(|| format!("failed to run OMC smoke script {}", script.display()))?;
+    let captured = captured_output(&output);
+    if !output.status.success() {
+        bail!(
+            "OpenModelica smoke script failed (status={}).{}",
+            output.status,
+            failure_guidance(&captured),
+        );
+    }
+    ensure!(
+        captured.contains(SMOKE_MARKER),
+        "OpenModelica smoke script completed without `{SMOKE_MARKER}`.{}",
+        format_output(&captured),
+    );
+    Ok(())
+}
+
+fn captured_output(output: &Output) -> String {
+    format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+fn format_output(output: &str) -> String {
+    format!("\nCaptured output:\n{output}")
+}
+
+fn failure_guidance(output: &str) -> String {
+    if is_container_runtime_storage_failure(output) {
+        format!(
+            "\nDetected container-runtime storage I/O failure. Restart the default Colima profile without deleting data: `colima stop && colima start`; then rerun `cargo xtask verify omc`.{}",
+            format_output(output)
+        )
+    } else {
+        format_output(output)
+    }
+}
+
+fn is_container_runtime_storage_failure(output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    output.contains("input/output error")
+        && (output.contains("docker") || output.contains("containerd"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::run_with_program;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    const PIN: &str = "1.27.0~1-gd7e2907-1";
+
+    fn test_root() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("create workspace root");
+        fs::create_dir_all(root.path().join("toolchains")).expect("create toolchains dir");
+        fs::write(root.path().join("toolchains/openmodelica-version"), PIN)
+            .expect("write OpenModelica pin");
+        root
+    }
+
+    fn write_omc(root: &Path, name: &str, body: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake omc");
+        let mut permissions = fs::metadata(&path)
+            .expect("read fake omc metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("make fake omc executable");
+        path
+    }
+
+    #[test]
+    fn accepts_pinned_healthy_version_and_workspace_smoke_script() {
+        let root = test_root();
+        let omc = write_omc(
+            root.path(),
+            "healthy-omc",
+            r#"
+if [ "$1" = "--version" ]; then
+  printf '%s\\n' 'OpenModelica 1.27.0'
+  exit 0
+fi
+case "$1" in
+  "$PWD"/*.mos) ;;
+  *) printf '%s\\n' 'smoke script was not workspace-local' >&2; exit 13 ;;
+esac
+printf '%s\\n' 'OMC_PREFLIGHT_OK'
+"#,
+        );
+
+        run_with_program(root.path(), &omc).expect("healthy OMC must pass preflight");
+    }
+
+    #[test]
+    fn reports_a_missing_omc_executable() {
+        let root = test_root();
+        let error = run_with_program(root.path(), &root.path().join("missing-omc"))
+            .expect_err("missing OMC must fail preflight");
+
+        assert!(error.to_string().contains("not found"), "{error:#}");
+    }
+
+    #[test]
+    fn classifies_container_runtime_storage_io_from_version_failure() {
+        let root = test_root();
+        let omc = write_omc(
+            root.path(),
+            "storage-io-omc",
+            r#"
+printf '%s\\n' 'docker: failed to create task: containerd: input/output error' >&2
+exit 23
+"#,
+        );
+
+        let error = run_with_program(root.path(), &omc)
+            .expect_err("container storage failure must fail preflight");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("container-runtime storage"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("colima stop && colima start"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_wrong_openmodelica_release() {
+        let root = test_root();
+        let omc = write_omc(
+            root.path(),
+            "wrong-release-omc",
+            r#"
+if [ "$1" = "--version" ]; then
+  printf '%s\\n' 'OpenModelica 1.26.3'
+  exit 0
+fi
+printf '%s\\n' 'OMC_PREFLIGHT_OK'
+"#,
+        );
+
+        let error =
+            run_with_program(root.path(), &omc).expect_err("wrong OMC release must fail preflight");
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("release mismatch"), "{diagnostic}");
+        assert!(diagnostic.contains("expected 1.27.0"), "{diagnostic}");
+        assert!(diagnostic.contains("observed 1.26.3"), "{diagnostic}");
+    }
+
+    #[test]
+    fn reports_smoke_script_failure_after_a_healthy_version() {
+        let root = test_root();
+        let omc = write_omc(
+            root.path(),
+            "smoke-failure-omc",
+            r#"
+if [ "$1" = "--version" ]; then
+  printf '%s\\n' 'OpenModelica 1.27.0'
+  exit 0
+fi
+printf '%s\\n' 'fake smoke failure' >&2
+exit 19
+"#,
+        );
+
+        let error =
+            run_with_program(root.path(), &omc).expect_err("smoke failure must fail preflight");
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("smoke script failed"), "{diagnostic}");
+        assert!(diagnostic.contains("fake smoke failure"), "{diagnostic}");
+    }
+}

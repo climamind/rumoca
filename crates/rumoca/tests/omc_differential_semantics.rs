@@ -1,5 +1,6 @@
 use std::fs;
-use std::process::Command;
+use std::io;
+use std::process::{Command, Output};
 
 use tempfile::tempdir_in;
 
@@ -12,15 +13,35 @@ package P
 end P;
 "#;
 
-fn omc_available() -> bool {
-    Command::new("omc").arg("--version").output().is_ok()
+#[derive(Debug, PartialEq, Eq)]
+enum OmcPrerequisite {
+    SkipMissing,
+    Ready,
+}
+
+fn omc_prerequisite_decision(result: io::Result<Output>) -> Result<OmcPrerequisite, String> {
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(OmcPrerequisite::SkipMissing),
+        Err(error) => Err(format!("failed to start `omc --version`: {error}")),
+        Ok(output) if output.status.success() => Ok(OmcPrerequisite::Ready),
+        Ok(output) => Err(format!(
+            "`omc --version` failed with status={}.\nstdout:\n{}\nstderr:\n{}\nRun `cargo xtask verify omc` to diagnose the OpenModelica runtime before retrying this differential test.",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )),
+    }
 }
 
 #[test]
 fn encapsulated_scope_rejection_matches_omc() {
-    if !omc_available() {
-        eprintln!("skipping OMC differential test: omc not available");
-        return;
+    match omc_prerequisite_decision(Command::new("omc").arg("--version").output()) {
+        Ok(OmcPrerequisite::SkipMissing) => {
+            eprintln!("skipping OMC differential test: omc executable not found");
+            return;
+        }
+        Ok(OmcPrerequisite::Ready) => {}
+        Err(diagnostic) => panic!("OMC differential-test prerequisite is unhealthy:\n{diagnostic}"),
     }
 
     let cwd = std::env::current_dir().expect("current dir");
@@ -63,4 +84,27 @@ getErrorString();
         err_text.contains("unresolved component reference: 'c'"),
         "expected Rumoca unresolved-name diagnostic, got:\n{err_text}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn omc_prerequisite_skips_only_when_the_executable_is_absent() {
+    let missing = omc_prerequisite_decision(Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "omc not found",
+    )))
+    .expect("missing OMC should be the explicit skip case");
+    assert_eq!(missing, OmcPrerequisite::SkipMissing);
+
+    let unhealthy = Command::new("sh")
+        .args([
+            "-c",
+            "printf '%s\\n' 'containerd: input/output error' >&2; exit 23",
+        ])
+        .output();
+    let error = omc_prerequisite_decision(unhealthy)
+        .expect_err("present but unhealthy OMC must be actionable");
+    assert!(error.contains("status=exit status: 23"), "{error}");
+    assert!(error.contains("containerd: input/output error"), "{error}");
+    assert!(error.contains("cargo xtask verify omc"), "{error}");
 }

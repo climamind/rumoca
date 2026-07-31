@@ -55,6 +55,24 @@ and local installations and CI must report the exact `major.minor.patch`
 release implied by the package pin before a full MSL result is comparable. The
 CI installer rejects older, silently upgraded, pre-release, and build outputs.
 
+Run the reusable preflight before diagnosing MSL parity failures:
+
+```bash
+cargo xtask verify omc
+```
+
+The gate validates the canonical release and executes a workspace-local `.mos`
+smoke script. Direct `cargo xtask verify msl-parity` invokes it before MSL setup,
+except a merge-only shard fan-in that performs no OMC execution. Native
+Linux/CI OpenModelica is supported without Docker or Colima. If Docker or
+containerd reports an `input/output error`, the gate reports it as a runtime
+storage failure and only suggests the non-destructive recovery command
+`colima stop && colima start`; it never restarts or deletes runtime state.
+The Cargo-native focused differential test remains
+`cargo test -p rumoca --test omc_differential_semantics -- --nocapture`: it skips
+only if the `omc` executable is absent, while a present but unhealthy runtime
+fails with captured diagnostics and points back to `cargo xtask verify omc`.
+
 Rust-only workflows do not require Node/npm:
 
 ```bash
@@ -124,6 +142,7 @@ cargo xtask vscode package --target linux-x64
 MSL/reference maintenance:
 
 ```bash
+cargo xtask verify omc
 cargo xtask verify msl-parity
 cargo xtask repo msl omc-reference
 cargo xtask repo msl flamegraph --model Modelica.Electrical.Digital.Examples.DFFREG --mode compile
