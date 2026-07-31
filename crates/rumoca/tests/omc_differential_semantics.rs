@@ -22,7 +22,9 @@ enum OmcPrerequisite {
 fn omc_prerequisite_decision(result: io::Result<Output>) -> Result<OmcPrerequisite, String> {
     match result {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(OmcPrerequisite::SkipMissing),
-        Err(error) => Err(format!("failed to start `omc --version`: {error}")),
+        Err(error) => Err(format!(
+            "failed to start `omc --version`: {error}\nRun `cargo xtask verify omc` to diagnose the OpenModelica runtime before retrying this differential test."
+        )),
         Ok(output) if output.status.success() => Ok(OmcPrerequisite::Ready),
         Ok(output) => Err(format!(
             "`omc --version` failed with status={}.\nstdout:\n{}\nstderr:\n{}\nRun `cargo xtask verify omc` to diagnose the OpenModelica runtime before retrying this differential test.",
@@ -106,5 +108,23 @@ fn omc_prerequisite_skips_only_when_the_executable_is_absent() {
         .expect_err("present but unhealthy OMC must be actionable");
     assert!(error.contains("status=exit status: 23"), "{error}");
     assert!(error.contains("containerd: input/output error"), "{error}");
+    assert!(error.contains("cargo xtask verify omc"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn omc_prerequisite_points_to_gate_when_present_but_not_executable() {
+    let temp = tempfile::tempdir().expect("create temporary OMC directory");
+    let omc = temp.path().join("omc");
+    fs::write(&omc, "#!/bin/sh\nexit 0\n").expect("write non-executable OMC file");
+
+    let launch = Command::new(&omc).arg("--version").output();
+    assert!(
+        matches!(launch.as_ref(), Err(error) if error.kind() == io::ErrorKind::PermissionDenied),
+        "expected a real permission-denied launch error, got {launch:?}"
+    );
+    let error = omc_prerequisite_decision(launch)
+        .expect_err("present but non-executable OMC must be actionable");
+    assert!(error.contains("failed to start `omc --version`"), "{error}");
     assert!(error.contains("cargo xtask verify omc"), "{error}");
 }
