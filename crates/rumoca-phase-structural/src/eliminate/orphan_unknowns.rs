@@ -103,7 +103,16 @@ fn exact_structured_scalar_lhs_owner(
         }
     }
     let name = component_ref.to_var_name();
-    let variable = crate::variable_scope::DaeVariableScope::new(dae).exact(&name)?;
+    let scope = crate::variable_scope::DaeVariableScope::new(dae);
+    let variable = scope.exact(&name)?;
+    let (base, selectors) = lhs_base_and_selectors(lhs)?;
+    if !selectors.is_empty()
+        && let Some(base_var) = scope.exact(&base)
+        && projected_lhs_owner_names(dae, &base, &base_var.dims, selectors, scalar_count)
+            .is_none_or(|owned| owned.as_slice() != std::slice::from_ref(&name))
+    {
+        return None;
+    }
     variable.dims.is_empty().then_some(name)
 }
 
