@@ -74,6 +74,36 @@ pub(super) fn lower_direct_dae_for_gpu_preparation(
     Ok(solve_model)
 }
 
+pub(super) fn try_lower_direct_dae_for_gpu_preparation(
+    dae_model: &dae::Dae,
+) -> Result<Option<solve::SolveModel>, rumoca_phase_solve::SolveModelLowerError> {
+    validate_gpu_dae_admission(dae_model)?;
+    let metadata_dae = attach_reference_metadata(dae_model)?;
+    let lowered = metadata_dae.clone();
+    match rumoca_phase_solve::lower_dae_to_solve_model_owned_for_gpu_preparation_with_metadata(
+        lowered,
+        &metadata_dae,
+    ) {
+        Ok(model) => Ok(Some(model)),
+        Err(error) => {
+            trace_direct_rejection(format!(
+                "direct GPU-preparation lowering failed before structural fallback: {error}"
+            ));
+            Ok(None)
+        }
+    }
+}
+
+pub(super) fn gpu_dae_requires_direct_initialization(dae_model: &dae::Dae) -> bool {
+    !dae_model.initialization.structured_equations.is_empty()
+        || dae_model.initialization.equations.len()
+            != dae_model.initialization.equation_provenance.len()
+        || dae_model
+            .initialization
+            .equation_provenance
+            .contains(&dae::InitializationEquationProvenance::User)
+}
+
 /// GPU preparation has no event/discrete runtime payload.  Reject these DAE
 /// forms before the direct path attempts lowering; falling through to the
 /// structural path would otherwise hide a semantic admission failure.
@@ -423,7 +453,7 @@ fn trace_direct_rejection(reason: impl AsRef<str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_gpu_dae_admission;
+    use super::{gpu_dae_requires_direct_initialization, validate_gpu_dae_admission};
     use rumoca_core::{Expression, Literal, SourceId, Span, VarName};
     use rumoca_ir_dae as dae;
 
@@ -513,5 +543,41 @@ mod tests {
         let error = validate_gpu_dae_admission(&dae_model)
             .expect_err("initial parameter target must reject");
         assert!(error.to_string().contains("initial P-slot target"));
+    }
+
+    #[test]
+    fn gpu_structural_fallback_never_owns_user_or_structured_initialization() {
+        let mut user = dae::Dae::default();
+        user.initialization.equations.push(equation());
+        user.initialization
+            .equation_provenance
+            .push(dae::InitializationEquationProvenance::User);
+        assert!(gpu_dae_requires_direct_initialization(&user));
+
+        let mut structured = dae::Dae::default();
+        structured
+            .initialization
+            .structured_equations
+            .push(dae::StructuredEquationFamily {
+                domain: rumoca_core::StructuredIndexDomain {
+                    binders: Vec::new(),
+                },
+                first_equation_index: 0,
+                equation_counts: Vec::new(),
+                span: span(),
+                origin: "strict structured fixture".to_string(),
+                regular: None,
+                template: None,
+                interiors_materialized: true,
+            });
+        assert!(gpu_dae_requires_direct_initialization(&structured));
+
+        let mut fixed = dae::Dae::default();
+        fixed.initialization.equations.push(equation());
+        fixed
+            .initialization
+            .equation_provenance
+            .push(dae::InitializationEquationProvenance::FixedStart);
+        assert!(!gpu_dae_requires_direct_initialization(&fixed));
     }
 }

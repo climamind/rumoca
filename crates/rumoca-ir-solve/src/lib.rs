@@ -21,10 +21,10 @@ use rumoca_core::{
 use serde::{Deserialize, Serialize};
 
 pub use initialization_validation::InitializationTargetRange;
+pub use initialization_validation::validate_compact_gpu_initialization;
 use initialization_validation::{
     initialization_stored_row_count, validate_initialization_direct_families,
 };
-
 pub use layout::{
     ComponentReferenceKey, ComponentReferenceKeyError, ComponentReferenceKeyErrorKind,
     ComponentReferenceKeyPart, ComponentReferenceSubscriptKey, IndexedScalarSlot, ScalarSlot,
@@ -38,7 +38,6 @@ pub use visitor::{
     LinearOpSliceKind, SolveVisitor, VisitScope, walk_compute_block, walk_compute_node,
     walk_scalar_program_block, walk_solve_artifacts, walk_solve_model, walk_solve_problem,
 };
-
 pub const SOLVE_SCHEMA_VERSION: u16 = 16;
 
 pub fn source_span_from_offsets(source: u64, start: usize, end: usize) -> Span {

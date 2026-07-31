@@ -119,9 +119,9 @@ structural-parameter values are available only after instantiation.
 
 ### 5. Evaluation Decoupled from Representation
 
-Evaluation follows IR ownership: `rumoca-eval-ast`, `rumoca-eval-flat`,
-`rumoca-eval-dae`, and solver-facing `rumoca-eval-solve`. Entry points stay
-representation-specific; cross-layer helpers must not hide ownership.
+Evaluation follows IR ownership across `rumoca-eval-ast`, `rumoca-eval-flat`,
+`rumoca-eval-dae`, and solver-facing `rumoca-eval-solve`; entry points remain
+representation-specific.
 
 Phase crates MAY depend on the evaluation crate for the IR they are actively processing
 when the phase needs compile-time evaluation of that representation. For example,
@@ -241,10 +241,10 @@ compiler/session → DAE structural → solve-IR lowering → runtime contracts 
 |---|---|---|
 | Compilation/session orchestration | `rumoca-compile` | Coordinates pipeline; no runtime |
 | DAE structural analysis (Pantelides, BLT, tearing, demotion) | `rumoca-phase-structural` | SPEC_0007 §Structural Transformation Scope |
-| Solver-facing prepared data + row ops | `rumoca-ir-solve` | Backend-neutral execution IR |
+| Solver-facing prepared data + row ops | `rumoca-ir-solve` | Backend-neutral IR and compact-initialization admission |
 | DAE → solve-IR lowering | `rumoca-phase-solve` | Proves compact GPU order; no structural mutation |
 | Compact Map evaluation | `rumoca-eval-solve` | No scalar reconstruction |
-| GPU initialization settlement | `rumoca-sim` | Compact GPU projection/verification; solver-free |
+| GPU initialization settlement | `rumoca-sim` | Reuses Solve-IR admission; solver-free projection/verification |
 | Optimization/training orchestration | `rumoca-opt` | Consumes Solve/eval APIs; no Modelica semantics |
 | Textual generated artifacts and templates | `rumoca-phase-codegen` | Jinja/minijinja rendering owns generated C, Rust, CUDA C, MLIR, FMI/eFMI and FMU/eFMU packaging text |
 | GALEC `.alg` text (recorded exception) | `rumoca-ir-galec` | Typed AST printing per eFMI conformance; routed via template context (SPEC_0034 GAL-009) |

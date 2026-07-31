@@ -23,15 +23,33 @@ fn direct_initialization_family(
     target_strides: Vec<AffineStencilIndexStrideTerm>,
 ) -> (ComputeNode, InitializationDirectFamily) {
     let domain = test_tensor_domain(3);
+    let target_load_strides = if target_strides.is_empty() {
+        Vec::new()
+    } else {
+        vec![AffineStencilLoadStride {
+            op_position: 0,
+            terms: target_strides.clone(),
+        }]
+    };
     let node = ComputeNode::Map {
         output_map: TensorOutputMap::dense_contiguous(node_index * 3, &domain)
             .expect("dense residual map"),
         domain,
         base_ops: vec![
-            LinearOp::Const { dst: 0, value: 0.0 },
-            LinearOp::StoreOutput { src: 0 },
+            LinearOp::LoadY {
+                dst: 0,
+                index: target_start,
+            },
+            LinearOp::Const { dst: 1, value: 0.0 },
+            LinearOp::Binary {
+                op: BinaryOp::Sub,
+                lhs: 0,
+                rhs: 1,
+                dst: 2,
+            },
+            LinearOp::StoreOutput { src: 2 },
         ],
-        load_strides: Vec::new(),
+        load_strides: target_load_strides,
         const_strides: Vec::new(),
         metadata: TensorNodeMetadata::default(),
         span: fixture_span(),
@@ -213,6 +231,145 @@ fn complete_compact_initialization() -> InitializationSolveSystem {
         },
         ..Default::default()
     }
+}
+
+fn assert_compact_wire_rejects(initialization: InitializationSolveSystem, expected: &str) {
+    let problem = SolveProblem {
+        layout: make_layout(&[("x", vec![3])], &[]),
+        initialization,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&problem).expect("serialize invalid compact JSON");
+    let json_error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("invalid compact JSON must fail semantic admission");
+    assert!(json_error.to_string().contains(expected), "{json_error}");
+    let bytes = bincode::serialize(&problem).expect("serialize invalid compact bincode");
+    let bincode_error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("invalid compact bincode must fail semantic admission");
+    assert!(
+        bincode_error.to_string().contains(expected),
+        "{bincode_error}"
+    );
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_constant_zero_map() {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map { base_ops, .. } = &mut initialization.residual.nodes[0] else {
+        unreachable!()
+    };
+    *base_ops = vec![
+        LinearOp::Const { dst: 0, value: 0.0 },
+        LinearOp::StoreOutput { src: 0 },
+    ];
+    assert_compact_wire_rejects(initialization, "target LoadY");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_wrong_target_load_and_sign() {
+    let mut wrong_load = complete_compact_initialization();
+    let ComputeNode::Map { base_ops, .. } = &mut wrong_load.residual.nodes[0] else {
+        unreachable!()
+    };
+    let LinearOp::LoadY { index, .. } = &mut base_ops[0] else {
+        unreachable!()
+    };
+    *index = 1;
+    assert_compact_wire_rejects(wrong_load, "target LoadY");
+
+    let mut wrong_map = complete_compact_initialization();
+    let ComputeNode::Map { load_strides, .. } = &mut wrong_map.residual.nodes[0] else {
+        unreachable!()
+    };
+    load_strides.clear();
+    assert_compact_wire_rejects(wrong_map, "affine map");
+
+    let mut wrong_sign = complete_compact_initialization();
+    wrong_sign.direct_families[0].residual_sign = -1;
+    assert_compact_wire_rejects(wrong_sign, "residual direction");
+}
+
+fn dependent_compact_initialization(cycle: bool) -> InitializationSolveSystem {
+    let dense = vec![AffineStencilIndexStrideTerm {
+        dimension: 0,
+        stride: 1,
+    }];
+    let (mut first_node, mut first_family) = direct_initialization_family(0, 0, dense.clone());
+    let (mut second_node, mut second_family) = direct_initialization_family(1, 3, dense);
+    let second_span = Span::from_offsets(
+        SourceId::from_source_name("ir_solve_second_family.mo"),
+        10,
+        20,
+    );
+    second_family.span = second_span;
+    if let ComputeNode::Map { span, base_ops, .. } = &mut second_node {
+        *span = second_span;
+        base_ops[1] = LinearOp::LoadY { dst: 1, index: 0 };
+    }
+    if cycle {
+        let ComputeNode::Map { base_ops, .. } = &mut first_node else {
+            unreachable!()
+        };
+        base_ops[1] = LinearOp::LoadY { dst: 1, index: 3 };
+    }
+    first_family.span = fixture_span();
+    InitializationSolveSystem {
+        residual: ComputeBlock {
+            nodes: vec![first_node, second_node],
+        },
+        direct_families: vec![first_family, second_family],
+        required_target_ranges: vec![InitializationTargetRange {
+            start: 0,
+            end: 6,
+            span: fixture_span(),
+        }],
+        projection_plan: AlgebraicProjectionPlan {
+            blocks: vec![
+                AlgebraicProjectionBlock {
+                    rows: vec![0],
+                    y_indices: vec![0],
+                    causal_steps: Vec::new(),
+                },
+                AlgebraicProjectionBlock {
+                    rows: vec![1],
+                    y_indices: vec![3],
+                    causal_steps: Vec::new(),
+                },
+            ],
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_dependency_reorder() {
+    let mut initialization = dependent_compact_initialization(false);
+    initialization.projection_plan.blocks.swap(0, 1);
+    let problem = SolveProblem {
+        layout: make_layout(&[("x", vec![6])], &[]),
+        initialization,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&problem).expect("serialize reordered compact JSON");
+    let error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("dependency reorder must fail JSON admission");
+    assert!(error.to_string().contains("dependency order"), "{error}");
+    let bytes = bincode::serialize(&problem).expect("serialize reordered compact bincode");
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("dependency reorder must fail bincode admission");
+    assert!(error.to_string().contains("dependency order"), "{error}");
+}
+
+#[test]
+fn compact_initialization_cycle_reports_first_blocked_owner_span() {
+    let initialization = dependent_compact_initialization(true);
+    let error = validate_compact_gpu_initialization(&initialization, 6)
+        .expect_err("direct dependency cycle must fail admission");
+    assert!(error.to_string().contains("dependency order"), "{error}");
+    assert_eq!(
+        error.source_span(),
+        Some(initialization.direct_families[0].span)
+    );
 }
 
 #[test]

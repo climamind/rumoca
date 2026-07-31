@@ -85,6 +85,8 @@ pub(super) type IndexedBindingMap = Arc<IndexMap<ComponentReferenceKey, Vec<Inde
 pub(crate) struct InitialResidualVisitMetrics {
     pub(crate) peak_owned_rows: usize,
     pub(crate) retained_indexed_context_entries: usize,
+    pub(crate) retained_direct_assignment_entries: usize,
+    pub(crate) retained_structural_binding_entries: usize,
 }
 
 #[derive(Clone)]

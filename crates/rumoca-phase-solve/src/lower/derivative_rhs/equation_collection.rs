@@ -153,6 +153,101 @@ pub(in crate::lower) fn collect_missing_indexed_record_field_assignments(
     Ok(missing)
 }
 
+/// Resolve only the missing indexed-record assignments referenced by one proof
+/// cell. This avoids retaining (or even materializing) the model-wide
+/// O(elements) direct-assignment table during compact initialization proof.
+pub(in crate::lower) fn collect_referenced_missing_indexed_record_field_assignments(
+    dae_model: &dae::Dae,
+    expression: &rumoca_core::Expression,
+    layout: &VarLayout,
+    structural_bindings: &IndexMap<String, f64>,
+) -> Result<IndexMap<String, DirectAssignmentValue>, LowerError> {
+    #[derive(Default)]
+    struct References(indexmap::IndexSet<String>);
+    impl rumoca_core::ExpressionVisitor for References {
+        fn visit_var_ref(
+            &mut self,
+            name: &rumoca_core::Reference,
+            subscripts: &[rumoca_core::Subscript],
+        ) {
+            self.0.insert(name.as_str().to_string());
+            self.walk_var_ref(name, subscripts);
+        }
+    }
+    let mut references = References::default();
+    rumoca_core::ExpressionVisitor::visit_expression(&mut references, expression);
+    references
+        .0
+        .retain(|key| layout.binding(key).is_none() && has_indexed_record_field_segment(key));
+    if references.0.is_empty() {
+        return Ok(IndexMap::new());
+    }
+
+    let mut assignments = IndexMap::new();
+    for equation in &dae_model.continuous.equations {
+        let Some((target, rhs)) = direct_assignment_target_rhs(equation)? else {
+            continue;
+        };
+        let target_key = target.as_str();
+        if dae_model.variables.states.contains_key(&target) {
+            continue;
+        }
+        if references.0.contains(target_key) {
+            assignments.insert(
+                target_key.to_string(),
+                DirectAssignmentValue::full(rhs.clone(), equation.span),
+            );
+        }
+        for requested in &references.0 {
+            if dae::component_base_name(requested).as_deref() != Some(target_key) {
+                continue;
+            }
+            let Some((base, dims, size)) = direct_assignment_shape(
+                dae_model,
+                &IndexMap::new(),
+                target_key,
+                equation.scalar_count,
+                &rhs,
+                structural_bindings,
+                equation.span,
+            )?
+            else {
+                continue;
+            };
+            let flat_index = (0..size)
+                .find(|flat_index| {
+                    dae::scalar_name_text_for_flat_index(&base, &dims, *flat_index) == *requested
+                })
+                .ok_or_else(|| {
+                    LowerError::contract_violation(
+                        format!(
+                            "indexed record-field reference `{requested}` is outside assignment `{target_key}`"
+                        ),
+                        equation.span,
+                    )
+                })?;
+            let repeat_period = direct_assignment_repeat_period(
+                dae_model,
+                &IndexMap::new(),
+                &dims,
+                &rhs,
+                structural_bindings,
+                equation.span,
+            )?;
+            assignments.insert(
+                requested.clone(),
+                DirectAssignmentValue::scalar(
+                    rhs.clone(),
+                    flat_index,
+                    repeat_period,
+                    equation.span,
+                ),
+            );
+        }
+    }
+    Ok(assignments)
+}
+
 pub(in crate::lower) fn has_indexed_record_field_segment(key: &str) -> bool {
     crate::path_utils::segments(key)
         .iter()
@@ -1516,5 +1611,44 @@ mod tests {
         let err = direct_assignment_target_rhs(&equation)
             .expect_err("invalid eligible direct-assignment target should fail");
         assert_eq!(err.source_span(), Some(span(3, 4)));
+    }
+
+    fn indexed_record_assignment_fixture(count: usize) -> dae::Dae {
+        let mut dae_model = dae::Dae::new();
+        for index in 1..=count {
+            let name = format!("records[{index}].field");
+            dae_model.continuous.equations.push(dae::Equation::explicit(
+                rumoca_core::VarName::new(&name),
+                literal(index as i64, span(index, index + 1)),
+                span(index, index + 1),
+                "indexed record assignment",
+            ));
+        }
+        dae_model
+    }
+
+    fn retained_assignment_count_for_last_record(count: usize) -> usize {
+        let dae_model = indexed_record_assignment_fixture(count);
+        let key = format!("records[{count}].field");
+        let expression = var_ref(&key, Vec::new(), span(count, count + 1));
+        let layout = VarLayout::from_parts(IndexMap::new(), 0, 0);
+        collect_referenced_missing_indexed_record_field_assignments(
+            &dae_model,
+            &expression,
+            &layout,
+            &IndexMap::new(),
+        )
+        .expect("one indexed-record proof cell should resolve lazily")
+        .len()
+    }
+
+    #[test]
+    fn indexed_record_direct_assignment_retained_state_is_constant_n1_n128() {
+        assert_eq!(retained_assignment_count_for_last_record(1), 1);
+        assert_eq!(
+            retained_assignment_count_for_last_record(128),
+            1,
+            "lazy proof lookup must not retain the other 127 indexed-record assignments"
+        );
     }
 }

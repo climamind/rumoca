@@ -47,6 +47,23 @@ pub(super) fn initialization_stored_row_count(
     Ok(rows)
 }
 
+/// Validate the complete compact GPU-initialization contract.
+///
+/// This is the single semantic admission gate shared by wire deserialization
+/// and the simulation runtime. It deliberately proves the direct assignment
+/// meaning, not only the surrounding vector shapes.
+pub fn validate_compact_gpu_initialization(
+    initialization: &InitializationSolveSystem,
+    y_upper_bound: usize,
+) -> Result<(), SolveProblemShapeContractError> {
+    initialization
+        .residual
+        .validate_shape_contract("initialization.residual")?;
+    let residual_row_count =
+        initialization_stored_row_count(&initialization.residual, "initialization.residual rows")?;
+    validate_initialization_direct_families(initialization, y_upper_bound, residual_row_count)
+}
+
 pub(super) fn validate_initialization_direct_families(
     initialization: &InitializationSolveSystem,
     y_upper_bound: usize,
@@ -64,11 +81,15 @@ pub(super) fn validate_initialization_direct_families(
         0,
         initialization.row_targets.len(),
     )?;
-    validate_count(
-        "initialization.direct_families",
-        initialization.residual.nodes.len(),
-        initialization.direct_families.len(),
-    )?;
+    if initialization.residual.nodes.len() != initialization.direct_families.len() {
+        let family = initialization.direct_families.first().ok_or_else(|| {
+            initialization_range_error("direct families must own every residual node exactly once")
+        })?;
+        return Err(direct_semantic_error(
+            family,
+            "direct families must own every residual node exactly once",
+        ));
+    }
     let mut covered_nodes = vec![false; initialization.residual.nodes.len()];
     let mut target_ranges = Vec::with_capacity(initialization.direct_families.len());
     for family in &initialization.direct_families {
@@ -105,7 +126,7 @@ pub(super) fn validate_initialization_direct_families(
             });
         }
     }
-    validate_compact_direct_projection_plan(initialization)?;
+    validate_compact_direct_projection_plan(initialization, &target_ranges)?;
     let direct_ranges = target_ranges
         .into_iter()
         .map(|(range, _, span)| InitializationTargetRange {
@@ -155,6 +176,7 @@ fn validate_compact_target_coverage(
 
 fn validate_compact_direct_projection_plan(
     initialization: &InitializationSolveSystem,
+    target_ranges: &[(std::ops::Range<usize>, usize, Span)],
 ) -> Result<(), SolveProblemShapeContractError> {
     if !initialization.projection_indices.is_empty() {
         return Err(compact_projection_error(
@@ -170,6 +192,28 @@ fn validate_compact_direct_projection_plan(
             "compact direct projection must own every direct family exactly once",
         ));
     }
+    let ranges_by_family = initialization
+        .direct_families
+        .iter()
+        .map(|family| {
+            target_ranges
+                .iter()
+                .find(|(_, node_index, _)| *node_index == family.node_index)
+                .map(|(range, _, _)| range.clone())
+                .ok_or_else(|| {
+                    compact_projection_error(
+                        initialization,
+                        family.node_index,
+                        "compact direct projection is missing a target owner",
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let dependencies = initialization
+        .direct_families
+        .iter()
+        .map(|family| direct_family_dependencies(initialization, family, &ranges_by_family))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut seen = vec![false; initialization.direct_families.len()];
     for (block_index, block) in initialization.projection_plan.blocks.iter().enumerate() {
         let [family_index] = block.rows.as_slice() else {
@@ -186,7 +230,7 @@ fn validate_compact_direct_projection_plan(
                 "compact direct projection family index is out of bounds",
             ));
         };
-        if std::mem::replace(&mut seen[*family_index], true) {
+        if seen[*family_index] {
             return Err(compact_projection_error(
                 initialization,
                 block_index,
@@ -200,6 +244,19 @@ fn validate_compact_direct_projection_plan(
                 "compact direct projection block has an invalid target anchor",
             ));
         }
+        if dependencies[*family_index]
+            .iter()
+            .copied()
+            .any(|owner| !seen[owner])
+        {
+            return Err(SolveProblemShapeContractError::ZeroTensorDimension {
+                context: "initialization.projection_plan".to_string(),
+                node_index: block_index,
+                dimension: "compact direct projection violates dependency order",
+                span: family.span,
+            });
+        }
+        seen[*family_index] = true;
     }
     Ok(())
 }
@@ -353,7 +410,14 @@ fn validate_initialization_direct_family(
             span: family.span,
         });
     };
-    let ComputeNode::Map { domain, span, .. } = node else {
+    let ComputeNode::Map {
+        domain,
+        base_ops,
+        load_strides,
+        span,
+        ..
+    } = node
+    else {
         return Err(SolveProblemShapeContractError::ZeroTensorDimension {
             context: "initialization.direct_families".to_string(),
             node_index: family.node_index,
@@ -395,5 +459,196 @@ fn validate_initialization_direct_family(
             Some(*span),
         )
     })?;
+    validate_direct_map_semantics(family, base_ops, load_strides)?;
     Ok(family.targets.start..end)
+}
+
+fn validate_direct_map_semantics(
+    family: &InitializationDirectFamily,
+    base_ops: &[LinearOp],
+    load_strides: &[AffineStencilLoadStride],
+) -> Result<(), SolveProblemShapeContractError> {
+    let mut target_loads = base_ops
+        .iter()
+        .enumerate()
+        .filter_map(|(position, op)| match op {
+            LinearOp::LoadY { dst, index } if *index == family.targets.start => {
+                Some((position, *dst))
+            }
+            _ => None,
+        });
+    let Some((target_position, target_register)) = target_loads.next() else {
+        return Err(direct_semantic_error(
+            family,
+            "direct Map is missing its target LoadY",
+        ));
+    };
+    if target_loads.next().is_some() {
+        return Err(direct_semantic_error(
+            family,
+            "direct Map has more than one target LoadY",
+        ));
+    }
+    let mut target_terms = Vec::new();
+    for stride in load_strides
+        .iter()
+        .filter(|stride| stride.op_position == target_position)
+    {
+        target_terms.extend(stride.terms.iter().cloned());
+    }
+    target_terms.sort_unstable_by_key(|term| term.dimension);
+    let mut expected_terms = family.targets.strides.clone();
+    expected_terms.sort_unstable_by_key(|term| term.dimension);
+    if target_terms != expected_terms {
+        return Err(direct_semantic_error(
+            family,
+            "direct target LoadY affine map does not match family.targets",
+        ));
+    }
+    let Some(LinearOp::StoreOutput { src }) = base_ops.last() else {
+        return Err(direct_semantic_error(
+            family,
+            "direct Map is missing terminal StoreOutput",
+        ));
+    };
+    let mut producers = base_ops.iter().filter_map(|op| match op {
+        LinearOp::Binary {
+            op: BinaryOp::Sub,
+            lhs,
+            rhs,
+            dst,
+        } if dst == src => Some((*lhs, *rhs)),
+        _ => None,
+    });
+    let Some((lhs, rhs)) = producers.next() else {
+        return Err(direct_semantic_error(
+            family,
+            "direct Map terminal residual is not a subtraction",
+        ));
+    };
+    if producers.next().is_some() {
+        return Err(direct_semantic_error(
+            family,
+            "direct Map terminal residual has ambiguous producers",
+        ));
+    }
+    let actual_sign = if lhs == target_register {
+        1
+    } else if rhs == target_register {
+        -1
+    } else {
+        return Err(direct_semantic_error(
+            family,
+            "direct Map terminal residual does not contain its target load",
+        ));
+    };
+    if actual_sign != family.residual_sign {
+        return Err(direct_semantic_error(
+            family,
+            "direct Map residual direction disagrees with residual_sign",
+        ));
+    }
+    Ok(())
+}
+
+fn direct_family_dependencies(
+    initialization: &InitializationSolveSystem,
+    family: &InitializationDirectFamily,
+    target_ranges: &[std::ops::Range<usize>],
+) -> Result<std::collections::BTreeSet<usize>, SolveProblemShapeContractError> {
+    let Some(ComputeNode::Map {
+        domain,
+        base_ops,
+        load_strides,
+        ..
+    }) = initialization.residual.nodes.get(family.node_index)
+    else {
+        return Err(direct_semantic_error(family, "non-Map direct family"));
+    };
+    let target_position = base_ops
+        .iter()
+        .position(
+            |op| matches!(op, LinearOp::LoadY { index, .. } if *index == family.targets.start),
+        )
+        .ok_or_else(|| direct_semantic_error(family, "missing target LoadY"))?;
+    let mut dependencies = std::collections::BTreeSet::new();
+    for (op_position, op) in base_ops.iter().enumerate() {
+        let LinearOp::LoadY { index, .. } = op else {
+            continue;
+        };
+        if op_position == target_position {
+            continue;
+        }
+        let load_range = affine_load_range(*index, op_position, domain, load_strides, family)?;
+        dependencies.extend(
+            target_ranges
+                .iter()
+                .enumerate()
+                .filter_map(|(owner, target)| ranges_overlap(&load_range, target).then_some(owner)),
+        );
+    }
+    Ok(dependencies)
+}
+
+fn affine_load_range(
+    base: usize,
+    op_position: usize,
+    domain: &StructuredIndexDomain,
+    load_strides: &[AffineStencilLoadStride],
+    family: &InitializationDirectFamily,
+) -> Result<std::ops::Range<usize>, SolveProblemShapeContractError> {
+    let mut minimum = base as i128;
+    let mut maximum = base as i128;
+    for term in load_strides
+        .iter()
+        .filter(|stride| stride.op_position == op_position)
+        .flat_map(|stride| &stride.terms)
+    {
+        let Some(binder) = domain.binders.get(term.dimension) else {
+            return Err(direct_semantic_error(
+                family,
+                "direct LoadY stride dimension is outside its domain",
+            ));
+        };
+        let count = StructuredIndexDomain {
+            binders: vec![binder.clone()],
+        }
+        .scalar_count()
+        .map_err(|_| direct_semantic_error(family, "invalid direct LoadY domain"))?;
+        let extent = (term.stride as i128)
+            .checked_mul(count.saturating_sub(1) as i128)
+            .ok_or_else(|| direct_semantic_error(family, "direct LoadY extent overflow"))?;
+        if extent < 0 {
+            minimum = minimum
+                .checked_add(extent)
+                .ok_or_else(|| direct_semantic_error(family, "direct LoadY range overflow"))?;
+        } else {
+            maximum = maximum
+                .checked_add(extent)
+                .ok_or_else(|| direct_semantic_error(family, "direct LoadY range overflow"))?;
+        }
+    }
+    let start = usize::try_from(minimum)
+        .map_err(|_| direct_semantic_error(family, "direct LoadY starts outside solver Y"))?;
+    let end = usize::try_from(maximum)
+        .ok()
+        .and_then(|maximum| maximum.checked_add(1))
+        .ok_or_else(|| direct_semantic_error(family, "direct LoadY range overflow"))?;
+    Ok(start..end)
+}
+
+fn ranges_overlap(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn direct_semantic_error(
+    family: &InitializationDirectFamily,
+    dimension: &'static str,
+) -> SolveProblemShapeContractError {
+    SolveProblemShapeContractError::ZeroTensorDimension {
+        context: "initialization.direct_families".to_string(),
+        node_index: family.node_index,
+        dimension,
+        span: family.span,
+    }
 }

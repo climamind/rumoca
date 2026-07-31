@@ -1100,26 +1100,25 @@ pub(super) fn visit_initial_residual_cells<'a>(
     let indexed_bindings = IndexedBindingSource::Borrowed(layout.indexed_bindings());
     let mut metrics = InitialResidualVisitMetrics {
         retained_indexed_context_entries: indexed_bindings.retained_owned_entries(),
+        retained_structural_binding_entries: structural_bindings.len(),
         ..InitialResidualVisitMetrics::default()
     };
-    let state_names = dae_model
-        .variables
-        .states
-        .keys()
-        .map(|name| name.as_str().to_string())
-        .collect::<std::collections::HashSet<_>>();
-    let direct_assignments = derivative_rhs::collect_missing_indexed_record_field_assignments(
-        dae_model,
-        &state_names,
-        layout,
-        &structural_bindings,
-    )?;
     let structural_bindings = Arc::new(structural_bindings);
-    let direct_assignments = Arc::new(direct_assignments);
     for (row_idx, equation) in equations {
         if equation.scalar_count == 0 {
             continue;
         }
+        let direct_assignments =
+            derivative_rhs::collect_referenced_missing_indexed_record_field_assignments(
+                dae_model,
+                &equation.rhs,
+                layout,
+                &structural_bindings,
+            )?;
+        metrics.retained_direct_assignment_entries = metrics
+            .retained_direct_assignment_entries
+            .max(direct_assignments.len());
+        let direct_assignments = Arc::new(direct_assignments);
         let context = RowLoweringContext {
             layout,
             functions: &dae_model.symbols.functions,
