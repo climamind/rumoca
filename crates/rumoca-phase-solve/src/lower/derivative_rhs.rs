@@ -1874,7 +1874,9 @@ fn row_builder<'a>(
             discrete_valued_names: Some(&dae_model.variables.discrete_valued),
             variable_starts: Some(&dae_model.metadata.variable_starts),
             dae_variables: Some(&dae_model.variables),
-            indexed_bindings: Some(indexed_bindings),
+            indexed_bindings: Some(super::IndexedBindingSource::Shared(Arc::clone(
+                indexed_bindings,
+            ))),
             is_initial_mode: false,
         },
     )
