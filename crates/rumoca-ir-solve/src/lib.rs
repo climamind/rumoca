@@ -9,6 +9,7 @@
 
 #[cfg(test)]
 mod compute_block_tests;
+mod direct_map_semantics;
 mod initialization_validation;
 mod layout;
 mod linear_op;

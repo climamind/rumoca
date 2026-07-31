@@ -241,7 +241,7 @@ compiler/session → DAE structural → solve-IR lowering → runtime contracts 
 |---|---|---|
 | Compilation/session orchestration | `rumoca-compile` | Coordinates pipeline; no runtime |
 | DAE structural analysis (Pantelides, BLT, tearing, demotion) | `rumoca-phase-structural` | SPEC_0007 §Structural Transformation Scope |
-| Solver-facing prepared data + row ops | `rumoca-ir-solve` | Backend-neutral IR and compact-initialization admission |
+| Solver-facing prepared data + row ops | `rumoca-ir-solve` | Backend-neutral IR and compact-initialization def-use admission |
 | DAE → solve-IR lowering | `rumoca-phase-solve` | Proves compact GPU order; no structural mutation |
 | Compact Map evaluation | `rumoca-eval-solve` | No scalar reconstruction |
 | GPU initialization settlement | `rumoca-sim` | Reuses Solve-IR admission; solver-free projection/verification |
