@@ -17,8 +17,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::{
-    lsp_benchmark_cmd, modelica_dependency_cache, run_forwarded_tool, run_status, test_cmd,
-    vscode_cmd, wasm_smoke,
+    lsp_benchmark_cmd, modelica_dependency_cache, omc_preflight, run_forwarded_tool, run_status,
+    test_cmd, vscode_cmd, wasm_smoke,
 };
 
 mod msl_cargo_setup_timing;
@@ -335,6 +335,8 @@ fn write_parity_config(root: &Path, args: &VerifyMslParityArgs) -> Result<()> {
 
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
 pub(crate) enum VerifyCommand {
+    /// Verify the pinned OpenModelica executable can run a workspace smoke script
+    Omc,
     /// Architecture-hardening gates (env-var registry, file-size, layering)
     Architecture,
     /// Rust formatting, traversal policy, and clippy
@@ -502,6 +504,7 @@ impl VerifySuite {
 
 pub(crate) fn run(args: VerifyArgs, root: &Path) -> Result<()> {
     match args.command {
+        VerifyCommand::Omc => omc_preflight::run(root),
         VerifyCommand::Lint => run_lint_job(root),
         VerifyCommand::Workspace(args) => args.run(root),
         VerifyCommand::TemplateRuntimes(args) => run_template_runtime_checks(root, args),
@@ -1132,8 +1135,19 @@ fn run_lint_job(root: &Path) -> Result<()> {
 }
 
 fn run_msl_quality_gate(root: &Path, args: &VerifyMslParityArgs) -> Result<()> {
+    run_msl_quality_gate_with_preflight(root, args, omc_preflight::run)
+}
+
+fn run_msl_quality_gate_with_preflight(
+    root: &Path,
+    args: &VerifyMslParityArgs,
+    preflight: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     // Fail fast on a malformed `--shard m/n` before any expensive setup.
     args.parse_shard()?;
+    if msl_parity_requires_omc_preflight(args) {
+        preflight(root)?;
+    }
     let ci_env = MslCiEnvironment::from_args(root, args);
     ci_env.print_notice();
     ci_env.clean_stale_results()?;
@@ -1167,6 +1181,10 @@ fn run_msl_quality_gate(root: &Path, args: &VerifyMslParityArgs) -> Result<()> {
         eprintln!("failed to write MSL Cargo setup timing report: {error:#}");
     }
     result
+}
+
+fn msl_parity_requires_omc_preflight(args: &VerifyMslParityArgs) -> bool {
+    args.merge_shards.is_none()
 }
 
 /// Run a specific libtest from a prebuilt `msl_tests` binary (built once by
@@ -1641,11 +1659,13 @@ where
 mod tests {
     use super::{
         MslCargoSetupTimingStep, MslCiEnvironment, MslHotspotModelResult, MslHotspotSummary,
-        VERIFY_SUITE_STEPS, VerifyMslParityArgs, VerifySuite, VerifyTimingReport, VerifyTimingStep,
-        hottest_compile_model, hottest_sim_model, msl_cache_layout_valid, prebuilt_sibling_binary,
-        render_verify_timing_markdown, should_log_process_tables,
-        write_msl_cargo_setup_timing_report, write_verify_timing_report,
+        VERIFY_SUITE_STEPS, VerifyArgs, VerifyCommand, VerifyMslParityArgs, VerifySuite,
+        VerifyTimingReport, VerifyTimingStep, hottest_compile_model, hottest_sim_model,
+        msl_cache_layout_valid, msl_parity_requires_omc_preflight, prebuilt_sibling_binary,
+        render_verify_timing_markdown, run_msl_quality_gate_with_preflight,
+        should_log_process_tables, write_msl_cargo_setup_timing_report, write_verify_timing_report,
     };
+    use clap::{Args, Command, FromArgMatches};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -1655,6 +1675,45 @@ mod tests {
             .filter(|step| suite.includes(step))
             .map(|step| step.args.to_vec())
             .collect()
+    }
+
+    #[test]
+    fn verify_omc_is_a_standalone_cli_command() {
+        let command = VerifyArgs::augment_args(Command::new("verify"));
+        let matches = command
+            .try_get_matches_from(["verify", "omc"])
+            .expect("verify omc must parse");
+        let parsed = VerifyArgs::from_arg_matches(&matches).expect("decode verify omc args");
+        assert!(matches!(parsed.command, VerifyCommand::Omc));
+    }
+
+    #[test]
+    fn direct_msl_parity_requires_the_shared_omc_preflight_but_merge_only_does_not() {
+        let direct = VerifyMslParityArgs::default();
+        let merge_only = VerifyMslParityArgs {
+            merge_shards: Some(PathBuf::from("target/msl/shards")),
+            ..VerifyMslParityArgs::default()
+        };
+
+        assert!(msl_parity_requires_omc_preflight(&direct));
+        assert!(!msl_parity_requires_omc_preflight(&merge_only));
+    }
+
+    #[test]
+    fn direct_msl_parity_runs_preflight_before_expensive_setup() {
+        let root = tempfile::tempdir().expect("create workspace root");
+        let args = VerifyMslParityArgs::default();
+        let error = run_msl_quality_gate_with_preflight(root.path(), &args, |preflight_root| {
+            assert_eq!(preflight_root, root.path());
+            anyhow::bail!("preflight stopped MSL setup")
+        })
+        .expect_err("preflight failure must stop direct MSL parity");
+
+        assert!(error.to_string().contains("preflight stopped MSL setup"));
+        assert!(
+            !root.path().join("target/msl/parity-config.json").exists(),
+            "preflight must run before MSL configuration and other expensive setup"
+        );
     }
 
     #[test]
