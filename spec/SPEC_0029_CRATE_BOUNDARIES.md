@@ -86,6 +86,7 @@ implementation.
 | `expr_contains_var` | `rumoca-ir-dae::expr_query` | Handles every `Expression` variant |
 | `expr_refers_to_var` | `rumoca-ir-dae::expr_query` | Same single-source rule. |
 | `expr_contains_der_of` | `rumoca-ir-dae::expr_query` | Same single-source rule. |
+| `validate_affine_map_metadata` | `rumoca-ir-solve` | Shared compact admission and phase/eval shape gate. |
 | Solver runtime time-event helpers (`event_right_limit_time`, scheduled/periodic time-event filtering, dynamic time-event parameter lookup) | `rumoca-solver::timeline` | Concrete solver backends call the shared runtime policy instead of copying time-grid rules. |
 | Solver runtime event-boundary helpers (`process_runtime_event_boundary`, `runtime_event_horizon`, `runtime_root_event_application_time`, `RuntimeEventBoundaryHandler`) | `rumoca-solver::runtime::event` | Concrete solver backends provide callback hooks for backend-local row application/state reset while shared Modelica event-boundary policy stays in `rumoca-solver`. |
 | Solver zero-state orchestration helpers (`run_no_state_output_schedule`, `NoStateOrchestrationBackend`, `NoStateEventStep`) | `rumoca-solver::runtime::no_state` | Concrete solver backends provide row/root/event callbacks while shared no-state output/event-loop policy stays in `rumoca-solver`. |
@@ -94,10 +95,8 @@ implementation.
 
 Required rules:
 
-- Every helper above has exactly one implementation, in the listed
-  module. All callers MUST import from that module path.
-- Do not fork helpers "for convenience." If the owner creates a forbidden
-  dependency, move the helper by spec update instead.
+- Each helper has one implementation; callers MUST import its listed owner.
+- Forbidden dependencies require a spec-backed move, not a helper fork.
 - Adding a helper to this list requires updating this spec.
 
 ### 4. Phase Typing via Newtypes

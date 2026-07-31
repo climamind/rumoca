@@ -291,6 +291,146 @@ fn malformed_random_initialization() -> InitializationSolveSystem {
     ])
 }
 
+fn compact_initialization_with_const_stride(
+    op_position: usize,
+    dimension: usize,
+    stride: f64,
+) -> InitializationSolveSystem {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map { const_strides, .. } = &mut initialization.residual.nodes[0] else {
+        unreachable!()
+    };
+    const_strides.push(AffineStencilConstStride {
+        op_position,
+        terms: vec![AffineStencilConstStrideTerm { dimension, stride }],
+    });
+    initialization
+}
+
+fn compact_initialization_with_non_target_load_stride() -> InitializationSolveSystem {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map { load_strides, .. } = &mut initialization.residual.nodes[0] else {
+        unreachable!()
+    };
+    load_strides.push(AffineStencilLoadStride {
+        op_position: 1,
+        terms: vec![AffineStencilIndexStrideTerm {
+            dimension: 0,
+            stride: 1,
+        }],
+    });
+    initialization
+}
+
+#[test]
+fn compact_initialization_json_rejects_const_stride_targeting_load_y() {
+    let problem = compact_problem(compact_initialization_with_const_stride(0, 0, 1.0));
+    let json = serde_json::to_string(&problem).expect("serialize malformed affine JSON");
+
+    let error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("const stride targeting LoadY must fail JSON admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine constant stride does not point at Const"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_const_stride_targeting_load_y() {
+    let problem = compact_problem(compact_initialization_with_const_stride(0, 0, 1.0));
+    let bytes = bincode::serialize(&problem).expect("serialize malformed affine bincode");
+
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("const stride targeting LoadY must fail bincode admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine constant stride does not point at Const"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_json_rejects_non_target_load_stride_targeting_const() {
+    let problem = compact_problem(compact_initialization_with_non_target_load_stride());
+    let json = serde_json::to_string(&problem).expect("serialize malformed affine JSON");
+
+    let error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("non-target load stride targeting Const must fail JSON admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine load stride does not point at LoadY or LoadP"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_non_target_load_stride_targeting_const() {
+    let problem = compact_problem(compact_initialization_with_non_target_load_stride());
+    let bytes = bincode::serialize(&problem).expect("serialize malformed affine bincode");
+
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("non-target load stride targeting Const must fail bincode admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine load stride does not point at LoadY or LoadP"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_json_rejects_const_stride_dimension_out_of_bounds() {
+    let problem = compact_problem(compact_initialization_with_const_stride(1, 1, 1.0));
+    let json = serde_json::to_string(&problem).expect("serialize malformed affine JSON");
+
+    let error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("out-of-bounds const stride dimension must fail JSON admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine stride dimension is outside domain"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_const_stride_dimension_out_of_bounds() {
+    let problem = compact_problem(compact_initialization_with_const_stride(1, 1, 1.0));
+    let bytes = bincode::serialize(&problem).expect("serialize malformed affine bincode");
+
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("out-of-bounds const stride dimension must fail bincode admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine stride dimension is outside domain"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_nonfinite_const_stride() {
+    let problem = compact_problem(compact_initialization_with_const_stride(
+        1,
+        0,
+        f64::INFINITY,
+    ));
+    let bytes = bincode::serialize(&problem).expect("serialize non-finite affine bincode");
+
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("non-finite const stride must fail bincode admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine constant stride is non-finite"),
+        "{error}"
+    );
+}
+
 #[test]
 fn compact_initialization_json_rejects_reachable_malformed_random_initial_state() {
     let problem = compact_problem(malformed_random_initialization());
@@ -475,13 +615,19 @@ fn compact_initialization_json_and_bincode_reject_multiple_store_outputs() {
 #[test]
 fn compact_initialization_json_and_bincode_reject_constant_zero_map() {
     let mut initialization = complete_compact_initialization();
-    let ComputeNode::Map { base_ops, .. } = &mut initialization.residual.nodes[0] else {
+    let ComputeNode::Map {
+        base_ops,
+        load_strides,
+        ..
+    } = &mut initialization.residual.nodes[0]
+    else {
         unreachable!()
     };
     *base_ops = vec![
         LinearOp::Const { dst: 0, value: 0.0 },
         LinearOp::StoreOutput { src: 0 },
     ];
+    load_strides.clear();
     assert_compact_wire_rejects(initialization, "target LoadY");
 }
 

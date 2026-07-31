@@ -415,6 +415,7 @@ fn validate_initialization_direct_family(
         domain,
         base_ops,
         load_strides,
+        const_strides,
         span,
         ..
     } = node
@@ -460,6 +461,8 @@ fn validate_initialization_direct_family(
             Some(*span),
         )
     })?;
+    validate_affine_map_metadata(domain, base_ops, load_strides, const_strides)
+        .map_err(|error| direct_semantic_error(family, error.direct_map_message()))?;
     validate_direct_map_semantics(family, base_ops, load_strides)?;
     Ok(family.targets.start..end)
 }

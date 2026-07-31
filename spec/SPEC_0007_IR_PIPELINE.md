@@ -191,13 +191,14 @@ Canonical terminology:
 Public APIs use `ScalarProgram`/`ScalarProgramBlock`; `RowBlock`/`ScalarRows`
 must not return.
 
-GPU initialization requires exact Y coverage, non-dummy spans, unit residual
-signs, and direct family/target ownership without scalar rows. Solve-IR owns the
-shared target/map/sign/dependency gate. Direct Maps require SSA
-definition-before-use, one terminal `StoreOutput`, and a reaching `Sub` whose
-sole target-`LoadY` operand has an opposite definition closure independent of
-that load. Structural fallback is limited to direct-ineligible models without
-event/discrete or user/structured initialization.
+Initialization requires exact Y coverage, real spans, unit signs, direct
+ownership, and no scalar rows. Solve-IR owns
+target/map/dependency/affine checks: stride op positions/dimensions are
+in-bounds, op kinds match, and constant strides are finite. Direct Maps require
+SSA, one terminal `StoreOutput`, and a reaching `Sub` with one target-`LoadY`
+side and independent peer closure.
+Structural fallback is limited to direct-ineligible models without event/discrete
+or user/structured initialization.
 
 `ComputeNode::AffineStencil` requires a preserved DAE domain plus affine-operand
 proof; unstructured-row recovery is forbidden.

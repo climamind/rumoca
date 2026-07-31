@@ -1,12 +1,10 @@
 //! Solver-facing Solve IR.
-//!
 //! This crate contains data consumed by simulation backends after DAE-level
 //! structural/lowering phases. It must stay free of DAE evaluation and phase
 //! logic.
-//!
-//! The facade defines the wire types while focused modules own layout, linear
-//! operations, direct-initialization validation, and visitor contracts.
+//! Focused modules own layout, linear ops, direct-initialization validation, and visitors.
 
+mod affine_map_validation;
 #[cfg(test)]
 mod compute_block_tests;
 mod direct_map_semantics;
@@ -21,8 +19,10 @@ use rumoca_core::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use initialization_validation::InitializationTargetRange;
-pub use initialization_validation::validate_compact_gpu_initialization;
+pub use affine_map_validation::{AffineMapMetadataError, validate_affine_map_metadata};
+pub use initialization_validation::{
+    InitializationTargetRange, validate_compact_gpu_initialization,
+};
 use initialization_validation::{
     initialization_stored_row_count, validate_initialization_direct_families,
 };
