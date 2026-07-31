@@ -674,6 +674,9 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                     format!("function `{}` input `{}`", function.name, input.name),
                     caller_actual.span().unwrap_or(actual_span),
                 )?;
+                if input.dims.is_empty() && input.shape_expr.is_empty() {
+                    scope.dims.insert(input.name.clone(), Vec::new());
+                }
                 if let Some(dims) = dims.filter(|dims| !dims.is_empty()) {
                     let scalars = self
                         .project_value_scalars(
@@ -730,7 +733,10 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 Some(dims) => {
                     scope.dims.insert(input.name.clone(), dims);
                 }
-                None if input.dims.is_empty() && !formal_accepts_structured_actual(input) => {
+                None if input.dims.is_empty()
+                    && input.shape_expr.is_empty()
+                    && !formal_accepts_structured_actual(input) =>
+                {
                     scope.dims.insert(input.name.clone(), Vec::new());
                 }
                 None => {}

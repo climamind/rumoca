@@ -794,6 +794,89 @@ fn range_index_assignment_keeps_slice_shape() -> Result<(), LowerError> {
 }
 
 #[test]
+fn dynamic_scalar_selector_projects_conditional_array_binding() -> Result<(), LowerError> {
+    let span = test_span();
+    let mut function = rumoca_core::Function::new("My.dynamicSelector", span);
+    function.inputs.push(function_param_with_dims("q", &[2]));
+    function.inputs.push(scalar_function_param("k"));
+    function.outputs.push(scalar_function_param("o"));
+    function.locals.push(function_param_with_dims("x", &[2]));
+    function.body.push(scalar_assignment("x", local_var("q")));
+    function.body.push(rumoca_core::Statement::If {
+        cond_blocks: vec![rumoca_core::StatementBlock {
+            cond: binary(
+                rumoca_core::OpBinary::Lt,
+                rumoca_core::Expression::VarRef {
+                    name: rumoca_core::VarName::new("q").into(),
+                    subscripts: vec![rumoca_core::Subscript::index(1, span)],
+                    span,
+                },
+                real(0.0),
+                span,
+            ),
+            stmts: vec![indexed_assignment_with_span(
+                "x",
+                &[1],
+                rumoca_core::Expression::Unary {
+                    op: rumoca_core::OpUnary::Minus,
+                    rhs: Box::new(rumoca_core::Expression::VarRef {
+                        name: rumoca_core::VarName::new("q").into(),
+                        subscripts: vec![rumoca_core::Subscript::index(1, span)],
+                        span,
+                    }),
+                    span,
+                },
+                span,
+            )],
+        }],
+        else_block: None,
+        span,
+    });
+    function.body.push(scalar_assignment(
+        "o",
+        rumoca_core::Expression::Index {
+            base: Box::new(local_var("x")),
+            subscripts: vec![rumoca_core::Subscript::Expr {
+                expr: Box::new(local_var("k")),
+                span,
+            }],
+            span,
+        },
+    ));
+
+    let mut dae_model = dae::Dae::default();
+    dae_model.variables.algebraics.insert(
+        rumoca_core::VarName::new("q_actual"),
+        dae::Variable {
+            name: rumoca_core::VarName::new("q_actual"),
+            dims: vec![2],
+            ..dae::Variable::empty_with_span(span)
+        },
+    );
+    dae_model
+        .symbols
+        .functions
+        .insert(function.name.clone(), function);
+    let structural_bindings = IndexMap::new();
+    let call = rumoca_core::Expression::FunctionCall {
+        name: rumoca_core::VarName::new("My.dynamicSelector").into(),
+        args: vec![local_var("q_actual"), local_var("selector")],
+        is_constructor: false,
+        span,
+    };
+
+    let values =
+        function_call_projected_scalars_with_owner(&call, &dae_model, &structural_bindings, span)?
+            .expect("conditional array output with a scalar selector should project");
+
+    assert!(matches!(
+        values.as_slice(),
+        [rumoca_core::Expression::If { .. }]
+    ));
+    Ok(())
+}
+
+#[test]
 fn projection_dims_preserve_matrix_slice_with_dynamic_scalar_index() -> Result<(), LowerError> {
     let dae_model = dae::Dae::default();
     let structural_bindings = IndexMap::new();
