@@ -287,11 +287,11 @@ cargo xtask verify msl-parity
 ```
 
 `cargo xtask verify omc` is the reusable OpenModelica preflight: it derives the
-pinned `major.minor.patch` release from `toolchains/openmodelica-version`, checks
-`omc --version`, and runs a real `.mos` script from a workspace-local temporary
-directory. Direct `cargo xtask verify msl-parity` runs the same preflight before
-its expensive setup; native Linux/CI installations remain supported, so Docker
-or Colima is not required. If the gate identifies Docker/containerd storage I/O,
+exact runtime identity by removing only the trailing Debian revision from
+`toolchains/openmodelica-version`, checks `omc --version`, and runs a real `.mos`
+script from a workspace-local temporary directory. Direct `cargo xtask verify
+msl-parity` runs the same preflight before its expensive setup; native Linux/CI
+installations remain supported, so Docker or Colima is not required. If the gate identifies Docker/containerd storage I/O,
 it prints the non-destructive `colima stop && colima start` recovery guidance and
 does not alter the runtime itself.
 

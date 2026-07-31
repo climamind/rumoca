@@ -1,5 +1,7 @@
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Output};
 
 use tempfile::tempdir_in;
@@ -12,6 +14,7 @@ package P
   end M;
 end P;
 "#;
+const OMC_PREFLIGHT_GUIDANCE: &str = "Run `cargo xtask verify omc` to diagnose the OpenModelica runtime before retrying this differential test.";
 
 #[derive(Debug, PartialEq, Eq)]
 enum OmcPrerequisite {
@@ -23,16 +26,44 @@ fn omc_prerequisite_decision(result: io::Result<Output>) -> Result<OmcPrerequisi
     match result {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(OmcPrerequisite::SkipMissing),
         Err(error) => Err(format!(
-            "failed to start `omc --version`: {error}\nRun `cargo xtask verify omc` to diagnose the OpenModelica runtime before retrying this differential test."
+            "failed to start `omc --version`: {error}\n{OMC_PREFLIGHT_GUIDANCE}"
         )),
         Ok(output) if output.status.success() => Ok(OmcPrerequisite::Ready),
         Ok(output) => Err(format!(
-            "`omc --version` failed with status={}.\nstdout:\n{}\nstderr:\n{}\nRun `cargo xtask verify omc` to diagnose the OpenModelica runtime before retrying this differential test.",
+            "`omc --version` failed with status={}.\n{}\n{OMC_PREFLIGHT_GUIDANCE}",
             output.status,
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim(),
+            captured_output(&output),
         )),
     }
+}
+
+fn omc_semantic_decision(result: io::Result<Output>) -> Result<(), String> {
+    let output = result.map_err(|error| {
+        format!(
+            "failed to run the OMC differential `.mos` script: {error}\n{OMC_PREFLIGHT_GUIDANCE}"
+        )
+    })?;
+    let captured = captured_output(&output);
+    if !output.status.success() {
+        return Err(format!(
+            "OMC differential `.mos` script failed with status={}.\n{captured}\n{OMC_PREFLIGHT_GUIDANCE}",
+            output.status,
+        ));
+    }
+    if !captured.contains("Variable c not found in scope M") {
+        return Err(format!(
+            "OMC differential `.mos` script omitted the expected encapsulated-scope diagnostic.\n{captured}\n{OMC_PREFLIGHT_GUIDANCE}"
+        ));
+    }
+    Ok(())
+}
+
+fn captured_output(output: &Output) -> String {
+    format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    )
 }
 
 #[test]
@@ -63,19 +94,8 @@ getErrorString();
     )
     .expect("write OMC script");
 
-    let omc = Command::new("omc")
-        .arg(&script_path)
-        .output()
-        .expect("run omc");
-    let omc_output = format!(
-        "{}{}",
-        String::from_utf8_lossy(&omc.stdout),
-        String::from_utf8_lossy(&omc.stderr)
-    );
-    assert!(
-        omc.status.success() && omc_output.contains("Variable c not found in scope M"),
-        "expected OMC to reject unqualified enclosing-scope lookup, got:\n{omc_output}"
-    );
+    omc_semantic_decision(Command::new("omc").arg(&script_path).output())
+        .unwrap_or_else(|diagnostic| panic!("OMC differential-test run failed:\n{diagnostic}"));
 
     let rumoca = rumoca::Compiler::new()
         .model("P.M")
@@ -127,4 +147,62 @@ fn omc_prerequisite_points_to_gate_when_present_but_not_executable() {
         .expect_err("present but non-executable OMC must be actionable");
     assert!(error.contains("failed to start `omc --version`"), "{error}");
     assert!(error.contains("cargo xtask verify omc"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn omc_semantic_run_failure_captures_output_and_points_to_gate() {
+    let temp = tempfile::tempdir().expect("create temporary OMC directory");
+    let omc = temp.path().join("omc");
+    fs::write(
+        &omc,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'OpenModelica 1.27.0~1-gd7e2907'
+  exit 0
+fi
+printf '%s\n' 'recognizable OMC stdout'
+printf '%s\n' 'recognizable OMC stderr' >&2
+exit 37
+"#,
+    )
+    .expect("write failing OMC executable");
+    let mut permissions = fs::metadata(&omc)
+        .expect("read OMC executable metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&omc, permissions).expect("make OMC executable");
+
+    let inherited_path = std::env::var("PATH").expect("read inherited PATH");
+    let path = format!("{}:{inherited_path}", temp.path().display());
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+        .args([
+            "encapsulated_scope_rejection_matches_omc",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("run differential test with fake OMC");
+    let diagnostic = format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "fake OMC must fail the child test"
+    );
+    assert!(
+        diagnostic.contains("recognizable OMC stdout"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("recognizable OMC stderr"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("cargo xtask verify omc"),
+        "{diagnostic}"
+    );
 }
