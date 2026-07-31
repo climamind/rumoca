@@ -21,10 +21,10 @@ use rumoca_core::{
 use serde::{Deserialize, Serialize};
 
 pub use initialization_validation::InitializationTargetRange;
+pub use initialization_validation::validate_compact_gpu_initialization;
 use initialization_validation::{
     initialization_stored_row_count, validate_initialization_direct_families,
 };
-
 pub use layout::{
     ComponentReferenceKey, ComponentReferenceKeyError, ComponentReferenceKeyErrorKind,
     ComponentReferenceKeyPart, ComponentReferenceSubscriptKey, IndexedScalarSlot, ScalarSlot,

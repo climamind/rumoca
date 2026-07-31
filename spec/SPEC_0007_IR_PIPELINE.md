@@ -193,16 +193,15 @@ must not return.
 
 GPU initialization requires exact Y coverage, non-dummy spans, and unit
 residual signs. Compact projection blocks own one direct family and target
-anchor; scalar rows/indices remain absent. Settlement shares one context and
-never falls back.
+anchor; scalar rows/indices remain absent. Solve-IR owns the target/map/sign/
+dependency gate and simulation reuses it. Structural fallback is limited to
+direct-ineligible models without event/discrete or user/structured initialization.
 
-`ComputeNode::AffineStencil` is source-proven from preserved DAE family domains
-and affine operand proofs; Solve lowering must not recover stencils from
-unstructured scalar rows.
+`ComputeNode::AffineStencil` requires a preserved DAE domain plus affine-operand
+proof; unstructured-row recovery is forbidden.
 
-The root `schema_version` field is mandatory on serialized Solve payloads.
-Deserializers reject unsupported versions and the Solve wire format does not
-accept pre-versioned `ComputeBlock` row payloads.
+Serialized Solve payloads require the supported `schema_version`; pre-versioned
+`ComputeBlock` rows are rejected.
 
 `SolveProblem` is the base lowered problem. Backend products that are expensive
 or not part of the canonical MLS DAE, such as mass-matrix form and

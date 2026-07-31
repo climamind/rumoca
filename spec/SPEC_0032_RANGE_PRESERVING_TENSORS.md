@@ -86,11 +86,16 @@ corresponding source base and corners; target maps therefore remain canonical
 positive-stride maps without changing source-index semantics. Empty domains
 produce no direct node, singleton dimensions require no corner, and only
 dimensions with at least two values contribute a stride proof.
+Direct-family owners are recorded when nodes are emitted; downstream coverage
+must consume that explicit association rather than zip against the source
+family list, because empty source domains emit no node.
 Corner-derived load, constant, and target strides are admissible only after
 Solve lowering proves the reconstructed program against every materialized
 family cell. That proof reuses one lowering context and releases each scalar
-proof row before visiting the next; family-sized tuple/equation/row ownership is
-forbidden. Direct-family `LoadY` dependencies form a compact causal projection
+proof row before visiting the next. Missing indexed-record assignments are
+resolved only for references in the current proof cell; retaining a
+family-sized assignment map or tuple/equation/row ownership is forbidden.
+Direct-family `LoadY` dependencies form a compact causal projection
 order in the existing initialization projection envelope. Cycles, unavailable
 interiors, non-affine values, and random/impure operations fail closed at the
 first owning source span; executing a self-consistent but unproven

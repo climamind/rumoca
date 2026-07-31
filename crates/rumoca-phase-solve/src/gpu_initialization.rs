@@ -7,6 +7,8 @@ pub(super) struct GpuInitializationProofMetrics {
     pub peak_owned_rows: usize,
     pub ordinal_slots: usize,
     pub retained_indexed_context_entries: usize,
+    pub retained_direct_assignment_entries: usize,
+    pub retained_structural_binding_entries: usize,
 }
 
 #[cfg(test)]
@@ -17,6 +19,8 @@ thread_local! {
             peak_owned_rows: 0,
             ordinal_slots: 0,
             retained_indexed_context_entries: 0,
+            retained_direct_assignment_entries: 0,
+            retained_structural_binding_entries: 0,
         }) };
 }
 
@@ -40,6 +44,7 @@ pub(super) fn lower_gpu_initialization_system(
     let mut expected = 0usize;
     let mut nodes = Vec::new();
     let mut families = Vec::new();
+    let mut family_owners = Vec::new();
     let mut residual_start = 0usize;
     for family in &dae_model.initialization.structured_equations {
         let cells = family
@@ -101,6 +106,7 @@ pub(super) fn lower_gpu_initialization_system(
                 span: direct.span,
             };
             families.push(direct);
+            family_owners.push(family);
         }
     }
     let required_user_initial_rows = required_user_initial_rows(dae_model)?;
@@ -111,7 +117,7 @@ pub(super) fn lower_gpu_initialization_system(
         ));
     }
     let (required_target_ranges, fixed_target_ranges) =
-        require_complete_gpu_initial_target_coverage(dae_model, layout, &families)?;
+        require_complete_gpu_initial_target_coverage(dae_model, layout, &families, &family_owners)?;
     let residual = solve::ComputeBlock { nodes };
     let projection_plan = lower_gpu_initialization_projection_plan(&residual, &families)?;
     Ok(solve::InitializationSolveSystem {
@@ -214,6 +220,7 @@ fn require_complete_gpu_initial_target_coverage(
     dae_model: &dae::Dae,
     layout: &solve::VarLayout,
     families: &[solve::InitializationDirectFamily],
+    family_owners: &[&dae::StructuredEquationFamily],
 ) -> Result<
     (
         Vec<solve::InitializationTargetRange>,
@@ -221,16 +228,17 @@ fn require_complete_gpu_initial_target_coverage(
     ),
     LowerError,
 > {
+    if family_owners.len() != families.len() {
+        return Err(gpu_initial_unsupported_optional(
+            "GPU initial direct-family owner association is incomplete",
+            families
+                .get(family_owners.len())
+                .map(|family| family.span)
+                .or_else(|| family_owners.last().map(|family| family.span)),
+        ));
+    }
     let mut direct_ranges = Vec::with_capacity(families.len());
-    for (structured, direct) in dae_model
-        .initialization
-        .structured_equations
-        .iter()
-        .flat_map(|structured| {
-            (0..structured.common_iteration_equation_count().unwrap_or(0)).map(move |_| structured)
-        })
-        .zip(families)
-    {
+    for (structured, direct) in family_owners.iter().copied().zip(families) {
         let dense =
             solve::TensorOutputMap::dense_contiguous(direct.targets.start, &structured.domain)
                 .map_err(|error| {
@@ -578,32 +586,40 @@ fn prove_gpu_direct_family_affine(
     });
     let mut ordinals = vec![0usize; family.domain.binders.len()];
     let mut cell = 0usize;
-    let visit_metrics = visit_initial_residual_cells(dae_model, layout, equations, |equation, ops| {
-        gpu_canonical_ordinals_for_cell(&family.domain, cell, &mut ordinals, family.span)?;
-        prove_gpu_direct_family_cell(&proof, &ordinals, equation, ops)?;
-        #[cfg(test)]
-        GPU_INITIALIZATION_PROOF_METRICS.with(|working_set| {
-            let metrics = working_set.get();
-            working_set.set(GpuInitializationProofMetrics {
-                cells: metrics.cells.saturating_add(1),
-                peak_owned_rows: metrics.peak_owned_rows,
-                ordinal_slots: metrics.ordinal_slots.max(ordinals.len()),
-                retained_indexed_context_entries: metrics.retained_indexed_context_entries,
+    let visit_metrics =
+        visit_initial_residual_cells(dae_model, layout, equations, |equation, ops| {
+            gpu_canonical_ordinals_for_cell(&family.domain, cell, &mut ordinals, family.span)?;
+            prove_gpu_direct_family_cell(&proof, &ordinals, equation, ops)?;
+            #[cfg(test)]
+            GPU_INITIALIZATION_PROOF_METRICS.with(|working_set| {
+                let metrics = working_set.get();
+                working_set.set(GpuInitializationProofMetrics {
+                    cells: metrics.cells.saturating_add(1),
+                    peak_owned_rows: metrics.peak_owned_rows,
+                    ordinal_slots: metrics.ordinal_slots.max(ordinals.len()),
+                    retained_indexed_context_entries: metrics.retained_indexed_context_entries,
+                    retained_direct_assignment_entries: metrics.retained_direct_assignment_entries,
+                    retained_structural_binding_entries: metrics
+                        .retained_structural_binding_entries,
+                });
             });
-        });
-        cell += 1;
-        Ok(())
-    })?;
+            cell += 1;
+            Ok(())
+        })?;
     #[cfg(test)]
     GPU_INITIALIZATION_PROOF_METRICS.with(|working_set| {
         let metrics = working_set.get();
         working_set.set(GpuInitializationProofMetrics {
-            peak_owned_rows: metrics
-                .peak_owned_rows
-                .max(visit_metrics.peak_owned_rows),
+            peak_owned_rows: metrics.peak_owned_rows.max(visit_metrics.peak_owned_rows),
             retained_indexed_context_entries: metrics
                 .retained_indexed_context_entries
                 .max(visit_metrics.retained_indexed_context_entries),
+            retained_direct_assignment_entries: metrics
+                .retained_direct_assignment_entries
+                .max(visit_metrics.retained_direct_assignment_entries),
+            retained_structural_binding_entries: metrics
+                .retained_structural_binding_entries
+                .max(visit_metrics.retained_structural_binding_entries),
             ..metrics
         });
     });
@@ -991,8 +1007,7 @@ fn canonical_gpu_initial_domain(
             if count == 0 {
                 std::mem::swap(&mut binder.lower, &mut binder.upper);
             } else {
-                let final_source_value =
-                    gpu_initial_final_source_value(binder, count, span)?;
+                let final_source_value = gpu_initial_final_source_value(binder, count, span)?;
                 binder.lower = final_source_value;
                 binder.upper = source_lower;
             }

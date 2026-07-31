@@ -216,6 +216,33 @@ fn test_prepare_gpu_simulation_exposes_native_kernel_schedules() {
 
 #[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
 #[test]
+fn test_prepare_gpu_simulation_retains_structural_fallback_compatibility() {
+    let _guard = session_test_guard();
+    clear_source_root_cache().expect("clear source-root cache");
+    let source = r#"
+    model GpuStructuralFallback
+      Real x;
+      Real dx;
+    equation
+      x = time;
+      dx = der(x);
+    end GpuStructuralFallback;
+    "#;
+    let json = prepare_gpu_simulation(source, "GpuStructuralFallback")
+        .expect("public WASM GPU entry must preserve the structural funnel");
+    let payload: serde_json::Value =
+        serde_json::from_str(&json).expect("GPU fallback payload should be valid JSON");
+    assert!(
+        payload["wgsl"]
+            .as_str()
+            .is_some_and(|source| !source.is_empty()),
+        "structurally prepared public payload must expose WGSL"
+    );
+    clear_source_root_cache().expect("clear source-root cache");
+}
+
+#[cfg(any(feature = "sim-wasm", feature = "sim-diffsol", feature = "sim-rk45"))]
+#[test]
 fn test_prepare_gpu_simulation_separates_output_and_fixed_step_intervals() {
     let _guard = session_test_guard();
     clear_source_root_cache().expect("clear source-root cache");

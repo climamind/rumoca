@@ -538,8 +538,7 @@ fn replay_gpu_direct_family(gpu: &solve::SolveProblem) -> Vec<f64> {
                 .iter()
                 .try_fold(0isize, |offset, term| {
                     offset.checked_add(
-                        term
-                            .stride
+                        term.stride
                             .checked_mul(isize::try_from(ordinal[term.dimension]).ok()?)?,
                     )
                 })
@@ -822,10 +821,88 @@ fn gpu_preparation_builds_projection_plan_for_reverse_ordered_direct_dependencie
     );
 }
 
+fn empty_structured_initial_family(
+    template: &dae::StructuredEquationFamily,
+    span: rumoca_core::Span,
+) -> dae::StructuredEquationFamily {
+    let mut empty = template.clone();
+    empty.domain.binders[0].upper = 0;
+    empty.equation_counts.clear();
+    empty.span = span;
+    empty
+}
+
+#[test]
+fn gpu_initial_owner_association_skips_empty_family_before_nonempty() {
+    let span = solve_numbered_span(320, 10, 20);
+    let empty_span = solve_numbered_span(320, 30, 40);
+    let mut dae_model = gpu_initial_family_fixture(&[7, 8], &[span, span]);
+    let empty = empty_structured_initial_family(
+        &dae_model.initialization.structured_equations[0],
+        empty_span,
+    );
+    dae_model
+        .initialization
+        .structured_equations
+        .insert(0, empty);
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        2,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("empty source family must not steal the following direct owner");
+    assert_eq!(gpu.initialization.direct_families.len(), 1);
+    assert_eq!(gpu.initialization.direct_families[0].targets.start, 0);
+    assert_eq!(gpu.initialization.direct_families[0].span, span);
+    assert_eq!(gpu.initialization.projection_plan.blocks[0].rows, vec![0]);
+}
+
+#[test]
+fn gpu_initial_owner_association_skips_empty_family_between_nonempty_families() {
+    let span = solve_numbered_span(321, 10, 20);
+    let empty_span = solve_numbered_span(321, 30, 40);
+    let mut dae_model = reverse_ordered_direct_dependency_fixture(span);
+    let empty = empty_structured_initial_family(
+        &dae_model.initialization.structured_equations[0],
+        empty_span,
+    );
+    dae_model
+        .initialization
+        .structured_equations
+        .insert(1, empty);
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        4,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("middle empty family must not shift later direct owners");
+    assert_eq!(
+        gpu.initialization
+            .direct_families
+            .iter()
+            .map(|family| family.targets.start)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert_eq!(
+        gpu.initialization
+            .projection_plan
+            .blocks
+            .iter()
+            .map(|block| block.rows[0])
+            .collect::<Vec<_>>(),
+        vec![1, 0]
+    );
+}
+
 #[test]
 fn gpu_preparation_rejects_direct_family_dependency_cycle() {
     let span = solve_numbered_span(318, 10, 20);
+    let second_span = solve_numbered_span(318, 30, 40);
     let mut dae_model = reverse_ordered_direct_dependency_fixture(span);
+    dae_model.initialization.structured_equations[1].span = second_span;
     for (offset, index) in (1..=2).enumerate() {
         dae_model.initialization.equations[2 + offset] = dae::Equation::residual(
             binary(
@@ -894,7 +971,11 @@ fn gpu_affine_proof_does_not_materialize_all_family_rows() {
     let visitor = visitor_implementation
         .split("pub(super) fn visit_initial_residual_cells")
         .nth(1)
-        .and_then(|source| source.split("fn lower_residual_rows_from_equations_core").next())
+        .and_then(|source| {
+            source
+                .split("fn lower_residual_rows_from_equations_core")
+                .next()
+        })
         .expect("structured proof visitor source");
     assert!(
         !visitor.contains("build_indexed_binding_map(layout)"),
@@ -934,6 +1015,18 @@ fn gpu_affine_proof_does_not_materialize_all_family_rows() {
         ),
         (0, 0),
         "borrowed layout metadata must retain zero new context entries at N=1 and N=128"
+    );
+    let small_owned_context = small_metrics
+        .retained_indexed_context_entries
+        .saturating_add(small_metrics.retained_direct_assignment_entries)
+        .saturating_add(small_metrics.retained_structural_binding_entries);
+    let large_owned_context = metrics
+        .retained_indexed_context_entries
+        .saturating_add(metrics.retained_direct_assignment_entries)
+        .saturating_add(metrics.retained_structural_binding_entries);
+    assert_eq!(
+        small_owned_context, large_owned_context,
+        "all owned proof-context collections must remain constant from N=1 to N=128"
     );
 }
 
