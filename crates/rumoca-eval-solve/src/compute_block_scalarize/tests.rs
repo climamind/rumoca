@@ -619,6 +619,47 @@ fn scalarize_reports_native_stride_invalid_dimension() {
 }
 
 #[test]
+fn scalarize_reports_nonfinite_const_stride_with_span() {
+    let span = rumoca_core::Span::from_offsets(
+        rumoca_core::SourceId::from_source_name("nonfinite_stride.mo"),
+        4,
+        12,
+    );
+    let block = ComputeBlock {
+        nodes: vec![ComputeNode::Map {
+            domain: test_tensor_domain(1),
+            output_map: rumoca_ir_solve::TensorOutputMap::dense_contiguous(
+                0,
+                &test_tensor_domain(1),
+            )
+            .expect("valid dense output map"),
+            base_ops: vec![
+                LinearOp::Const { dst: 0, value: 1.0 },
+                LinearOp::StoreOutput { src: 0 },
+            ],
+            load_strides: Vec::new(),
+            const_strides: vec![AffineStencilConstStride {
+                op_position: 0,
+                terms: vec![rumoca_ir_solve::AffineStencilConstStrideTerm {
+                    dimension: 0,
+                    stride: f64::NAN,
+                }],
+            }],
+            metadata: rumoca_ir_solve::TensorNodeMetadata::default(),
+            span,
+        }],
+    };
+
+    let error = to_scalar_program_block(&block)
+        .expect_err("non-finite const stride must fail scalarization metadata admission");
+    assert_eq!(error.source_span(), Some(span));
+    assert!(
+        error.to_string().contains("const stride") && error.to_string().contains("non-finite"),
+        "error should explain the non-finite const stride: {error}"
+    );
+}
+
+#[test]
 fn scalarize_reports_invalid_stride_metadata_for_empty_domain() {
     let span = rumoca_core::Span::from_offsets(
         rumoca_core::SourceId::from_source_name("bad_empty_domain.mo"),

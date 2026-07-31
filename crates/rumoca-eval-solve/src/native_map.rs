@@ -39,7 +39,8 @@ pub fn eval_map_elements_with_context(
             context.with_runtime_state(&local_runtime_state)
         }
     };
-    validate_affine_map_metadata(domain, base_ops, load_strides, const_strides, *span)?;
+    rumoca_ir_solve::validate_affine_map_metadata(domain, base_ops, load_strides, const_strides)
+        .map_err(|error| affine_map_error(error.to_string(), *span))?;
     let counts = map_domain_counts(domain, *span)?;
     if counts.contains(&0) {
         return Ok(MapEvaluationMetrics::default());
@@ -193,73 +194,6 @@ fn checked_affine_const_offset(
             .then_some(next)
             .ok_or_else(|| affine_map_error("affine constant offset is non-finite", span))
     })
-}
-
-fn validate_affine_map_metadata(
-    domain: &rumoca_core::StructuredIndexDomain,
-    base_ops: &[LinearOp],
-    load_strides: &[rumoca_ir_solve::AffineStencilLoadStride],
-    const_strides: &[rumoca_ir_solve::AffineStencilConstStride],
-    span: rumoca_core::Span,
-) -> Result<(), EvalSolveError> {
-    for stride in load_strides {
-        validate_affine_dimensions(&stride.terms, domain, span)?;
-        if !matches!(
-            base_ops.get(stride.op_position),
-            Some(LinearOp::LoadY { .. } | LinearOp::LoadP { .. })
-        ) {
-            return Err(affine_map_error(
-                "affine load stride does not point at LoadY or LoadP",
-                span,
-            ));
-        }
-    }
-    for stride in const_strides {
-        validate_affine_dimensions(&stride.terms, domain, span)?;
-        if !matches!(
-            base_ops.get(stride.op_position),
-            Some(LinearOp::Const { .. })
-        ) {
-            return Err(affine_map_error(
-                "affine constant stride does not point at Const",
-                span,
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_affine_dimensions<T: AffineDimension>(
-    terms: &[T],
-    domain: &rumoca_core::StructuredIndexDomain,
-    span: rumoca_core::Span,
-) -> Result<(), EvalSolveError> {
-    if terms
-        .iter()
-        .any(|term| term.dimension() >= domain.binders.len())
-    {
-        return Err(affine_map_error(
-            "affine stride references a missing domain dimension",
-            span,
-        ));
-    }
-    Ok(())
-}
-
-trait AffineDimension {
-    fn dimension(&self) -> usize;
-}
-
-impl AffineDimension for rumoca_ir_solve::AffineStencilIndexStrideTerm {
-    fn dimension(&self) -> usize {
-        self.dimension
-    }
-}
-
-impl AffineDimension for rumoca_ir_solve::AffineStencilConstStrideTerm {
-    fn dimension(&self) -> usize {
-        self.dimension
-    }
 }
 
 fn map_domain_counts(

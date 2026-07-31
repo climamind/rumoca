@@ -104,7 +104,10 @@ flow, definition-before-use, and exactly one terminal `StoreOutput` whose
 reaching definition is a subtraction with exactly one operand equal to the
 verified target-`LoadY` register. The other operand's complete
 reaching-definition closure must not reach that target load; malformed source
-shapes and register overwrites fail closed.
+shapes and register overwrites fail closed. One Solve-IR helper validates every
+load/constant stride's operation position, operation kind, domain dimension,
+and finite constant value for compact admission, phase validation, and native
+or scalar evaluation.
 
 ### 5. Ownership Boundaries
 

@@ -670,8 +670,12 @@ mod tests {
     #[test]
     fn settlement_semantic_gate_rejects_constant_zero_and_wrong_target_maps() {
         let mut constant = direct_model();
-        let solve::ComputeNode::Map { base_ops, .. } =
-            &mut constant.problem.initialization.residual.nodes[0]
+        let solve::ComputeNode::Map {
+            base_ops,
+            load_strides,
+            const_strides,
+            ..
+        } = &mut constant.problem.initialization.residual.nodes[0]
         else {
             unreachable!()
         };
@@ -679,6 +683,8 @@ mod tests {
             LinearOp::Const { dst: 0, value: 0.0 },
             LinearOp::StoreOutput { src: 0 },
         ];
+        load_strides.clear();
+        const_strides.clear();
         let error = settle_gpu_initial_conditions(&constant, 0.0)
             .expect_err("constant-zero direct Map cannot return an unsettled y");
         assert!(error.to_string().contains("target LoadY"), "{error}");
@@ -877,12 +883,14 @@ mod tests {
         let ComputeNode::Map {
             base_ops,
             load_strides,
+            const_strides,
             ..
         } = &mut cycle.problem.initialization.residual.nodes[1]
         else {
             unreachable!()
         };
         base_ops[1] = LinearOp::LoadY { dst: 1, index: 0 };
+        const_strides.clear();
         load_strides.push(rumoca_ir_solve::AffineStencilLoadStride {
             op_position: 1,
             terms: vec![AffineStencilIndexStrideTerm {
@@ -986,6 +994,69 @@ mod tests {
                 ..
             } if message.contains("random or impure direct Map operation") && actual == span()
         ));
+    }
+
+    #[test]
+    fn settlement_semantic_gate_rejects_malformed_affine_metadata_with_owner_span() {
+        let owner_span = rumoca_core::Span::from_offsets(
+            rumoca_core::SourceId::from_source_name("direct_family_owner.mo"),
+            20,
+            30,
+        );
+        for malformed in 0..4 {
+            let mut model = direct_model();
+            model.problem.initialization.direct_families[0].span = owner_span;
+            let solve::ComputeNode::Map {
+                load_strides,
+                const_strides,
+                ..
+            } = &mut model.problem.initialization.residual.nodes[0]
+            else {
+                unreachable!()
+            };
+            let expected = match malformed {
+                0 => {
+                    const_strides.push(rumoca_ir_solve::AffineStencilConstStride {
+                        op_position: 0,
+                        terms: vec![rumoca_ir_solve::AffineStencilConstStrideTerm {
+                            dimension: 0,
+                            stride: 1.0,
+                        }],
+                    });
+                    "affine constant stride does not point at Const"
+                }
+                1 => {
+                    load_strides.push(rumoca_ir_solve::AffineStencilLoadStride {
+                        op_position: 1,
+                        terms: vec![AffineStencilIndexStrideTerm {
+                            dimension: 0,
+                            stride: 1,
+                        }],
+                    });
+                    "affine load stride does not point at LoadY or LoadP"
+                }
+                2 => {
+                    const_strides[0].terms[0].dimension = 1;
+                    "affine stride dimension is outside domain"
+                }
+                3 => {
+                    const_strides[0].terms[0].stride = f64::NAN;
+                    "affine constant stride is non-finite"
+                }
+                _ => unreachable!(),
+            };
+
+            let error = settle_gpu_initial_conditions(&model, 0.0)
+                .expect_err("malformed affine metadata must fail shared semantic admission");
+            assert!(matches!(
+                error,
+                GpuInitializationError::Malformed {
+                    ref message,
+                    span: Some(actual),
+                    ..
+                } if message.contains(expected) && actual == owner_span
+            ));
+        }
     }
 
     #[test]
