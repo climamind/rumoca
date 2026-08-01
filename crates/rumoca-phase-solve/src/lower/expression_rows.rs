@@ -8,8 +8,8 @@ use rumoca_ir_solve::{
 };
 
 use super::{
-    DirectAssignmentValue, IndexedBindingMap, LowerBuilder, LowerBuilderMetadata, LowerError,
-    Scope, compile_time, derivative_rhs,
+    DirectAssignmentValue, IndexedBindingMap, IndexedBindingSource, InitialResidualVisitMetrics,
+    LowerBuilder, LowerBuilderMetadata, LowerError, Scope, compile_time, derivative_rhs,
     function_calls::external_table_intrinsic_kind,
     helpers::{
         build_indexed_binding_map, format_usize_dims, parse_indexed_binding_key, variable_size,
@@ -32,7 +32,7 @@ struct RowLoweringContext<'a> {
     dae_variables: Option<&'a dae::DaeVariables>,
     structural_bindings: Option<Arc<IndexMap<String, f64>>>,
     direct_assignments: Option<Arc<IndexMap<String, DirectAssignmentValue>>>,
-    indexed_bindings: IndexedBindingMap,
+    indexed_bindings: IndexedBindingSource<'a>,
     is_initial_mode: bool,
     guard_target_start_before_first_clock_tick: bool,
 }
@@ -151,7 +151,8 @@ pub fn lower_expression_rows_from_expressions(
     layout: &VarLayout,
     functions: &IndexMap<rumoca_core::VarName, rumoca_core::Function>,
 ) -> Result<Vec<Vec<LinearOp>>, LowerError> {
-    let indexed_bindings = Arc::new(build_indexed_binding_map(layout));
+    let indexed_bindings =
+        IndexedBindingSource::Shared(Arc::new(build_indexed_binding_map(layout)));
     lower_expression_rows_from_expressions_with_context(
         expressions,
         RowLoweringContext {
@@ -177,7 +178,8 @@ pub fn lower_initial_expression_rows_from_expressions(
     layout: &VarLayout,
     functions: &IndexMap<rumoca_core::VarName, rumoca_core::Function>,
 ) -> Result<Vec<Vec<LinearOp>>, LowerError> {
-    let indexed_bindings = Arc::new(build_indexed_binding_map(layout));
+    let indexed_bindings =
+        IndexedBindingSource::Shared(Arc::new(build_indexed_binding_map(layout)));
     lower_expression_rows_from_expressions_with_context(
         expressions,
         RowLoweringContext {
@@ -206,7 +208,8 @@ pub fn lower_expression_rows_from_expressions_with_runtime_metadata(
     clock_timings: &IndexMap<String, dae::ClockSchedule>,
     variable_starts: &IndexMap<String, rumoca_core::Expression>,
 ) -> Result<Vec<Vec<LinearOp>>, LowerError> {
-    let indexed_bindings = Arc::new(build_indexed_binding_map(layout));
+    let indexed_bindings =
+        IndexedBindingSource::Shared(Arc::new(build_indexed_binding_map(layout)));
     lower_expression_rows_from_expressions_with_context(
         expressions,
         RowLoweringContext {
@@ -235,7 +238,8 @@ pub fn lower_initial_expression_rows_from_expressions_with_runtime_metadata(
     clock_timings: &IndexMap<String, dae::ClockSchedule>,
     variable_starts: &IndexMap<String, rumoca_core::Expression>,
 ) -> Result<Vec<Vec<LinearOp>>, LowerError> {
-    let indexed_bindings = Arc::new(build_indexed_binding_map(layout));
+    let indexed_bindings =
+        IndexedBindingSource::Shared(Arc::new(build_indexed_binding_map(layout)));
     lower_expression_rows_from_expressions_with_context(
         expressions,
         RowLoweringContext {
@@ -262,7 +266,8 @@ pub(super) fn lower_expression_rows_from_expressions_with_structural_bindings(
     functions: &IndexMap<rumoca_core::VarName, rumoca_core::Function>,
     metadata: RuntimeRowMetadata<'_>,
 ) -> Result<Vec<Vec<LinearOp>>, LowerError> {
-    let indexed_bindings = Arc::new(build_indexed_binding_map(layout));
+    let indexed_bindings =
+        IndexedBindingSource::Shared(Arc::new(build_indexed_binding_map(layout)));
     lower_expression_rows_from_expressions_with_context(
         expressions,
         RowLoweringContext {
@@ -304,7 +309,7 @@ pub(super) fn lower_observation_rows_from_expressions_with_structural_bindings(
             dae_variables: metadata.dae_variables,
             structural_bindings: metadata.structural_bindings,
             direct_assignments: None,
-            indexed_bindings,
+            indexed_bindings: IndexedBindingSource::Shared(indexed_bindings),
             is_initial_mode: false,
             guard_target_start_before_first_clock_tick: metadata
                 .guard_target_start_before_first_clock_tick,
@@ -408,7 +413,8 @@ pub(super) fn lower_expression_rows_with_mode<'a>(
         equations.push(equation);
     }
     let mut block = ComputeBlock::default();
-    let indexed_bindings = Arc::new(build_indexed_binding_map(layout));
+    let indexed_bindings =
+        IndexedBindingSource::Shared(Arc::new(build_indexed_binding_map(layout)));
     let ctx = RowLoweringContext {
         layout,
         functions,
@@ -1081,6 +1087,73 @@ pub(super) fn lower_residual_rows_and_targets_from_equations_with_mode<'a>(
     Ok((rows, targets))
 }
 
+/// Lower initial residual cells with one shared lowering context and hand each
+/// row to the caller before advancing. This is the compact structured proof
+/// path: it never retains a family-sized equation or row vector.
+pub(super) fn visit_initial_residual_cells<'a>(
+    dae_model: &dae::Dae,
+    layout: &VarLayout,
+    equations: impl IntoIterator<Item = (usize, &'a dae::Equation)>,
+    mut visit: impl FnMut(&dae::Equation, &[LinearOp]) -> Result<(), LowerError>,
+) -> Result<InitialResidualVisitMetrics, LowerError> {
+    let structural_bindings = compile_time::structural_bindings(dae_model)?;
+    let indexed_bindings = IndexedBindingSource::Borrowed(layout.indexed_bindings());
+    let mut metrics = InitialResidualVisitMetrics {
+        retained_indexed_context_entries: indexed_bindings.retained_owned_entries(),
+        retained_structural_binding_entries: structural_bindings.len(),
+        ..InitialResidualVisitMetrics::default()
+    };
+    let structural_bindings = Arc::new(structural_bindings);
+    for (row_idx, equation) in equations {
+        if equation.scalar_count == 0 {
+            continue;
+        }
+        let direct_assignments =
+            derivative_rhs::collect_referenced_missing_indexed_record_field_assignments(
+                dae_model,
+                &equation.rhs,
+                layout,
+                &structural_bindings,
+            )?;
+        metrics.retained_direct_assignment_entries = metrics
+            .retained_direct_assignment_entries
+            .max(direct_assignments.len());
+        let direct_assignments = Arc::new(direct_assignments);
+        let context = RowLoweringContext {
+            layout,
+            functions: &dae_model.symbols.functions,
+            clock_intervals: Some(&dae_model.clocks.intervals),
+            clock_timings: Some(&dae_model.clocks.timings),
+            triggered_clock_conditions: Some(&dae_model.clocks.triggered_conditions),
+            discrete_valued_names: Some(&dae_model.variables.discrete_valued),
+            variable_starts: Some(&dae_model.metadata.variable_starts),
+            dae_variables: Some(&dae_model.variables),
+            structural_bindings: Some(Arc::clone(&structural_bindings)),
+            direct_assignments: Some(Arc::clone(&direct_assignments)),
+            indexed_bindings: indexed_bindings.clone(),
+            is_initial_mode: true,
+            guard_target_start_before_first_clock_tick: false,
+        };
+        let rows = if let Some(rows) =
+            lower_scalarized_record_residual_rows(equation, row_idx, 0, &context)?
+        {
+            rows
+        } else {
+            lower_equation_residual_rows(equation, row_idx, 0, &context)?
+        };
+        metrics.peak_owned_rows = metrics.peak_owned_rows.max(rows.len());
+        validate_equation_row_count(equation, rows.len(), &context)?;
+        if rows.len() != 1 {
+            return Err(LowerError::contract_violation(
+                "structured initial proof cell must lower to exactly one residual row",
+                equation.span,
+            ));
+        }
+        visit(equation, &rows[0])?;
+    }
+    Ok(metrics)
+}
+
 fn lower_residual_rows_from_equations_core<'a>(
     dae_model: &dae::Dae,
     layout: &VarLayout,
@@ -1146,7 +1219,7 @@ fn lower_residual_rows_from_equations_core<'a>(
             dae_variables: Some(&dae_model.variables),
             structural_bindings: Some(Arc::clone(&structural_bindings)),
             direct_assignments: Some(Arc::clone(&direct_assignments)),
-            indexed_bindings: Arc::clone(&indexed_bindings),
+            indexed_bindings: IndexedBindingSource::Shared(Arc::clone(&indexed_bindings)),
             is_initial_mode,
             guard_target_start_before_first_clock_tick: false,
         };
@@ -1912,7 +1985,7 @@ fn lower_builder_for_context<'a>(
             discrete_valued_names: ctx.discrete_valued_names,
             variable_starts: ctx.variable_starts,
             dae_variables: ctx.dae_variables,
-            indexed_bindings: Some(&ctx.indexed_bindings),
+            indexed_bindings: Some(ctx.indexed_bindings.clone()),
             is_initial_mode: ctx.is_initial_mode,
         },
     )

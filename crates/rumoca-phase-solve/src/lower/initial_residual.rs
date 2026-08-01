@@ -19,6 +19,38 @@ pub fn lower_initial_residual(
     )
 }
 
+/// Lower exactly one already-materialized initial residual cell.
+pub(crate) fn lower_initial_residual_cell(
+    dae_model: &dae::Dae,
+    layout: &VarLayout,
+    equation_index: usize,
+    equation: &dae::Equation,
+) -> Result<Vec<LinearOp>, super::LowerError> {
+    let mut rows = expression_rows::lower_residual_rows_from_equations_with_mode(
+        dae_model,
+        layout,
+        [(equation_index, equation)],
+        0,
+        true,
+    )?;
+    if rows.len() != 1 {
+        return Err(super::LowerError::contract_violation(
+            "structured initial base cell must lower to exactly one residual row",
+            equation.span,
+        ));
+    }
+    Ok(rows.remove(0))
+}
+
+pub(crate) fn visit_initial_residual_cells<'a>(
+    dae_model: &dae::Dae,
+    layout: &VarLayout,
+    equations: impl IntoIterator<Item = (usize, &'a dae::Equation)>,
+    visit: impl FnMut(&dae::Equation, &[LinearOp]) -> Result<(), super::LowerError>,
+) -> Result<super::InitialResidualVisitMetrics, super::LowerError> {
+    expression_rows::visit_initial_residual_cells(dae_model, layout, equations, visit)
+}
+
 pub fn initial_residual_equations<'a>(
     dae_model: &'a dae::Dae,
     layout: &VarLayout,
