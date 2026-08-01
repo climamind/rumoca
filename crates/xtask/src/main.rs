@@ -7,6 +7,7 @@ mod lsp_benchmark_cmd;
 #[cfg(test)]
 mod main_tests;
 mod modelica_dependency_cache;
+mod omc_preflight;
 mod playground_cmd;
 mod release_cmd;
 mod repo_cli_cmd;

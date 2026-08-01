@@ -35,12 +35,23 @@ explicitly when identity crosses phase boundaries.
 | View ordering is deterministic | Domain enumeration | Backend agreement |
 | Views carry provenance | Scalar-view metadata | Diagnostics and fallback |
 | No scalar-row reassembly | Solve lowering | Prevents fragile recovery |
+| Unmaterialized interior rows are non-semantic placeholders | Flat/DAE structural metadata | Corner proof remains authoritative |
 
 Domains enumerate in binder declaration order, lexicographic with the innermost
 binder varying fastest, respecting explicit step direction. For each index
 tuple, body equations emit in source/body order. Scalar views must preserve
 parent structured/tensor id, index tuple, scalar row id, and instantiated
 lhs/rhs or output expression.
+Function projection derives slice shape from selector kind: `:` preserves the
+axis, a confirmed scalar selector removes it without evaluating its value, and
+compatible elementwise binary array operands retain that shape. Function-
+projection shape inference declines unknown or array-valued selectors and
+ranges with unknown compile-time length.
+
+For a regular family whose interiors are not materialized, only the base and
+per-binder neighbor rows carry the reconstruction proof. Structural rewrites of
+an interior placeholder do not invalidate that proof; rewrites of a corner row
+must discard the family metadata unless a new proof is produced.
 
 ### 3. DAE Canonical Form
 
@@ -49,6 +60,7 @@ lhs/rhs or output expression.
 | Structured DAE contains no source `der(...)` | DAE lowering | MLS Appendix B form |
 | Derivative families map to canonical slots | DAE structured family | Explicit state identity |
 | No parallel scalarized owner | DAE IR | Avoids drift |
+| Orphan pruning counts exact scalar references on both equation sides | Structural phases | An explicit scalar lhs is a live owner use; a shaped slice/base lhs owns only the exact scalar projection proven by DAE dimensions and `scalar_count`; an aggregate base alias alone does not keep unrelated scalar leaves |
 
 A source family such as `der(u[i, j]) = w[i, j]` is represented as residuals
 over canonical derivative slots/state metadata. The structured node owns the
@@ -70,6 +82,44 @@ comes from structured DAE domains plus affine operand proofs; Solve lowering
 must not rediscover stencils by scanning anonymous scalar rows. Backends may
 fuse or split generated kernels as target-local codegen, but the reported
 kernel inventory must match the generated work.
+
+For direct structured initialization, the same domain can pair a residual `Map`
+with a compact target `TensorOutputMap`. The target map is the sole scalar-view
+mapping for that family; creating parallel `row_targets`, `StructuredProgram`,
+or `Vec<Vec<LinearOp>>` ownership is forbidden on the compact path. The
+`ComputeBlock` remains the sole owner of the Map; initialization metadata refers
+to it by node index. `rumoca-eval-solve` executes the base program and affine
+strides natively over the domain, without per-cell `LinearOp` construction.
+Direct and fixed-start target ranges form an exact, non-overlapping affine
+partition. Fixed-start array coverage is derived from the resolved contiguous
+layout base and shape without scalar row-target materialization. Descending
+source binders are normalized to an ascending execution domain by selecting the
+corresponding source base and corners; target maps therefore remain canonical
+positive-stride maps without changing source-index semantics. Empty domains
+produce no direct node, singleton dimensions require no corner, and only
+dimensions with at least two values contribute a stride proof.
+Direct-family owners are recorded when nodes are emitted; downstream coverage
+must consume that explicit association rather than zip against the source
+family list, because empty source domains emit no node.
+Corner-derived load, constant, and target strides are admissible only after
+Solve lowering proves the reconstructed program against every materialized
+family cell. That proof reuses one lowering context and releases each scalar
+proof row before visiting the next. Missing indexed-record assignments are
+resolved only for references in the current proof cell; retaining a
+family-sized assignment map or tuple/equation/row ownership is forbidden.
+Direct-family `LoadY` dependencies form a compact causal projection
+order in the existing initialization projection envelope. Cycles, unavailable
+interiors, non-affine values, and random/impure operations fail closed at the
+first owning source span; executing a self-consistent but unproven
+reconstruction is forbidden. Wire and runtime admission require SSA register
+flow, definition-before-use, and exactly one terminal `StoreOutput` whose
+reaching definition is a subtraction with exactly one operand equal to the
+verified target-`LoadY` register. The other operand's complete
+reaching-definition closure must not reach that target load; malformed source
+shapes and register overwrites fail closed. One Solve-IR helper validates every
+load/constant stride's operation position, operation kind, domain dimension,
+and finite constant value for compact admission, phase validation, and native
+or scalar evaluation.
 
 ### 5. Ownership Boundaries
 
