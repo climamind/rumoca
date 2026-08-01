@@ -291,7 +291,7 @@ fn sympy_trace_test(source: &str, model_name: &str) {
     )
     .expect("render template");
 
-    let stdout = run_python(&rendered, SYMPY_EVAL_DRIVER);
+    let stdout = run_python(&rendered, SYMPY_EVAL_DRIVER, "SymPy");
     let result: serde_json::Value = serde_json::from_str(stdout.trim()).expect("parse JSON output");
 
     // Get reference derivatives at t=0 from rumoca simulator
@@ -356,25 +356,13 @@ print(mod.simulate())
 "#;
 
 #[cfg(feature = "template-runtime-tests")]
-fn python_has_onnx() -> bool {
-    Command::new(python_command())
-        .args(["-c", "import onnx; import onnxruntime; import numpy"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(feature = "template-runtime-tests")]
 fn onnx_trace_test(source: &str, model_name: &str) {
-    if !runtime_dependency_available(python_has_onnx(), "onnx/onnxruntime") {
-        return;
-    }
     let rendered = render_template(
         source,
         model_name,
         templates::builtin_template_source("onnx", "onnx.py.jinja").unwrap(),
     );
-    let csv = run_python(&rendered, ONNX_CSV_DRIVER);
+    let csv = run_python(&rendered, ONNX_CSV_DRIVER, "ONNX");
     let backend_traces = parse_csv_traces(&csv);
     let (dae, sim) = reference_trace(source, model_name, 1.0);
     assert_traces_match(&backend_traces, &dae.dae, &sim, C_TOLERANCE, "ONNX");
@@ -420,25 +408,13 @@ print(mod.simulate_csv())
 "#;
 
 #[cfg(feature = "template-runtime-tests")]
-fn python_has_jax() -> bool {
-    Command::new(python_command())
-        .args(["-c", "import jax; import diffrax; import numpy"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(feature = "template-runtime-tests")]
 fn jax_trace_test(source: &str, model_name: &str) {
-    if !runtime_dependency_available(python_has_jax(), "jax/diffrax") {
-        return;
-    }
     let rendered = render_template(
         source,
         model_name,
         templates::builtin_template_source("jax", "jax.py.jinja").unwrap(),
     );
-    let csv = run_python(&rendered, JAX_CSV_DRIVER);
+    let csv = run_python(&rendered, JAX_CSV_DRIVER, "JAX");
     let backend_traces = parse_csv_traces(&csv);
     let (dae, sim) = reference_trace(source, model_name, 1.0);
     assert_traces_match(&backend_traces, &dae.dae, &sim, JAX_TOLERANCE, "JAX");
