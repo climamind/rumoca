@@ -6,7 +6,10 @@ use rumoca_ir_dae as dae;
 use rumoca_ir_solve as solve;
 use rumoca_solver::{SimOptions, SimSolverMode};
 
-use super::direct::{lower_direct_dae_for_gpu_preparation, lower_direct_dae_for_simulation};
+use super::direct::{
+    gpu_dae_requires_direct_initialization, lower_direct_dae_for_gpu_preparation,
+    lower_direct_dae_for_simulation, try_lower_direct_dae_for_gpu_preparation,
+};
 use super::structural_lowering::structurally_lower_dae_for_simulation;
 use super::timing::{
     log_solve_lowering_done, log_solve_lowering_start, stage_timer_elapsed_seconds,
@@ -24,7 +27,10 @@ pub fn lower_dae_for_gpu_preparation(
     dae_model: &dae::Dae,
     opts: &SimOptions,
 ) -> Result<solve::SolveModel, rumoca_phase_solve::SolveModelLowerError> {
-    if let Some(solve_model) = lower_direct_dae_for_gpu_preparation(dae_model)? {
+    if gpu_dae_requires_direct_initialization(dae_model) {
+        return lower_direct_dae_for_gpu_preparation(dae_model);
+    }
+    if let Some(solve_model) = try_lower_direct_dae_for_gpu_preparation(dae_model)? {
         return Ok(solve_model);
     }
     let structurally_lowered = structurally_lower_dae_for_simulation(dae_model, opts)?;
