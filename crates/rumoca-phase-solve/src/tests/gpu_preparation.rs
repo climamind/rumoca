@@ -1,5 +1,112 @@
 use super::*;
 
+fn gpu_indexed_var(name: &str, index: i64, span: rumoca_core::Span) -> rumoca_core::Expression {
+    gpu_indexed_var_at(name, &[index], span)
+}
+
+fn gpu_indexed_var_at(
+    name: &str,
+    indices: &[i64],
+    span: rumoca_core::Span,
+) -> rumoca_core::Expression {
+    rumoca_core::Expression::VarRef {
+        name: source_ref(name),
+        subscripts: indices
+            .iter()
+            .map(|index| rumoca_core::Subscript::generated_index(*index, span))
+            .collect(),
+        span,
+    }
+}
+
+fn gpu_initial_family_fixture(values: &[i64], spans: &[rumoca_core::Span]) -> dae::Dae {
+    let indices = (1..=values.len() as i64)
+        .map(|index| vec![index])
+        .collect::<Vec<_>>();
+    gpu_initial_family_fixture_at(values, spans, &[values.len() as i64], indices)
+}
+
+fn gpu_initial_family_fixture_at(
+    values: &[i64],
+    spans: &[rumoca_core::Span],
+    shape: &[i64],
+    indices: Vec<Vec<i64>>,
+) -> dae::Dae {
+    assert_eq!(values.len(), spans.len());
+    assert_eq!(values.len(), indices.len());
+    let mut dae_model = dae::Dae::default();
+    dae_model
+        .variables
+        .states
+        .insert(rumoca_core::VarName::new("x"), array_var("x", shape));
+    for ((&value, &span), indices) in values.iter().zip(spans).zip(&indices) {
+        dae_model.continuous.equations.push(dae::Equation::residual(
+            binary(
+                rumoca_core::OpBinary::Sub,
+                der(gpu_indexed_var_at("x", indices, span)),
+                rumoca_core::Expression::Literal {
+                    value: rumoca_core::Literal::Integer(0),
+                    span,
+                },
+            ),
+            span,
+            "derivative row",
+        ));
+        dae_model
+            .initialization
+            .equations
+            .push(dae::Equation::residual(
+                binary(
+                    rumoca_core::OpBinary::Sub,
+                    gpu_indexed_var_at("x", indices, span),
+                    rumoca_core::Expression::Literal {
+                        value: rumoca_core::Literal::Integer(value),
+                        span,
+                    },
+                ),
+                span,
+                "structured initial row",
+            ));
+        dae_model
+            .initialization
+            .equation_provenance
+            .push(dae::InitializationEquationProvenance::User);
+    }
+    let template = dae_model.initialization.equations[0].rhs.clone();
+    let binders = shape
+        .iter()
+        .enumerate()
+        .map(|(dimension, upper)| rumoca_core::StructuredIndexBinder {
+            id: dimension,
+            display_name: format!("i{dimension}"),
+            lower: 1,
+            upper: *upper,
+            step: 1,
+        })
+        .collect();
+    dae_model
+        .initialization
+        .structured_equations
+        .push(dae::StructuredEquationFamily {
+            domain: rumoca_core::StructuredIndexDomain { binders },
+            first_equation_index: 0,
+            equation_counts: vec![1; values.len()],
+            span: spans[0],
+            origin: "structured initial fixture".to_string(),
+            regular: Some(rumoca_core::RegularForFamily {
+                binders: (0..shape.len())
+                    .map(|dimension| format!("i{dimension}"))
+                    .collect(),
+                accesses: Vec::new(),
+            }),
+            template: Some(rumoca_core::ComprehensionTemplate {
+                body: vec![template],
+            }),
+            interiors_materialized: true,
+        });
+    dae_model
+}
+
 #[test]
 fn gpu_preparation_inlines_input_driven_algebraic_in_derivative_rhs() {
     let span = solve_test_span();
@@ -75,4 +182,1042 @@ fn gpu_preparation_inlines_input_driven_algebraic_in_derivative_rhs() {
         "{:?}",
         gpu_rhs.programs[0]
     );
+}
+
+#[test]
+fn gpu_preparation_rejects_nonstructured_initial_assignment_shape() {
+    let span = solve_test_span();
+    let mut dae_model = dae::Dae::default();
+    dae_model
+        .variables
+        .states
+        .insert(rumoca_core::VarName::new("x"), scalar_var("x"));
+    dae_model.continuous.equations.push(dae::Equation::residual(
+        binary(rumoca_core::OpBinary::Sub, der(var("x")), int_expr(0)),
+        span,
+        "der(x) = 0",
+    ));
+    dae_model
+        .initialization
+        .equations
+        .push(dae::Equation::residual(
+            binary(rumoca_core::OpBinary::Sub, var("x"), int_expr(7)),
+            span,
+            "x = 7",
+        ));
+
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        1,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect_err("GPU preparation must fail closed instead of scalarizing initialization rows");
+    assert!(matches!(
+        &gpu,
+        crate::lower::LowerError::UnsupportedAt { .. }
+    ));
+    assert_eq!(gpu.source_span(), Some(span));
+}
+
+#[test]
+fn gpu_preparation_ignores_automatic_fixed_start_rows() {
+    let span = solve_test_span();
+    let mut dae_model = dae::Dae::default();
+    dae_model
+        .variables
+        .states
+        .insert(rumoca_core::VarName::new("x"), scalar_var("x"));
+    dae_model.continuous.equations.push(dae::Equation::residual(
+        binary(rumoca_core::OpBinary::Sub, der(var("x")), int_expr(0)),
+        span,
+        "der(x) = 0",
+    ));
+    dae_model
+        .initialization
+        .equations
+        .push(dae::Equation::residual(
+            binary(rumoca_core::OpBinary::Sub, var("x"), int_expr(7)),
+            span,
+            "fixed start initialization for x",
+        ));
+    dae_model
+        .initialization
+        .equation_provenance
+        .push(dae::InitializationEquationProvenance::FixedStart);
+
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        1,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("GPU preparation should retain declared fixed starts without scalar initialization");
+    assert!(gpu.initialization.residual.is_empty());
+    assert!(gpu.initialization.direct_families.is_empty());
+    assert!(gpu.initialization.row_targets.is_empty());
+}
+
+#[test]
+fn gpu_preparation_rejects_partial_fixed_start_target_coverage() {
+    let span = solve_test_span();
+    let mut dae_model = dae::Dae::default();
+    for name in ["x", "y"] {
+        dae_model
+            .variables
+            .states
+            .insert(rumoca_core::VarName::new(name), scalar_var(name));
+        dae_model.continuous.equations.push(dae::Equation::residual(
+            binary(rumoca_core::OpBinary::Sub, der(var(name)), int_expr(0)),
+            span,
+            "derivative",
+        ));
+    }
+    dae_model
+        .initialization
+        .equations
+        .push(dae::Equation::residual(
+            binary(rumoca_core::OpBinary::Sub, var("x"), int_expr(7)),
+            span,
+            "fixed start initialization for x",
+        ));
+    dae_model
+        .initialization
+        .equation_provenance
+        .push(dae::InitializationEquationProvenance::FixedStart);
+
+    let error = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        2,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect_err("partial GPU initialization coverage must fail closed");
+    assert!(error.to_string().contains("cover every solver Y slot"));
+}
+
+#[test]
+fn gpu_preparation_rejects_overlapping_fixed_start_targets_at_conflicting_span() {
+    let first_span = solve_numbered_span(301, 10, 20);
+    let conflicting_span = solve_numbered_span(301, 30, 40);
+    let mut dae_model = dae::Dae::default();
+    dae_model
+        .variables
+        .states
+        .insert(rumoca_core::VarName::new("x"), scalar_var("x"));
+    dae_model.continuous.equations.push(dae::Equation::residual(
+        binary(rumoca_core::OpBinary::Sub, der(var("x")), int_expr(0)),
+        first_span,
+        "derivative",
+    ));
+    for span in [first_span, conflicting_span] {
+        dae_model
+            .initialization
+            .equations
+            .push(dae::Equation::residual(
+                binary(rumoca_core::OpBinary::Sub, var("x"), int_expr(7)),
+                span,
+                "fixed start initialization for x",
+            ));
+        dae_model
+            .initialization
+            .equation_provenance
+            .push(dae::InitializationEquationProvenance::FixedStart);
+    }
+
+    let error = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        1,
+        Some(first_span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect_err("overlapping fixed-start ownership must fail closed");
+    assert!(error.to_string().contains("overlap"));
+    assert_eq!(error.source_span(), Some(conflicting_span));
+}
+
+#[test]
+fn gpu_preparation_emits_one_compact_fixed_range_for_array_target() {
+    let span = solve_numbered_span(302, 10, 20);
+    let mut dae_model = dae::Dae::default();
+    dae_model
+        .variables
+        .states
+        .insert(rumoca_core::VarName::new("x"), array_var("x", &[128]));
+    let mut derivative = dae::Equation::residual(
+        binary(rumoca_core::OpBinary::Sub, der(var("x")), int_expr(0)),
+        span,
+        "array derivative",
+    );
+    derivative.scalar_count = 128;
+    dae_model.continuous.equations.push(derivative);
+    let mut fixed = dae::Equation::residual(
+        binary(rumoca_core::OpBinary::Sub, var("x"), int_expr(7)),
+        span,
+        "fixed array start",
+    );
+    fixed.scalar_count = 128;
+    dae_model.initialization.equations.push(fixed);
+    dae_model
+        .initialization
+        .equation_provenance
+        .push(dae::InitializationEquationProvenance::FixedStart);
+
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        128,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("fixed array target should lower as one affine range");
+    assert_eq!(gpu.initialization.fixed_target_ranges.len(), 1);
+    assert_eq!(gpu.initialization.fixed_target_ranges[0].start, 0);
+    assert_eq!(gpu.initialization.fixed_target_ranges[0].end, 128);
+}
+
+#[test]
+fn gpu_phase_range_validation_rejects_direct_fixed_overlap_at_later_span() {
+    let first_span = solve_numbered_span(303, 10, 20);
+    let conflicting_span = solve_numbered_span(303, 30, 40);
+    let error = crate::gpu_initialization::normalize_gpu_target_ranges(
+        vec![
+            solve::InitializationTargetRange {
+                start: 0,
+                end: 2,
+                span: first_span,
+            },
+            solve::InitializationTargetRange {
+                start: 1,
+                end: 3,
+                span: conflicting_span,
+            },
+        ],
+        3,
+    )
+    .expect_err("phase validation must reject direct/fixed ownership overlap");
+    assert!(error.to_string().contains("overlap"));
+    assert_eq!(error.source_span(), Some(conflicting_span));
+}
+
+#[test]
+fn gpu_phase_range_validation_merges_adjacency_only() {
+    let span = solve_numbered_span(304, 10, 20);
+    let normalized = crate::gpu_initialization::normalize_gpu_target_ranges(
+        vec![
+            solve::InitializationTargetRange {
+                start: 0,
+                end: 1,
+                span,
+            },
+            solve::InitializationTargetRange {
+                start: 1,
+                end: 3,
+                span,
+            },
+        ],
+        3,
+    )
+    .expect("adjacent phase ranges should merge");
+    assert_eq!(normalized.len(), 1);
+    assert_eq!((normalized[0].start, normalized[0].end), (0, 3));
+}
+
+#[test]
+fn gpu_preparation_accepts_all_singleton_structured_domain() {
+    let span = solve_numbered_span(310, 10, 20);
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &gpu_initial_family_fixture_at(&[7], &[span], &[1, 1], vec![vec![1, 1]]),
+        1,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("all-singleton domain is one valid family cell");
+    assert_eq!(gpu.initialization.direct_families.len(), 1);
+    let solve::ComputeNode::Map {
+        domain,
+        load_strides,
+        const_strides,
+        ..
+    } = &gpu.initialization.residual.nodes[0]
+    else {
+        panic!("singleton structured initialization must remain a Map")
+    };
+    assert_eq!(domain.scalar_count(), Ok(1));
+    assert!(load_strides.is_empty());
+    assert!(const_strides.is_empty());
+    assert!(
+        gpu.initialization.direct_families[0]
+            .targets
+            .strides
+            .is_empty()
+    );
+}
+
+#[test]
+fn gpu_preparation_accepts_mixed_singleton_structured_domain() {
+    let spans = [
+        solve_numbered_span(311, 10, 20),
+        solve_numbered_span(311, 30, 40),
+        solve_numbered_span(311, 50, 60),
+    ];
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &gpu_initial_family_fixture_at(
+            &[1, 2, 3],
+            &spans,
+            &[1, 3],
+            vec![vec![1, 1], vec![1, 2], vec![1, 3]],
+        ),
+        3,
+        Some(spans[0]),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("singleton axes have no affine degree of freedom");
+    let solve::ComputeNode::Map {
+        domain,
+        load_strides,
+        const_strides,
+        ..
+    } = &gpu.initialization.residual.nodes[0]
+    else {
+        panic!("mixed-singleton structured initialization must remain a Map")
+    };
+    assert_eq!(domain.scalar_count(), Ok(3));
+    assert!(
+        load_strides
+            .iter()
+            .flat_map(|stride| &stride.terms)
+            .all(|term| term.dimension == 1)
+    );
+    assert!(
+        const_strides
+            .iter()
+            .flat_map(|stride| &stride.terms)
+            .all(|term| term.dimension == 1)
+    );
+}
+
+#[test]
+fn gpu_preparation_accepts_descending_singleton_structured_domain() {
+    let span = solve_numbered_span(312, 10, 20);
+    let mut dae_model = gpu_initial_family_fixture_at(&[9], &[span], &[1], vec![vec![1]]);
+    let binder = &mut dae_model.initialization.structured_equations[0]
+        .domain
+        .binders[0];
+    binder.lower = 3;
+    binder.upper = 3;
+    binder.step = -1;
+
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        1,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("descending singleton is one canonical family cell");
+    let solve::ComputeNode::Map { domain, .. } = &gpu.initialization.residual.nodes[0] else {
+        panic!("descending singleton must remain a Map")
+    };
+    assert_eq!(domain.scalar_count(), Ok(1));
+    assert_eq!(domain.binders[0].step, 1);
+}
+
+fn replay_gpu_direct_family(gpu: &solve::SolveProblem) -> Vec<f64> {
+    let family = &gpu.initialization.direct_families[0];
+    let node = &gpu.initialization.residual.nodes[family.node_index];
+    let mut y = vec![0.0; gpu.layout.y_scalars()];
+    rumoca_eval_solve::eval_map_elements_with_context(
+        node,
+        &mut y,
+        &[],
+        0.0,
+        rumoca_eval_solve::RowEvalContext::default(),
+        |ordinal, residual, y| {
+            let offset = family
+                .targets
+                .strides
+                .iter()
+                .try_fold(0isize, |offset, term| {
+                    offset.checked_add(
+                        term.stride
+                            .checked_mul(isize::try_from(ordinal[term.dimension]).ok()?)?,
+                    )
+                })
+                .expect("fixture target map must remain in host range");
+            let target = family
+                .targets
+                .start
+                .checked_add_signed(offset)
+                .expect("fixture target must remain in Y");
+            y[target] -= f64::from(family.residual_sign) * residual;
+            Ok(())
+        },
+    )
+    .expect("emitted direct family must replay natively");
+    y
+}
+
+#[test]
+fn gpu_preparation_canonicalizes_nondivisible_descending_domain_without_changing_values() {
+    let spans = [
+        solve_numbered_span(316, 10, 20),
+        solve_numbered_span(316, 30, 40),
+    ];
+    let mut dae_model =
+        gpu_initial_family_fixture_at(&[40, 20], &spans, &[2], vec![vec![2], vec![1]]);
+    let binder = &mut dae_model.initialization.structured_equations[0]
+        .domain
+        .binders[0];
+    binder.lower = 4;
+    binder.upper = 1;
+    binder.step = -2;
+
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        2,
+        Some(spans[0]),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("nondivisible descending domain must retain its source value set");
+    let solve::ComputeNode::Map { domain, .. } = &gpu.initialization.residual.nodes[0] else {
+        panic!("descending direct family must remain a Map")
+    };
+    assert_eq!(
+        (
+            domain.binders[0].lower,
+            domain.binders[0].step,
+            domain.binders[0].upper,
+        ),
+        (2, 2, 4),
+        "canonical domain must enumerate exactly the source values [2, 4]"
+    );
+    assert_eq!(gpu.initialization.direct_families[0].targets.start, 0);
+    assert_eq!(
+        gpu.initialization.direct_families[0].targets.strides,
+        vec![solve::AffineStencilIndexStrideTerm {
+            dimension: 0,
+            stride: 1,
+        }]
+    );
+    assert_eq!(replay_gpu_direct_family(&gpu), vec![20.0, 40.0]);
+}
+
+#[test]
+fn gpu_preparation_canonicalizes_wide_step_descending_singleton_at_source_lower() {
+    let span = solve_numbered_span(317, 10, 20);
+    let mut dae_model = gpu_initial_family_fixture_at(&[30], &[span], &[1], vec![vec![1]]);
+    let binder = &mut dae_model.initialization.structured_equations[0]
+        .domain
+        .binders[0];
+    binder.lower = 3;
+    binder.upper = 1;
+    binder.step = -5;
+
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        1,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("wide-step descending singleton must retain source lower");
+    let solve::ComputeNode::Map { domain, .. } = &gpu.initialization.residual.nodes[0] else {
+        panic!("descending singleton must remain a Map")
+    };
+    assert_eq!(
+        (
+            domain.binders[0].lower,
+            domain.binders[0].step,
+            domain.binders[0].upper,
+        ),
+        (3, 5, 3)
+    );
+    assert_eq!(replay_gpu_direct_family(&gpu), vec![30.0]);
+}
+
+#[test]
+fn gpu_preparation_skips_empty_structured_domain_without_a_direct_node() {
+    let span = solve_numbered_span(313, 10, 20);
+    let mut dae_model = dae::Dae::default();
+    dae_model
+        .variables
+        .states
+        .insert(rumoca_core::VarName::new("x"), scalar_var("x"));
+    dae_model.continuous.equations.push(dae::Equation::residual(
+        binary(rumoca_core::OpBinary::Sub, der(var("x")), int_expr(0)),
+        span,
+        "derivative",
+    ));
+    dae_model
+        .initialization
+        .equations
+        .push(dae::Equation::residual(
+            binary(rumoca_core::OpBinary::Sub, var("x"), int_expr(7)),
+            span,
+            "fixed start",
+        ));
+    dae_model
+        .initialization
+        .equation_provenance
+        .push(dae::InitializationEquationProvenance::FixedStart);
+    dae_model
+        .initialization
+        .structured_equations
+        .push(dae::StructuredEquationFamily {
+            domain: rumoca_core::StructuredIndexDomain {
+                binders: vec![rumoca_core::StructuredIndexBinder {
+                    id: 0,
+                    display_name: "i".to_string(),
+                    lower: 1,
+                    upper: 0,
+                    step: 1,
+                }],
+            },
+            first_equation_index: 1,
+            equation_counts: Vec::new(),
+            span,
+            origin: "empty structured initializer".to_string(),
+            regular: Some(rumoca_core::RegularForFamily {
+                binders: vec!["i".to_string()],
+                accesses: Vec::new(),
+            }),
+            template: Some(rumoca_core::ComprehensionTemplate { body: Vec::new() }),
+            interiors_materialized: true,
+        });
+
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        1,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("empty domain contributes zero initial rows");
+    assert!(gpu.initialization.residual.nodes.is_empty());
+    assert!(gpu.initialization.direct_families.is_empty());
+    assert_eq!(gpu.initialization.fixed_target_ranges.len(), 1);
+}
+
+fn reverse_ordered_direct_dependency_fixture(span: rumoca_core::Span) -> dae::Dae {
+    let domain = rumoca_core::StructuredIndexDomain {
+        binders: vec![rumoca_core::StructuredIndexBinder {
+            id: 0,
+            display_name: "i".to_string(),
+            lower: 1,
+            upper: 2,
+            step: 1,
+        }],
+    };
+    let mut dae_model = dae::Dae::default();
+    for name in ["a", "b"] {
+        dae_model
+            .variables
+            .states
+            .insert(rumoca_core::VarName::new(name), array_var(name, &[2]));
+        for index in 1..=2 {
+            dae_model.continuous.equations.push(dae::Equation::residual(
+                binary(
+                    rumoca_core::OpBinary::Sub,
+                    der(gpu_indexed_var(name, index, span)),
+                    int_expr(0),
+                ),
+                span,
+                "derivative",
+            ));
+        }
+    }
+    for index in 1..=2 {
+        dae_model
+            .initialization
+            .equations
+            .push(dae::Equation::residual(
+                binary(
+                    rumoca_core::OpBinary::Sub,
+                    gpu_indexed_var("a", index, span),
+                    binary(
+                        rumoca_core::OpBinary::Add,
+                        gpu_indexed_var("b", index, span),
+                        int_expr(1),
+                    ),
+                ),
+                span,
+                "a depends on b",
+            ));
+        dae_model
+            .initialization
+            .equation_provenance
+            .push(dae::InitializationEquationProvenance::User);
+    }
+    for index in 1..=2 {
+        dae_model
+            .initialization
+            .equations
+            .push(dae::Equation::residual(
+                binary(
+                    rumoca_core::OpBinary::Sub,
+                    gpu_indexed_var("b", index, span),
+                    rumoca_core::Expression::Literal {
+                        value: rumoca_core::Literal::Integer(index),
+                        span,
+                    },
+                ),
+                span,
+                "b source",
+            ));
+        dae_model
+            .initialization
+            .equation_provenance
+            .push(dae::InitializationEquationProvenance::User);
+    }
+    for (first_equation_index, origin) in [(0, "a depends on b"), (2, "b source")] {
+        dae_model
+            .initialization
+            .structured_equations
+            .push(dae::StructuredEquationFamily {
+                domain: domain.clone(),
+                first_equation_index,
+                equation_counts: vec![1, 1],
+                span,
+                origin: origin.to_string(),
+                regular: Some(rumoca_core::RegularForFamily {
+                    binders: vec!["i".to_string()],
+                    accesses: Vec::new(),
+                }),
+                template: Some(rumoca_core::ComprehensionTemplate {
+                    body: vec![
+                        dae_model.initialization.equations[first_equation_index]
+                            .rhs
+                            .clone(),
+                    ],
+                }),
+                interiors_materialized: true,
+            });
+    }
+    dae_model
+}
+
+#[test]
+fn gpu_preparation_builds_projection_plan_for_reverse_ordered_direct_dependencies() {
+    let span = solve_numbered_span(314, 10, 20);
+    let dae_model = reverse_ordered_direct_dependency_fixture(span);
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        4,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("reverse source order must be resolved by a compact projection plan");
+    assert_eq!(gpu.initialization.direct_families.len(), 2);
+    assert!(
+        !gpu.initialization.projection_plan.blocks.is_empty(),
+        "GPU lowering must emit an executable initialization projection contract"
+    );
+    assert_eq!(
+        gpu.initialization
+            .projection_plan
+            .blocks
+            .iter()
+            .map(|block| block.rows.as_slice())
+            .collect::<Vec<_>>(),
+        vec![&[1][..], &[0][..]],
+        "b must be projected before the source-earlier family that reads it"
+    );
+}
+
+fn empty_structured_initial_family(
+    template: &dae::StructuredEquationFamily,
+    span: rumoca_core::Span,
+) -> dae::StructuredEquationFamily {
+    let mut empty = template.clone();
+    empty.domain.binders[0].upper = 0;
+    empty.equation_counts.clear();
+    empty.span = span;
+    empty
+}
+
+#[test]
+fn gpu_initial_owner_association_skips_empty_family_before_nonempty() {
+    let span = solve_numbered_span(320, 10, 20);
+    let empty_span = solve_numbered_span(320, 30, 40);
+    let mut dae_model = gpu_initial_family_fixture(&[7, 8], &[span, span]);
+    let empty = empty_structured_initial_family(
+        &dae_model.initialization.structured_equations[0],
+        empty_span,
+    );
+    dae_model
+        .initialization
+        .structured_equations
+        .insert(0, empty);
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        2,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("empty source family must not steal the following direct owner");
+    assert_eq!(gpu.initialization.direct_families.len(), 1);
+    assert_eq!(gpu.initialization.direct_families[0].targets.start, 0);
+    assert_eq!(gpu.initialization.direct_families[0].span, span);
+    assert_eq!(gpu.initialization.projection_plan.blocks[0].rows, vec![0]);
+}
+
+#[test]
+fn gpu_initial_owner_association_skips_empty_family_between_nonempty_families() {
+    let span = solve_numbered_span(321, 10, 20);
+    let empty_span = solve_numbered_span(321, 30, 40);
+    let mut dae_model = reverse_ordered_direct_dependency_fixture(span);
+    let empty = empty_structured_initial_family(
+        &dae_model.initialization.structured_equations[0],
+        empty_span,
+    );
+    dae_model
+        .initialization
+        .structured_equations
+        .insert(1, empty);
+    let gpu = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        4,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("middle empty family must not shift later direct owners");
+    assert_eq!(
+        gpu.initialization
+            .direct_families
+            .iter()
+            .map(|family| family.targets.start)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert_eq!(
+        gpu.initialization
+            .projection_plan
+            .blocks
+            .iter()
+            .map(|block| block.rows[0])
+            .collect::<Vec<_>>(),
+        vec![1, 0]
+    );
+}
+
+#[test]
+fn gpu_preparation_rejects_direct_family_dependency_cycle() {
+    let span = solve_numbered_span(318, 10, 20);
+    let second_span = solve_numbered_span(318, 30, 40);
+    let mut dae_model = reverse_ordered_direct_dependency_fixture(span);
+    dae_model.initialization.structured_equations[1].span = second_span;
+    for (offset, index) in (1..=2).enumerate() {
+        dae_model.initialization.equations[2 + offset] = dae::Equation::residual(
+            binary(
+                rumoca_core::OpBinary::Sub,
+                gpu_indexed_var("b", index, span),
+                binary(
+                    rumoca_core::OpBinary::Add,
+                    gpu_indexed_var("a", index, span),
+                    int_expr(1),
+                ),
+            ),
+            span,
+            "b depends on a",
+        );
+    }
+    dae_model.initialization.structured_equations[1].template =
+        Some(rumoca_core::ComprehensionTemplate {
+            body: vec![dae_model.initialization.equations[2].rhs.clone()],
+        });
+
+    let error = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        4,
+        Some(span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect_err("cyclic direct-family ownership must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("cyclic direct-family dependency"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(error.source_span(), Some(span));
+}
+
+#[test]
+fn gpu_initial_projection_handles_negative_binder_steps() {
+    // Source binder traversal may descend. Target maps remain canonical dense
+    // positive-stride maps; Solve-IR validation rejects negative target strides.
+    let domain = rumoca_core::StructuredIndexDomain {
+        binders: vec![rumoca_core::StructuredIndexBinder {
+            id: 0,
+            display_name: "i".to_string(),
+            lower: 3,
+            upper: 1,
+            step: -1,
+        }],
+    };
+
+    assert_eq!(gpu_corner_cell_index(&domain, 0, solve_test_span()), Ok(1));
+}
+
+#[test]
+fn gpu_affine_proof_does_not_materialize_all_family_rows() {
+    let implementation = include_str!("../gpu_initialization.rs");
+    let visitor_implementation = include_str!("../lower/expression_rows.rs");
+    assert!(
+        !implementation.contains(".index_tuples()"),
+        "GPU proof must reuse one ordinal buffer instead of materializing every tuple"
+    );
+    assert!(
+        !implementation.contains("lower_initial_residual_cells("),
+        "GPU proof must lower and release one scalar proof row at a time"
+    );
+    let visitor = visitor_implementation
+        .split("pub(super) fn visit_initial_residual_cells")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("fn lower_residual_rows_from_equations_core")
+                .next()
+        })
+        .expect("structured proof visitor source");
+    assert!(
+        !visitor.contains("build_indexed_binding_map(layout)"),
+        "structured proof visitor must borrow indexed layout metadata instead of cloning every element"
+    );
+
+    let small_span = solve_numbered_span(315, 1, 2);
+    lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &gpu_initial_family_fixture(&[1], &[small_span]),
+        1,
+        Some(small_span),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("singleton affine family should use the same borrowed proof context");
+    let small_metrics = gpu_initialization_proof_metrics();
+
+    let values = (1..=128).collect::<Vec<_>>();
+    let spans = (0..values.len())
+        .map(|index| solve_numbered_span(319, index * 2 + 1, index * 2 + 2))
+        .collect::<Vec<_>>();
+    lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &gpu_initial_family_fixture(&values, &spans),
+        values.len(),
+        spans.first().copied(),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect("large affine family should stream through proof lowering");
+    let metrics = gpu_initialization_proof_metrics();
+    assert_eq!(metrics.cells, values.len());
+    assert_eq!(small_metrics.peak_owned_rows, 1);
+    assert_eq!(metrics.peak_owned_rows, 1);
+    assert_eq!(metrics.ordinal_slots, 1);
+    assert_eq!(
+        (
+            small_metrics.retained_indexed_context_entries,
+            metrics.retained_indexed_context_entries,
+        ),
+        (0, 0),
+        "borrowed layout metadata must retain zero new context entries at N=1 and N=128"
+    );
+    let small_owned_context = small_metrics
+        .retained_indexed_context_entries
+        .saturating_add(small_metrics.retained_direct_assignment_entries)
+        .saturating_add(small_metrics.retained_structural_binding_entries);
+    let large_owned_context = metrics
+        .retained_indexed_context_entries
+        .saturating_add(metrics.retained_direct_assignment_entries)
+        .saturating_add(metrics.retained_structural_binding_entries);
+    assert_eq!(
+        small_owned_context, large_owned_context,
+        "all owned proof-context collections must remain constant from N=1 to N=128"
+    );
+}
+
+#[test]
+fn gpu_initial_uniformity_checks_destinations_nonloads_and_load_p() {
+    let span = solve_test_span();
+    let base = vec![
+        solve::LinearOp::LoadP { dst: 0, index: 4 },
+        solve::LinearOp::Const { dst: 1, value: 2.0 },
+        solve::LinearOp::Binary {
+            dst: 2,
+            op: solve::BinaryOp::Add,
+            lhs: 0,
+            rhs: 1,
+        },
+        solve::LinearOp::StoreOutput { src: 2 },
+    ];
+    let mut corner = base.clone();
+    corner[0] = solve::LinearOp::LoadP { dst: 0, index: 7 };
+    let mut loads = Vec::new();
+    let mut constants = Vec::new();
+    append_gpu_corner_strides(&base, &corner, 0, &mut loads, &mut constants, span)
+        .expect("LoadP may vary affinely");
+    assert_eq!(loads[0].terms[0].stride, 3);
+
+    corner[2] = solve::LinearOp::Binary {
+        dst: 3,
+        op: solve::BinaryOp::Add,
+        lhs: 0,
+        rhs: 1,
+    };
+    append_gpu_corner_strides(&base, &corner, 0, &mut Vec::new(), &mut Vec::new(), span)
+        .expect_err("destination register drift must fail closed");
+}
+
+#[test]
+fn gpu_initial_projection_rejects_nonaffine_three_cell_constants_at_first_bad_row() {
+    let spans = [
+        solve_numbered_span(305, 10, 20),
+        solve_numbered_span(305, 30, 40),
+        solve_numbered_span(305, 50, 60),
+    ];
+    let dae_model = gpu_initial_family_fixture(&[1, 4, 9], &spans);
+
+    let error = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        3,
+        Some(spans[0]),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect_err("non-affine constants must not be synthesized as 1, 4, 7");
+
+    assert!(error.to_string().contains("affine"), "{error}");
+    assert_eq!(error.source_span(), Some(spans[2]));
+}
+
+#[test]
+fn gpu_initial_metadata_failures_preserve_family_and_equation_spans() {
+    let spans = [
+        solve_numbered_span(306, 10, 20),
+        solve_numbered_span(306, 30, 40),
+        solve_numbered_span(306, 50, 60),
+    ];
+    for missing_regular in [true, false] {
+        let mut dae_model = gpu_initial_family_fixture(&[1, 2, 3], &spans);
+        let family = &mut dae_model.initialization.structured_equations[0];
+        if missing_regular {
+            family.regular = None;
+        } else {
+            family.template = None;
+        }
+        let error = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+            &dae_model,
+            3,
+            Some(spans[0]),
+            SolveProblemLoweringProfile::GpuPreparation,
+        )
+        .expect_err("missing structured metadata must fail closed");
+        assert_eq!(error.source_span(), Some(spans[0]));
+    }
+
+    let mut dae_model = gpu_initial_family_fixture(&[1, 2, 3], &spans);
+    dae_model.initialization.equation_provenance.pop();
+    let error = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        3,
+        Some(spans[0]),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect_err("missing equation provenance must fail closed");
+    assert_eq!(error.source_span(), Some(spans[2]));
+}
+
+#[test]
+fn gpu_initial_coverage_failure_points_to_first_uncovered_user_equation() {
+    let spans = [
+        solve_numbered_span(307, 10, 20),
+        solve_numbered_span(307, 30, 40),
+        solve_numbered_span(307, 50, 60),
+    ];
+    let uncovered_span = solve_numbered_span(307, 70, 80);
+    let mut dae_model = gpu_initial_family_fixture(&[1, 2, 3], &spans);
+    dae_model
+        .initialization
+        .equations
+        .push(dae::Equation::residual(
+            binary(
+                rumoca_core::OpBinary::Sub,
+                gpu_indexed_var("x", 3, uncovered_span),
+                rumoca_core::Expression::Literal {
+                    value: rumoca_core::Literal::Integer(4),
+                    span: uncovered_span,
+                },
+            ),
+            uncovered_span,
+            "uncovered initial row",
+        ));
+    dae_model
+        .initialization
+        .equation_provenance
+        .push(dae::InitializationEquationProvenance::User);
+
+    let error = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &dae_model,
+        3,
+        Some(spans[0]),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect_err("mixed structured and scalar initial rows must fail closed");
+    assert_eq!(error.source_span(), Some(uncovered_span));
+}
+
+#[test]
+fn gpu_initial_direct_and_body_shape_failures_preserve_user_spans() {
+    let spans = [
+        solve_numbered_span(308, 10, 20),
+        solve_numbered_span(308, 30, 40),
+        solve_numbered_span(308, 50, 60),
+    ];
+    let mut nondirect = gpu_initial_family_fixture(&[1, 2, 3], &spans);
+    nondirect.initialization.equations[0].rhs = binary(
+        rumoca_core::OpBinary::Add,
+        gpu_indexed_var("x", 1, spans[0]),
+        int_expr(1),
+    );
+    let error = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &nondirect,
+        3,
+        Some(spans[0]),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect_err("non-direct base row must fail closed");
+    assert_eq!(error.source_span(), Some(spans[0]));
+
+    let mut mismatched = gpu_initial_family_fixture(&[1, 2, 3], &spans);
+    mismatched.initialization.equations[2].rhs = binary(
+        rumoca_core::OpBinary::Sub,
+        gpu_indexed_var("x", 3, spans[2]),
+        binary(rumoca_core::OpBinary::Add, int_expr(4), int_expr(5)),
+    );
+    let error = lower_solve_problem_with_solver_len_and_model_span_and_profile(
+        &mismatched,
+        3,
+        Some(spans[0]),
+        SolveProblemLoweringProfile::GpuPreparation,
+    )
+    .expect_err("body-shape mismatch must fail closed");
+    assert_eq!(error.source_span(), Some(spans[2]));
+
+    let mut corner = vec![solve::LinearOp::Const { dst: 0, value: 1.0 }];
+    corner.push(solve::LinearOp::StoreOutput { src: 0 });
+    let error = append_gpu_corner_strides(
+        &[solve::LinearOp::Const { dst: 0, value: 1.0 }],
+        &corner,
+        0,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        spans[1],
+    )
+    .expect_err("operation-shape mismatch must fail closed");
+    assert_eq!(error.source_span(), Some(spans[1]));
+}
+
+#[test]
+fn gpu_initial_lowering_rejects_random_operations_with_source_span() {
+    let span = solve_numbered_span(309, 10, 20);
+    let error = reject_nondeterministic_gpu_initial_ops(
+        &[solve::LinearOp::ImpureRandomInit { dst: 1, seed: 0 }],
+        span,
+    )
+    .expect_err("GPU initialization lowering must reject non-replayable operations");
+    assert!(error.to_string().contains("random or impure"));
+    assert_eq!(error.source_span(), Some(span));
 }

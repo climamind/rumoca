@@ -7,7 +7,11 @@ use rumoca_ir_dae as dae;
 use rumoca_solver::{SimOptions, SimSolverMode};
 
 use super::diagnostics::SimulationDiagnosticError;
-use super::entry::{lower_dae_for_simulation, lower_dae_for_simulation_with_stage_timing};
+use super::direct::try_lower_direct_dae_for_gpu_preparation;
+use super::entry::{
+    lower_dae_for_gpu_preparation, lower_dae_for_simulation,
+    lower_dae_for_simulation_with_stage_timing,
+};
 use super::probe::{eval_dae_at, jacobian_for_dae};
 use super::structural_lowering::{
     metadata_attachment_lower_error, prepare_dae_after_boundary_elimination,
@@ -28,6 +32,36 @@ fn simulation_structural_lowering_keeps_observations_for_torn_variables() {
     assert_eq!(model.visible_names, ["a", "b", "c"]);
     assert_eq!(model.visible_value_rows.len(), model.visible_names.len());
     assert_eq!(model.problem.solve_layout.solver_maps.names.len(), 1);
+}
+
+#[test]
+fn gpu_preparation_restores_structural_funnel_after_direct_rejection() {
+    let mut dae = exact_alias_state_dae();
+    dae.initialization.equations.push(dae::Equation::explicit(
+        VarName::new("x"),
+        real(1.0),
+        fixture_span(),
+        "typed fixed start",
+    ));
+    dae.initialization
+        .equation_provenance
+        .push(dae::InitializationEquationProvenance::FixedStart);
+    assert!(
+        try_lower_direct_dae_for_gpu_preparation(&dae)
+            .expect("direct eligibility check should not fail")
+            .is_none(),
+        "exact-alias fixture must exercise the structural fallback"
+    );
+    let model = lower_dae_for_gpu_preparation(&dae, &SimOptions::default())
+        .expect("public GPU preparation should retain structural compatibility");
+    model
+        .problem
+        .validate_shape_contract()
+        .expect("structural GPU fallback artifact should be valid");
+    assert!(
+        !model.problem.initialization.fixed_target_ranges.is_empty(),
+        "typed FixedStart provenance must survive the structural funnel"
+    );
 }
 
 #[test]

@@ -1321,6 +1321,9 @@ mod tests {
                 initialization: solve::InitializationSolveSystem {
                     residual: ComputeBlock::from_scalar_program_block(zero.clone()),
                     row_targets: Vec::new(),
+                    direct_families: Vec::new(),
+                    required_target_ranges: Vec::new(),
+                    fixed_target_ranges: Vec::new(),
                     projection_indices: Vec::new(),
                     projection_plan: solve::AlgebraicProjectionPlan::default(),
                     update_rhs: solve::ScalarProgramBlock::default(),
@@ -1408,11 +1411,7 @@ mod tests {
                         zero_row(),
                         zero_row(),
                     ])),
-                    row_targets: Vec::new(),
-                    projection_indices: Vec::new(),
-                    projection_plan: solve::AlgebraicProjectionPlan::default(),
-                    update_rhs: solve::ScalarProgramBlock::default(),
-                    update_targets: Vec::new(),
+                    ..Default::default()
                 },
                 discrete: solve::DiscreteSolveSystem::default(),
                 events: solve::SolveEventPartition {
