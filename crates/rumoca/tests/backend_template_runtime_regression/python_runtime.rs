@@ -59,13 +59,18 @@ fn resolve_python<'a>(
     ))
 }
 
-fn python_command(backend: &str) -> &'static str {
-    resolve_python(["python3", "python"], backend, python_modules(backend))
-        .unwrap_or_else(|error| panic!("{error}"))
+pub(super) fn run_python(rendered: &str, driver: &str, backend: &str) -> String {
+    run_python_with_candidates(rendered, driver, backend, ["python3", "python"])
 }
 
-pub(super) fn run_python(rendered: &str, driver: &str, backend: &str) -> String {
-    let python = python_command(backend);
+fn run_python_with_candidates<'a>(
+    rendered: &str,
+    driver: &str,
+    backend: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let python = resolve_python(candidates, backend, python_modules(backend))
+        .unwrap_or_else(|error| panic!("{error}"));
     let dir = Builder::new()
         .prefix("rumoca_runtime_test_")
         .tempdir()
@@ -108,7 +113,7 @@ fn probe_executable(dir: &std::path::Path, name: &str, body: &str) -> std::path:
 const CANDIDATE_PROBE: &str = r#"#!/bin/sh
 dir=${0%/*}
 name=${0##*/}
-printf '%s\n' "$@" > "$dir/$name.args"
+printf '%s\n' "$@" >> "$dir/$name.args"
 if [ "$1" = --version ]; then exit 0; fi
 if [ "$name" = python-capable ]; then exit 0; fi
 echo "ModuleNotFoundError: $name lacks ONNX" >&2
@@ -125,7 +130,7 @@ fn python_runtime_probe_contract_modules_are_backend_specific() {
 
 #[test]
 #[cfg(unix)]
-fn python_runtime_probe_contract_selects_backend_capable_candidate() {
+fn python_runtime_probe_contract_reuses_backend_capable_candidate_for_driver() {
     let dir = Builder::new()
         .prefix("rumoca_python_candidates_")
         .tempdir()
@@ -137,17 +142,22 @@ fn python_runtime_probe_contract_selects_backend_capable_candidate() {
         second.to_str().expect("UTF-8 second candidate"),
     ];
 
+    run_python_with_candidates("unused rendered model", "unused driver", "ONNX", candidates);
+
+    let expected_import = "import onnx, onnxruntime, numpy";
+    let first_args = fs::read_to_string(dir.path().join("python-first.args"))
+        .expect("read first candidate argv");
     assert_eq!(
-        resolve_python(candidates, "ONNX", python_modules("ONNX")).expect("resolve Python"),
-        candidates[1]
+        first_args.lines().collect::<Vec<_>>(),
+        ["--version", "-c", expected_import]
     );
-    for candidate in ["python-first", "python-capable"] {
-        assert_eq!(
-            fs::read_to_string(dir.path().join(format!("{candidate}.args")))
-                .expect("read candidate argv"),
-            "-c\nimport onnx, onnxruntime, numpy\n"
-        );
-    }
+
+    let second_args = fs::read_to_string(dir.path().join("python-capable.args"))
+        .expect("read capable candidate argv");
+    let second_args = second_args.lines().collect::<Vec<_>>();
+    assert_eq!(&second_args[..3], ["--version", "-c", expected_import]);
+    assert!(second_args[3].ends_with("/driver.py"));
+    assert_eq!(second_args.len(), 4);
 }
 
 #[test]
