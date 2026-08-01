@@ -730,7 +730,10 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 Some(dims) => {
                     scope.dims.insert(input.name.clone(), dims);
                 }
-                None if input.dims.is_empty() && !formal_accepts_structured_actual(input) => {
+                None if input.dims.is_empty()
+                    && input.shape_expr.is_empty()
+                    && !formal_accepts_structured_actual(input) =>
+                {
                     scope.dims.insert(input.name.clone(), Vec::new());
                 }
                 None => {}
@@ -1868,6 +1871,9 @@ impl<'a> FunctionProjectionAnalysis<'a> {
     ) -> Result<rumoca_core::Expression, LowerError> {
         if let Some((name, subscripts, span)) = indexed_var_selection(value)
             && let Some(values) = scope.scalars.get(name.as_str())
+            && self
+                .expr_dims_with_owner(value, scope, depth + 1, span)?
+                .is_some_and(|dims| dims.is_empty())
         {
             let dims = scope.dims.get(name.as_str()).ok_or_else(|| {
                 LowerError::contract_violation(
