@@ -269,13 +269,10 @@ fn plain_runtime_selector(
     if analysis.structural_bindings.contains_key(name.as_str()) {
         return false;
     }
-    let Some(replacement) = scope.full.get(name.as_str()) else {
-        return true;
-    };
-    if analysis.compile_time_scalar(replacement).is_some() {
-        return false;
-    }
-    true
+    scope
+        .full
+        .get(name.as_str())
+        .is_none_or(|replacement| is_same_plain_var_ref(replacement, name.as_str()))
 }
 
 fn positive_i64_from_compile_time_scalar(value: f64) -> Option<i64> {
