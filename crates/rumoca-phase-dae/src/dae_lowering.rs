@@ -3979,14 +3979,18 @@ impl Projector<'_> {
                 else {
                     return Ok(None);
                 };
-                if matches!(op, OpBinary::Mul | OpBinary::MulElem) {
-                    product_dims(op, &lhs_dims, &rhs_dims, span).map(Some)
-                } else if (lhs_dims.is_empty() && rhs_dims.is_empty())
-                    || (matches!(op, OpBinary::Add | OpBinary::Sub) && lhs_dims == rhs_dims)
-                {
-                    Ok(Some(lhs_dims))
-                } else {
-                    Err(projection_error("unknown operand shape", span))
+                match op {
+                    OpBinary::Mul | OpBinary::MulElem => {
+                        product_dims(op, &lhs_dims, &rhs_dims, span).map(Some)
+                    }
+                    OpBinary::Div => division_dims(&lhs_dims, &rhs_dims, span).map(Some),
+                    OpBinary::DivElem => elementwise_dims(&lhs_dims, &rhs_dims, span).map(Some),
+                    _ if lhs_dims.is_empty() && rhs_dims.is_empty()
+                        || matches!(op, OpBinary::Add | OpBinary::Sub) && lhs_dims == rhs_dims =>
+                    {
+                        Ok(Some(lhs_dims))
+                    }
+                    _ => Err(projection_error("unknown operand shape", span)),
                 }
             }
             _ => Ok(None),
@@ -4019,14 +4023,17 @@ impl Projector<'_> {
                 .ok_or_else(|| projection_error("result shape mismatch", *span))?;
             return self.element(expr, &indices, *span).map(Some);
         }
-        if !matches!(op, OpBinary::Mul | OpBinary::MulElem) {
-            return Ok(None);
+        if matches!(op, OpBinary::MulElem | OpBinary::Div | OpBinary::DivElem) {
+            return self.project_lanewise_binary(expr, k, target_dims);
+        }
+        if !matches!(op, OpBinary::Mul) {
+            return self.project_non_binary(expr);
         }
         if target_dims.iter().any(|dim| *dim < 0) {
             return Err(projection_error("negative dimension", *span));
         }
-        let lhs_dims = self.dims(lhs, *span)?;
-        let rhs_dims = self.dims(rhs, *span)?;
+        let lhs_dims = self.product_candidate_operand_dims(lhs, *span)?;
+        let rhs_dims = self.product_candidate_operand_dims(rhs, *span)?;
         if scalar_times_unknown_non_product(self, lhs, &lhs_dims, rhs, &rhs_dims)? {
             return Ok(None);
         }
@@ -4061,14 +4068,6 @@ impl Projector<'_> {
         }
         let indices = projection_lane_indices(k, target_dims)
             .ok_or_else(|| projection_error("result shape mismatch", *span))?;
-        if matches!(op, OpBinary::MulElem) {
-            return Ok(Some(vectorized_binary_expr(
-                op.clone(),
-                self.element(lhs, &indices, *span)?,
-                self.element(rhs, &indices, *span)?,
-                *span,
-            )));
-        }
         if lhs_dims.is_empty() || rhs_dims.is_empty() {
             let lhs_indices: &[i64] = if lhs_dims.is_empty() { &[] } else { &indices };
             let rhs_indices: &[i64] = if rhs_dims.is_empty() { &[] } else { &indices };
@@ -4095,6 +4094,44 @@ impl Projector<'_> {
         dot_product_expr(&lhs_values, &rhs_values, *span)
             .map(Some)
             .ok_or_else(|| projection_error("unsupported inner dimension", *span))
+    }
+
+    fn project_lanewise_binary(
+        &self,
+        expr: &Expr,
+        k: usize,
+        target_dims: &[i64],
+    ) -> Result<Option<Expr>, ToDaeError> {
+        let Expr::Binary { op, lhs, rhs, span } = expr else {
+            unreachable!("lane-wise projection requires a binary expression");
+        };
+        if target_dims.iter().any(|dim| *dim < 0) {
+            return Err(projection_error("negative dimension", *span));
+        }
+        let lhs_dims = self
+            .dims(lhs, *span)?
+            .ok_or_else(|| projection_error("unknown operand shape", *span))?;
+        let rhs_dims = self
+            .dims(rhs, *span)?
+            .ok_or_else(|| projection_error("unknown operand shape", *span))?;
+        let result_dims = match op {
+            OpBinary::MulElem | OpBinary::DivElem => elementwise_dims(&lhs_dims, &rhs_dims, *span)?,
+            OpBinary::Div => division_dims(&lhs_dims, &rhs_dims, *span)?,
+            _ => unreachable!("unsupported lane-wise binary operator"),
+        };
+        if result_dims != target_dims {
+            return Err(projection_error("result shape mismatch", *span));
+        }
+        let indices = projection_lane_indices(k, target_dims)
+            .ok_or_else(|| projection_error("result shape mismatch", *span))?;
+        let lhs_indices: &[i64] = if lhs_dims.is_empty() { &[] } else { &indices };
+        let rhs_indices: &[i64] = if rhs_dims.is_empty() { &[] } else { &indices };
+        Ok(Some(vectorized_binary_expr(
+            op.clone(),
+            self.element(lhs, lhs_indices, *span)?,
+            self.element(rhs, rhs_indices, *span)?,
+            *span,
+        )))
     }
 
     fn project_non_binary(&self, expr: &Expr) -> Result<Option<Expr>, ToDaeError> {
@@ -4444,9 +4481,7 @@ fn scalar_times_unknown_non_product(
 }
 fn product_dims(op: &OpBinary, lhs: &[i64], rhs: &[i64], at: Span) -> Result<Vec<i64>, ToDaeError> {
     if matches!(op, OpBinary::MulElem) {
-        return (lhs == rhs)
-            .then(|| lhs.to_vec())
-            .ok_or_else(|| projection_error("elementwise shape mismatch", at));
+        return elementwise_dims(lhs, rhs, at);
     }
     match (lhs.len(), rhs.len()) {
         (0, _) => Ok(rhs.to_vec()),
@@ -4459,6 +4494,20 @@ fn product_dims(op: &OpBinary, lhs: &[i64], rhs: &[i64], at: Span) -> Result<Vec
         (2, 2) => Ok(vec![lhs[0], rhs[1]]),
         _ => unreachable!(),
     }
+}
+fn elementwise_dims(lhs: &[i64], rhs: &[i64], at: Span) -> Result<Vec<i64>, ToDaeError> {
+    if lhs.is_empty() {
+        return Ok(rhs.to_vec());
+    }
+    if rhs.is_empty() || lhs == rhs {
+        return Ok(lhs.to_vec());
+    }
+    Err(projection_error("elementwise shape mismatch", at))
+}
+fn division_dims(lhs: &[i64], rhs: &[i64], at: Span) -> Result<Vec<i64>, ToDaeError> {
+    rhs.is_empty()
+        .then(|| lhs.to_vec())
+        .ok_or_else(|| projection_error("division requires scalar divisor", at))
 }
 fn proven_projected_dims(dims: &[i64], subscripts: &[Subscript]) -> Option<Vec<i64>> {
     (subscripts.len() <= dims.len()).then_some(())?;
