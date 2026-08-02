@@ -49,12 +49,15 @@ rustc --version
 cargo --version
 ```
 
-MSL parity uses the exact OpenModelica Debian package recorded in
-`toolchains/openmodelica-version`. CI installs that package by exact equality,
-and local installations and CI must report the exact runtime identity formed by
-removing only the package pin's trailing Debian revision before a full MSL
-result is comparable. The CI installer rejects older, silently upgraded,
-pre-release, and build outputs.
+MSL parity uses the exact OpenModelica Debian build recorded in
+`toolchains/openmodelica-version`. CI downloads the four official package files
+listed in `toolchains/openmodelica-packages.txt`, verifies their committed
+SHA-256 digests and Debian `Package`/`Version`/`Architecture` metadata before
+installation, and then requires each installed package version to match the
+pin. Local installations and CI must report the exact runtime identity formed
+by removing only the pin's trailing Debian revision before a full MSL result is
+comparable. Older, silently upgraded, pre-release, and different build outputs
+are rejected.
 
 Run the reusable preflight before diagnosing MSL parity failures:
 
