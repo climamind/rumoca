@@ -4099,10 +4099,12 @@ impl Projector<'_> {
 
     fn project_non_binary(&self, expr: &Expr) -> Result<Option<Expr>, ToDaeError> {
         if self.has_descendant_matrix_multiply_candidate(expr, false)? {
-            return Err(projection_error(
-                "unsupported matrix-product wrapper",
-                expr.span().unwrap_or(Span::DUMMY),
-            ));
+            return Err(match expr.span() {
+                Some(span) => projection_error("unsupported matrix-product wrapper", span),
+                None => ToDaeError::runtime_contract_violation(
+                    "DAE matrix-product projection: unsupported matrix-product wrapper",
+                ),
+            });
         }
         Ok(None)
     }
