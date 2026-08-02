@@ -13,10 +13,10 @@ strict-ir-validation = []
 rumoca-core = { workspace = true }
 indexmap = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 bincode = { workspace = true }
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

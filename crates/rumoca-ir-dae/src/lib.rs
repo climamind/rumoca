@@ -27,7 +27,7 @@ use rumoca_core::{
 use serde::ser::{SerializeStruct, SerializeTuple};
 use serde::{Deserialize, Serialize};
 
-pub const DAE_SCHEMA_VERSION: u16 = 7;
+pub const DAE_SCHEMA_VERSION: u16 = 8;
 
 mod event_threshold;
 mod expr_query;
@@ -268,18 +268,43 @@ impl Serialize for Dae {
     }
 }
 
+fn validate_dae_schema_version<E>(schema_version: u16) -> Result<(), E>
+where
+    E: serde::de::Error,
+{
+    if schema_version == DAE_SCHEMA_VERSION {
+        return Ok(());
+    }
+    Err(E::custom(format!(
+        "unsupported DAE schema_version {schema_version}; expected {DAE_SCHEMA_VERSION}"
+    )))
+}
+
+fn deserialize_human_readable_dae_wire<'de, D>(deserializer: D) -> Result<DaeWire, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+        .ok_or_else(|| serde::de::Error::custom("DAE schema_version must be an explicit u16"))?;
+    validate_dae_schema_version::<D::Error>(schema_version)?;
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
 impl<'de> Deserialize<'de> for Dae {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let wire = DaeWire::deserialize(deserializer)?;
-        if wire.schema_version != DAE_SCHEMA_VERSION {
-            return Err(serde::de::Error::custom(format!(
-                "unsupported DAE schema_version {}; expected {}",
-                wire.schema_version, DAE_SCHEMA_VERSION
-            )));
-        }
+        let wire = if deserializer.is_human_readable() {
+            deserialize_human_readable_dae_wire(deserializer)?
+        } else {
+            DaeWire::deserialize(deserializer)?
+        };
+        validate_dae_schema_version::<D::Error>(wire.schema_version)?;
         if wire.initial_equations.len() != wire.initial_equation_provenance.len() {
             return Err(serde::de::Error::custom(
                 "DAE initial equation provenance cardinality mismatch",
@@ -1514,6 +1539,22 @@ mod tests {
         let err = serde_json::from_value::<Dae>(unsupported)
             .expect_err("unsupported DAE schema version must fail");
         assert!(err.to_string().contains("unsupported DAE schema_version"));
+    }
+
+    #[test]
+    fn test_dae_json_rejects_v7_after_scheduled_event_wire_change() {
+        let mut stale_v7 = serde_json::to_value(Dae::default()).expect("DAE should serialize");
+        stale_v7["schema_version"] = serde_json::json!(7);
+        stale_v7["scheduled_time_events"] = serde_json::json!([1.0]);
+
+        let error = serde_json::from_value::<Dae>(stale_v7)
+            .expect_err("the pre-object scheduled-time-event schema must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported DAE schema_version 7; expected 8"),
+            "version rejection must identify the stale and required versions: {error}"
+        );
     }
 
     #[test]

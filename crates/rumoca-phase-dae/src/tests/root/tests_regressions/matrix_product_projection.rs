@@ -291,6 +291,53 @@ fn dae_scaling_with_missing_base(variants: &[&str]) -> rumoca_ir_dae::Dae {
     dae
 }
 
+fn wrapped_matrix_vector_model(rhs: Expression) -> Model {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "A", &[2, 3]);
+    declare_array(&mut flat, "B", &[2, 3]);
+    declare_array(&mut flat, "x", &[3]);
+    declare_array(&mut flat, "y", &[2]);
+    declare_array(&mut flat, "c", &[]);
+    add_equation(&mut flat, colon_vector("y"), rhs, 2);
+    flat
+}
+
+fn matrix_vector_product(name: &str) -> Expression {
+    multiply(colon_array(name, 2), colon_vector("x"))
+}
+
+#[test]
+fn test_todae_rejects_unary_wrapper_around_matrix_product() {
+    let flat = wrapped_matrix_vector_model(Expression::Unary {
+        op: rumoca_core::OpUnary::Minus,
+        rhs: Box::new(matrix_vector_product("A")),
+        span: crate::test_support::test_span(),
+    });
+
+    assert_projection_error(&flat, "unsupported matrix-product wrapper");
+}
+
+#[test]
+fn test_todae_rejects_nonscalar_builtin_wrapper_around_matrix_product() {
+    let flat = wrapped_matrix_vector_model(builtin(
+        rumoca_core::BuiltinFunction::Sin,
+        vec![matrix_vector_product("A")],
+    ));
+
+    assert_projection_error(&flat, "unsupported matrix-product wrapper");
+}
+
+#[test]
+fn test_todae_rejects_if_wrapper_around_matrix_products() {
+    let flat = wrapped_matrix_vector_model(Expression::If {
+        branches: vec![(make_structured_var_ref("c"), matrix_vector_product("A"))],
+        else_branch: Box::new(matrix_vector_product("B")),
+        span: crate::test_support::test_span(),
+    });
+
+    assert_projection_error(&flat, "unsupported matrix-product wrapper");
+}
+
 #[test]
 fn test_todae_preserves_ordinary_scalar_product_operands() {
     let cases = [

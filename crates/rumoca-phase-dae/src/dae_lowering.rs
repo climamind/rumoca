@@ -3999,6 +3999,12 @@ impl Projector<'_> {
         target_dims: &[i64],
     ) -> Result<Option<Expr>, ToDaeError> {
         let Expr::Binary { op, lhs, rhs, span } = expr else {
+            if self.has_descendant_matrix_product_candidate(expr, false)? {
+                return Err(projection_error(
+                    "unsupported matrix-product wrapper",
+                    expr.span().unwrap_or(Span::DUMMY),
+                ));
+            }
             return Ok(None);
         };
         if matches!(op, OpBinary::Add | OpBinary::Sub) {
