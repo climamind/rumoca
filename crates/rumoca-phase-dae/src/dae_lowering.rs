@@ -3999,7 +3999,7 @@ impl Projector<'_> {
         target_dims: &[i64],
     ) -> Result<Option<Expr>, ToDaeError> {
         let Expr::Binary { op, lhs, rhs, span } = expr else {
-            if self.has_descendant_matrix_product_candidate(expr, false)? {
+            if self.has_descendant_matrix_multiply_candidate(expr, false)? {
                 return Err(projection_error(
                     "unsupported matrix-product wrapper",
                     expr.span().unwrap_or(Span::DUMMY),
@@ -4220,13 +4220,28 @@ impl Projector<'_> {
         expr: &Expr,
         allow_non_scalar_evidence: bool,
     ) -> Result<bool, ToDaeError> {
+        self.has_descendant_product_candidate(expr, allow_non_scalar_evidence, true)
+    }
+
+    fn has_descendant_matrix_multiply_candidate(
+        &self,
+        expr: &Expr,
+        allow_non_scalar_evidence: bool,
+    ) -> Result<bool, ToDaeError> {
+        self.has_descendant_product_candidate(expr, allow_non_scalar_evidence, false)
+    }
+
+    fn has_descendant_product_candidate(
+        &self,
+        expr: &Expr,
+        allow_non_scalar_evidence: bool,
+        include_elementwise: bool,
+    ) -> Result<bool, ToDaeError> {
         match expr {
-            Expr::Binary {
-                op: OpBinary::Mul | OpBinary::MulElem,
-                lhs,
-                rhs,
-                span,
-            } => {
+            Expr::Binary { op, lhs, rhs, span }
+                if matches!(op, OpBinary::Mul)
+                    || include_elementwise && matches!(op, OpBinary::MulElem) =>
+            {
                 let operands = [lhs.as_ref(), rhs.as_ref()];
                 let operand_dims = operands
                     .iter()
@@ -4245,7 +4260,13 @@ impl Projector<'_> {
                 if operand_dims.iter().flatten().any(Vec::is_empty) {
                     return operands
                         .into_iter()
-                        .map(|operand| self.has_descendant_matrix_product_candidate(operand, false))
+                        .map(|operand| {
+                            self.has_descendant_product_candidate(
+                                operand,
+                                false,
+                                include_elementwise,
+                            )
+                        })
                         .collect::<Result<Vec<_>, _>>()
                         .map(|candidates| candidates.into_iter().any(std::convert::identity));
                 }
@@ -4257,26 +4278,41 @@ impl Projector<'_> {
                         .map(|(operand, _)| {
                             Ok::<bool, ToDaeError>(
                                 has_array_slice_syntax(operand)
-                                    || self
-                                        .has_descendant_matrix_product_candidate(operand, true)?,
+                                    || self.has_descendant_product_candidate(
+                                        operand,
+                                        true,
+                                        include_elementwise,
+                                    )?,
                             )
                         })
                         .collect::<Result<Vec<_>, _>>()?
                         .into_iter()
                         .any(std::convert::identity))
             }
-            Expr::Binary { lhs, rhs, .. } => Ok(self
-                .has_descendant_matrix_product_candidate(lhs, allow_non_scalar_evidence)?
-                || self.has_descendant_matrix_product_candidate(rhs, allow_non_scalar_evidence)?),
-            Expr::Unary { rhs, .. } => {
-                self.has_descendant_matrix_product_candidate(rhs, allow_non_scalar_evidence)
-            }
+            Expr::Binary { lhs, rhs, .. } => Ok(self.has_descendant_product_candidate(
+                lhs,
+                allow_non_scalar_evidence,
+                include_elementwise,
+            )? || self.has_descendant_product_candidate(
+                rhs,
+                allow_non_scalar_evidence,
+                include_elementwise,
+            )?),
+            Expr::Unary { rhs, .. } => self.has_descendant_product_candidate(
+                rhs,
+                allow_non_scalar_evidence,
+                include_elementwise,
+            ),
             Expr::BuiltinCall { function, args, .. }
                 if !builtin_is_scalar_boundary(function, args.len()) =>
             {
                 args.iter()
                     .map(|arg| {
-                        self.has_descendant_matrix_product_candidate(arg, allow_non_scalar_evidence)
+                        self.has_descendant_product_candidate(
+                            arg,
+                            allow_non_scalar_evidence,
+                            include_elementwise,
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map(|candidates| candidates.into_iter().any(std::convert::identity))
@@ -4289,16 +4325,18 @@ impl Projector<'_> {
                 let branch_candidates = branches
                     .iter()
                     .map(|(_, value)| {
-                        self.has_descendant_matrix_product_candidate(
+                        self.has_descendant_product_candidate(
                             value,
                             allow_non_scalar_evidence,
+                            include_elementwise,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(branch_candidates.into_iter().any(std::convert::identity)
-                    || self.has_descendant_matrix_product_candidate(
+                    || self.has_descendant_product_candidate(
                         else_branch,
                         allow_non_scalar_evidence,
+                        include_elementwise,
                     )?)
             }
             _ if allow_non_scalar_evidence => {

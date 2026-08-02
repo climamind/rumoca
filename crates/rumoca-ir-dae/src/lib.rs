@@ -280,30 +280,12 @@ where
     )))
 }
 
-fn deserialize_human_readable_dae_wire<'de, D>(deserializer: D) -> Result<DaeWire, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    let schema_version = value
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|version| u16::try_from(version).ok())
-        .ok_or_else(|| serde::de::Error::custom("DAE schema_version must be an explicit u16"))?;
-    validate_dae_schema_version::<D::Error>(schema_version)?;
-    serde_json::from_value(value).map_err(serde::de::Error::custom)
-}
-
 impl<'de> Deserialize<'de> for Dae {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let wire = if deserializer.is_human_readable() {
-            deserialize_human_readable_dae_wire(deserializer)?
-        } else {
-            DaeWire::deserialize(deserializer)?
-        };
+        let wire = DaeWire::deserialize(deserializer)?;
         validate_dae_schema_version::<D::Error>(wire.schema_version)?;
         if wire.initial_equations.len() != wire.initial_equation_provenance.len() {
             return Err(serde::de::Error::custom(
@@ -1547,14 +1529,106 @@ mod tests {
         stale_v7["schema_version"] = serde_json::json!(7);
         stale_v7["scheduled_time_events"] = serde_json::json!([1.0]);
 
-        let error = serde_json::from_value::<Dae>(stale_v7)
+        serde_json::from_value::<Dae>(stale_v7)
             .expect_err("the pre-object scheduled-time-event schema must be rejected");
+    }
+
+    #[test]
+    fn test_dae_yaml_roundtrip_preserves_schema_v8_wire() {
+        let mut expected = Dae::default();
+        expected
+            .events
+            .scheduled_time_events
+            .push(super::DaeScheduledTimeEvent {
+                time: 1.25,
+                source_span: Some(fixture_span()),
+            });
+
+        let yaml = serde_yaml::to_string(&expected).expect("DAE should serialize as YAML");
+        let actual: Dae = serde_yaml::from_str(&yaml).expect("schema-v8 YAML should deserialize");
+
+        assert_eq!(actual.schema_version, DAE_SCHEMA_VERSION);
+        assert_eq!(
+            actual.events.scheduled_time_events,
+            expected.events.scheduled_time_events
+        );
+    }
+
+    #[test]
+    fn test_dae_yaml_rejects_v7_current_shape_by_schema_version() {
+        let yaml = serde_yaml::to_string(&Dae::default()).expect("DAE should serialize as YAML");
+        let stale_v7 = yaml.replacen("schema_version: 8", "schema_version: 7", 1);
+
+        let error = serde_yaml::from_str::<Dae>(&stale_v7)
+            .expect_err("the previous DAE schema version must be rejected");
         assert!(
             error
                 .to_string()
                 .contains("unsupported DAE schema_version 7; expected 8"),
             "version rejection must identify the stale and required versions: {error}"
         );
+    }
+
+    #[test]
+    fn test_dae_yaml_rejects_real_v7_numeric_event_wire() {
+        let yaml = serde_yaml::to_string(&Dae::default()).expect("DAE should serialize as YAML");
+        let stale_v7 = yaml
+            .replacen("schema_version: 8", "schema_version: 7", 1)
+            .replacen(
+                "scheduled_time_events: []",
+                "scheduled_time_events:\n- 1.0",
+                1,
+            );
+
+        serde_yaml::from_str::<Dae>(&stale_v7)
+            .expect_err("the pre-object scheduled-time-event schema must be rejected");
+    }
+
+    #[test]
+    fn test_dae_ron_roundtrip_preserves_schema_v8_wire() {
+        let mut expected = Dae::default();
+        expected
+            .events
+            .scheduled_time_events
+            .push(super::DaeScheduledTimeEvent {
+                time: 1.25,
+                source_span: Some(fixture_span()),
+            });
+
+        let ron = ron::to_string(&expected).expect("DAE should serialize as RON");
+        let actual: Dae = ron::from_str(&ron).expect("schema-v8 RON should deserialize");
+
+        assert_eq!(actual.schema_version, DAE_SCHEMA_VERSION);
+        assert_eq!(
+            actual.events.scheduled_time_events,
+            expected.events.scheduled_time_events
+        );
+    }
+
+    #[test]
+    fn test_dae_ron_rejects_v7_current_shape_by_schema_version() {
+        let ron = ron::to_string(&Dae::default()).expect("DAE should serialize as RON");
+        let stale_v7 = ron.replacen("schema_version:8", "schema_version:7", 1);
+
+        let error = ron::from_str::<Dae>(&stale_v7)
+            .expect_err("the previous DAE schema version must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported DAE schema_version 7; expected 8"),
+            "version rejection must identify the stale and required versions: {error}"
+        );
+    }
+
+    #[test]
+    fn test_dae_ron_rejects_real_v7_numeric_event_wire() {
+        let ron = ron::to_string(&Dae::default()).expect("DAE should serialize as RON");
+        let stale_v7 = ron
+            .replacen("schema_version:8", "schema_version:7", 1)
+            .replacen("scheduled_time_events:[]", "scheduled_time_events:[1.0]", 1);
+
+        ron::from_str::<Dae>(&stale_v7)
+            .expect_err("the pre-object scheduled-time-event schema must be rejected");
     }
 
     #[test]
