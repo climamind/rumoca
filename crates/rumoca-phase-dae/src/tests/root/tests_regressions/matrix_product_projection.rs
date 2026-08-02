@@ -306,6 +306,37 @@ fn matrix_vector_product(name: &str) -> Expression {
     multiply(colon_array(name, 2), colon_vector("x"))
 }
 
+fn wrapped_elementwise_vector_model(rhs: Expression) -> Model {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "a", &[2]);
+    declare_array(&mut flat, "b", &[2]);
+    declare_array(&mut flat, "y", &[2]);
+    add_equation(&mut flat, colon_vector("y"), rhs, 2);
+    flat
+}
+
+fn elementwise_vector_product() -> Expression {
+    binary(
+        rumoca_core::OpBinary::MulElem,
+        colon_vector("a"),
+        colon_vector("b"),
+    )
+}
+
+fn assert_elementwise_lane_product(expr: &Expression, lane: i64) {
+    let Expression::Binary {
+        op: rumoca_core::OpBinary::MulElem,
+        lhs,
+        rhs,
+        ..
+    } = expr
+    else {
+        panic!("expected lane-projected MulElem, got {expr:?}");
+    };
+    assert_eq!(literal_subscripts(lhs), Some(("a", vec![lane])));
+    assert_eq!(literal_subscripts(rhs), Some(("b", vec![lane])));
+}
+
 #[test]
 fn test_todae_rejects_unary_wrapper_around_matrix_product() {
     let flat = wrapped_matrix_vector_model(Expression::Unary {
@@ -336,6 +367,66 @@ fn test_todae_rejects_if_wrapper_around_matrix_products() {
     });
 
     assert_projection_error(&flat, "unsupported matrix-product wrapper");
+}
+
+#[test]
+fn test_todae_accepts_unary_wrapper_around_elementwise_product() {
+    let flat = wrapped_elementwise_vector_model(Expression::Unary {
+        op: rumoca_core::OpUnary::Minus,
+        rhs: Box::new(elementwise_vector_product()),
+        span: crate::test_support::test_span(),
+    });
+
+    let dae = to_dae_with_options(
+        &flat,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("wrapped elementwise multiplication must remain lane-projectable");
+    assert_eq!(dae.continuous.equations.len(), 2);
+    for (lane, equation) in dae.continuous.equations.iter().enumerate() {
+        let Expression::Unary {
+            op: rumoca_core::OpUnary::Minus,
+            rhs,
+            ..
+        } = residual_rhs(equation)
+        else {
+            panic!("expected unary wrapper, got {:?}", equation.rhs);
+        };
+        assert_elementwise_lane_product(rhs, i64::try_from(lane + 1).expect("lane fits i64"));
+    }
+}
+
+#[test]
+fn test_todae_accepts_builtin_wrapper_around_elementwise_product() {
+    let flat = wrapped_elementwise_vector_model(builtin(
+        rumoca_core::BuiltinFunction::Sin,
+        vec![elementwise_vector_product()],
+    ));
+
+    let dae = to_dae_with_options(
+        &flat,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("builtin-wrapped elementwise multiplication must remain lane-projectable");
+    assert_eq!(dae.continuous.equations.len(), 2);
+    for (lane, equation) in dae.continuous.equations.iter().enumerate() {
+        let Expression::BuiltinCall {
+            function: rumoca_core::BuiltinFunction::Sin,
+            args,
+            ..
+        } = residual_rhs(equation)
+        else {
+            panic!("expected sin wrapper, got {:?}", equation.rhs);
+        };
+        let [product] = args.as_slice() else {
+            panic!("expected one projected sin argument, got {args:?}");
+        };
+        assert_elementwise_lane_product(product, i64::try_from(lane + 1).expect("lane fits i64"));
+    }
 }
 
 #[test]
