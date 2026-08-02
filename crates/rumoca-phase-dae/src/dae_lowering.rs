@@ -3996,6 +3996,19 @@ impl Projector<'_> {
             _ => Ok(None),
         }
     }
+    fn validate_known_result_dims(
+        &self,
+        expr: &Expr,
+        target_dims: &[i64],
+        span: Span,
+    ) -> Result<(), ToDaeError> {
+        match self.dims(expr, span)? {
+            Some(result_dims) if result_dims != target_dims => {
+                Err(projection_error("result shape mismatch", span))
+            }
+            _ => Ok(()),
+        }
+    }
     fn project(
         &self,
         expr: &Expr,
@@ -4025,7 +4038,7 @@ impl Projector<'_> {
         }
         if matches!(op, OpBinary::MulElem | OpBinary::Div | OpBinary::DivElem) {
             if !self.has_descendant_matrix_multiply_candidate(expr, false)? {
-                self.dims(expr, *span)?;
+                self.validate_known_result_dims(expr, target_dims, *span)?;
                 return Ok(None);
             }
             return self.project_lanewise_binary(expr, k, target_dims);
