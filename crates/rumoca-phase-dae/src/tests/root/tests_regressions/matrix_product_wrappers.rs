@@ -152,6 +152,46 @@ fn test_todae_preserves_plain_scalar_wrapper_around_non_matrix_expression() {
 }
 
 #[test]
+fn test_todae_rejects_plain_elementwise_result_shape_mismatch() {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "a", &[3]);
+    declare_array(&mut flat, "b", &[3]);
+    declare_array(&mut flat, "y", &[2]);
+    add_equation(
+        &mut flat,
+        colon_vector("y"),
+        binary(
+            rumoca_core::OpBinary::MulElem,
+            colon_vector("a"),
+            colon_vector("b"),
+        ),
+        2,
+    );
+
+    assert_projection_error(&flat, "result shape mismatch");
+}
+
+#[test]
+fn test_todae_rejects_plain_elementwise_vector_in_scalar_context() {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "a", &[3]);
+    declare_array(&mut flat, "b", &[3]);
+    declare_array(&mut flat, "y", &[]);
+    add_equation(
+        &mut flat,
+        make_structured_var_ref("y"),
+        binary(
+            rumoca_core::OpBinary::MulElem,
+            colon_vector("a"),
+            colon_vector("b"),
+        ),
+        1,
+    );
+
+    assert_projection_error(&flat, "result shape mismatch");
+}
+
+#[test]
 fn test_todae_projects_div_wrapper_around_matrix_product() {
     let flat = wrapped_matrix_vector_model(binary(
         rumoca_core::OpBinary::Div,
