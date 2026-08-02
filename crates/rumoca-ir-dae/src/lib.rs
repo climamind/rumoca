@@ -516,7 +516,7 @@ pub struct DaeInitializationPartition {
     /// `initial_equations`.
     #[serde(rename = "initial_structured_equations")]
     pub structured_equations: Vec<StructuredEquationFamily>,
-    /// Typed provenance for generated initialization rows. This remains an
+    /// Typed provenance for generated initialization rows. This remains a
     /// serialized phase contract with one entry per initialization equation.
     #[serde(rename = "initial_equation_provenance")]
     pub equation_provenance: Vec<InitializationEquationProvenance>,

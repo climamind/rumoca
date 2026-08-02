@@ -42,17 +42,13 @@ pub(crate) fn lower_initial_residual_cell(
     Ok(rows.remove(0))
 }
 
-/// Lower a complete materialized initial family in one shared lowering context.
-/// GPU affine proof uses the batch form so full-domain verification remains
-/// linear instead of rebuilding expression-lowering metadata for every cell.
-pub(crate) fn lower_initial_residual_cells<'a>(
+pub(crate) fn visit_initial_residual_cells<'a>(
     dae_model: &dae::Dae,
     layout: &VarLayout,
     equations: impl IntoIterator<Item = (usize, &'a dae::Equation)>,
-) -> Result<Vec<Vec<LinearOp>>, super::LowerError> {
-    expression_rows::lower_residual_rows_from_equations_with_mode(
-        dae_model, layout, equations, 0, true,
-    )
+    visit: impl FnMut(&dae::Equation, &[LinearOp]) -> Result<(), super::LowerError>,
+) -> Result<super::InitialResidualVisitMetrics, super::LowerError> {
+    expression_rows::visit_initial_residual_cells(dae_model, layout, equations, visit)
 }
 
 pub fn initial_residual_equations<'a>(
