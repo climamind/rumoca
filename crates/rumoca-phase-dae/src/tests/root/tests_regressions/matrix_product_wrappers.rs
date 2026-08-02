@@ -92,6 +92,66 @@ fn assert_complete_matrix_vector_lane(expr: &Expression, row: i64) {
 }
 
 #[test]
+fn test_todae_preserves_plain_scalar_wrapper_around_non_matrix_expression() {
+    for op in [
+        rumoca_core::OpBinary::Div,
+        rumoca_core::OpBinary::DivElem,
+        rumoca_core::OpBinary::MulElem,
+    ] {
+        let mut flat = Model::new();
+        declare_array(&mut flat, "x", &[]);
+        declare_array(&mut flat, "s", &[]);
+        declare_array(&mut flat, "y", &[]);
+        add_equation(
+            &mut flat,
+            make_structured_var_ref("y"),
+            binary(
+                op.clone(),
+                builtin(
+                    rumoca_core::BuiltinFunction::Sin,
+                    vec![make_structured_var_ref("x")],
+                ),
+                make_structured_var_ref("s"),
+            ),
+            1,
+        );
+
+        let dae = to_dae_with_options(
+            &flat,
+            ToDaeOptions {
+                error_on_unbalanced: false,
+            },
+        )
+        .expect("ordinary scalar wrappers must bypass matrix-product projection");
+        let [equation] = dae.continuous.equations.as_slice() else {
+            panic!(
+                "expected one scalar equation, got {:?}",
+                dae.continuous.equations
+            );
+        };
+        let Expression::Binary {
+            op: actual,
+            lhs,
+            rhs,
+            ..
+        } = residual_rhs(equation)
+        else {
+            panic!("expected preserved scalar wrapper, got {:?}", equation.rhs);
+        };
+        assert_eq!(actual, &op);
+        assert!(matches!(
+            lhs.as_ref(),
+            Expression::BuiltinCall {
+                function: rumoca_core::BuiltinFunction::Sin,
+                args,
+                ..
+            } if literal_subscripts(&args[0]) == Some(("x", vec![]))
+        ));
+        assert_eq!(literal_subscripts(rhs), Some(("s", vec![])));
+    }
+}
+
+#[test]
 fn test_todae_projects_div_wrapper_around_matrix_product() {
     let flat = wrapped_matrix_vector_model(binary(
         rumoca_core::OpBinary::Div,

@@ -4079,6 +4079,10 @@ impl Projector<'_> {
             return self.element(expr, &indices, *span).map(Some);
         }
         if matches!(op, OpBinary::MulElem | OpBinary::Div | OpBinary::DivElem) {
+            if !self.has_descendant_matrix_multiply_candidate(expr, false)? {
+                self.dims(expr, *span)?;
+                return Ok(None);
+            }
             return self.project_lanewise_binary(expr, k, target_dims);
         }
         if !matches!(op, OpBinary::Mul) {
