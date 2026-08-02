@@ -27,7 +27,8 @@ pub(super) fn scalarize_affine_rows_with_span(
     kind: &'static str,
     span: rumoca_core::Span,
 ) -> Result<Vec<Vec<LinearOp>>, ScalarizeError> {
-    validate_affine_stride_metadata(domain, base_ops, load_strides, const_strides, kind, span)?;
+    rumoca_ir_solve::validate_affine_map_metadata(domain, base_ops, load_strides, const_strides)
+        .map_err(|error| affine_metadata_error(error, kind, span))?;
     let index_tuples = domain
         .index_tuples()
         .map_err(|err| ScalarizeError::ShapeContract {
@@ -121,104 +122,59 @@ pub fn scalar_program_output_count(
     checked_tensor_output_count_optional(&indices, output_cursor, kind, block_span(block))
 }
 
-fn validate_affine_stride_metadata(
-    domain: &rumoca_core::StructuredIndexDomain,
-    base_ops: &[LinearOp],
-    load_strides: &[rumoca_ir_solve::AffineStencilLoadStride],
-    const_strides: &[rumoca_ir_solve::AffineStencilConstStride],
+fn affine_metadata_error(
+    error: rumoca_ir_solve::AffineMapMetadataError,
     kind: &'static str,
     span: rumoca_core::Span,
-) -> Result<(), ScalarizeError> {
-    for stride in load_strides {
-        validate_stride_terms(domain, &stride.terms, kind, span)?;
-        match base_ops.get(stride.op_position) {
-            Some(LinearOp::LoadY { .. } | LinearOp::LoadP { .. }) => {}
-            Some(op) => {
-                return Err(affine_stride_error(
-                    kind,
-                    stride.op_position,
-                    base_ops.len(),
-                    "LoadY or LoadP",
-                    Some(linear_op_name(op)),
-                    span,
-                ));
-            }
-            None => {
-                return Err(affine_stride_error(
-                    kind,
-                    stride.op_position,
-                    base_ops.len(),
-                    "LoadY or LoadP",
-                    None,
-                    span,
-                ));
-            }
+) -> ScalarizeError {
+    match error {
+        rumoca_ir_solve::AffineMapMetadataError::InvalidLoadStrideOp {
+            op_position,
+            op_count,
+            actual,
+        } => ScalarizeError::InvalidStrideOp {
+            kind,
+            op_position,
+            op_count,
+            expected: "LoadY or LoadP",
+            actual,
+            span,
+        },
+        rumoca_ir_solve::AffineMapMetadataError::InvalidConstStrideOp {
+            op_position,
+            op_count,
+            actual,
+        } => ScalarizeError::InvalidStrideOp {
+            kind,
+            op_position,
+            op_count,
+            expected: "Const",
+            actual,
+            span,
+        },
+        rumoca_ir_solve::AffineMapMetadataError::InvalidLoadStrideDimension {
+            dimension,
+            dimension_count,
         }
-    }
-    for stride in const_strides {
-        validate_stride_terms(domain, &stride.terms, kind, span)?;
-        match base_ops.get(stride.op_position) {
-            Some(LinearOp::Const { .. }) => {}
-            Some(op) => {
-                return Err(affine_stride_error(
-                    kind,
-                    stride.op_position,
-                    base_ops.len(),
-                    "Const",
-                    Some(linear_op_name(op)),
-                    span,
-                ));
-            }
-            None => {
-                return Err(affine_stride_error(
-                    kind,
-                    stride.op_position,
-                    base_ops.len(),
-                    "Const",
-                    None,
-                    span,
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_stride_terms<T>(
-    domain: &rumoca_core::StructuredIndexDomain,
-    terms: &[T],
-    kind: &'static str,
-    span: rumoca_core::Span,
-) -> Result<(), ScalarizeError>
-where
-    T: StrideTermDimension,
-{
-    for term in terms {
-        if term.dimension() >= domain.binders.len() {
-            return Err(ScalarizeError::InvalidStrideDimension {
-                kind,
-                dimension: term.dimension(),
-                dimension_count: domain.binders.len(),
-                span,
-            });
-        }
-    }
-    Ok(())
-}
-
-trait StrideTermDimension {
-    fn dimension(&self) -> usize;
-}
-
-impl StrideTermDimension for rumoca_ir_solve::AffineStencilIndexStrideTerm {
-    fn dimension(&self) -> usize {
-        self.dimension
-    }
-}
-
-impl StrideTermDimension for rumoca_ir_solve::AffineStencilConstStrideTerm {
-    fn dimension(&self) -> usize {
-        self.dimension
+        | rumoca_ir_solve::AffineMapMetadataError::InvalidConstStrideDimension {
+            dimension,
+            dimension_count,
+        } => ScalarizeError::InvalidStrideDimension {
+            kind,
+            dimension,
+            dimension_count,
+            span,
+        },
+        rumoca_ir_solve::AffineMapMetadataError::NonFiniteConstStride {
+            op_position,
+            dimension,
+        } => ScalarizeError::ShapeContract {
+            message: format!(
+                "native {kind} family const stride op position {op_position}, dimension \
+                 {dimension} is non-finite"
+            ),
+            span: Some(span),
+        },
     }
 }
 

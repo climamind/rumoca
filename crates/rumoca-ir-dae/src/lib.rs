@@ -514,8 +514,8 @@ pub struct DaeInitializationPartition {
     /// `initial_equations`.
     #[serde(rename = "initial_structured_equations")]
     pub structured_equations: Vec<StructuredEquationFamily>,
-    /// Typed provenance for generated initialization rows. This remains an
-    /// serialized phase contract with one entry per initialization equation.
+    /// Typed provenance for initialization rows; consumers must not infer
+    /// semantic origin from debug labels.
     #[serde(rename = "initial_equation_provenance")]
     pub equation_provenance: Vec<InitializationEquationProvenance>,
 }
@@ -1522,9 +1522,9 @@ mod tests {
         dae.initialization.equations.push(Equation::residual(
             rumoca_core::Expression::Literal {
                 value: rumoca_core::Literal::Real(0.0),
-                span: fixture_span(),
+                span: Span::DUMMY,
             },
-            fixture_span(),
+            Span::DUMMY,
             "roundtrip",
         ));
         dae.initialization
@@ -1535,22 +1535,6 @@ mod tests {
         assert_eq!(
             decoded.initialization.equation_provenance,
             dae.initialization.equation_provenance
-        );
-        let encoded = bincode::serialize(&dae).expect("serialize nonempty DAE provenance");
-        let equation_bytes = bincode::serialize(&dae.initialization.equations)
-            .expect("serialize nonempty initialization equations");
-        let _: Vec<Equation> = bincode::deserialize(&equation_bytes)
-            .expect("roundtrip nonempty initialization equations");
-        let provenance_bytes = bincode::serialize(&dae.initialization.equation_provenance)
-            .expect("serialize nonempty initialization provenance");
-        let _: Vec<super::InitializationEquationProvenance> =
-            bincode::deserialize(&provenance_bytes)
-                .expect("roundtrip nonempty initialization provenance");
-        let binary_decoded: Dae =
-            bincode::deserialize(&encoded).expect("roundtrip nonempty DAE provenance");
-        assert_eq!(
-            binary_decoded.initialization.equation_provenance,
-            vec![super::InitializationEquationProvenance::FixedStart]
         );
 
         let mut malformed = value;

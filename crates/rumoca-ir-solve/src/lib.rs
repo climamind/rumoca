@@ -1,14 +1,13 @@
 //! Solver-facing Solve IR.
-//!
 //! This crate contains data consumed by simulation backends after DAE-level
 //! structural/lowering phases. It must stay free of DAE evaluation and phase
 //! logic.
-//!
-//! The facade defines the wire types while focused modules own layout, linear
-//! operations, direct-initialization validation, and visitor contracts.
+//! Focused modules own layout, linear ops, direct-initialization validation, and visitors.
 
+mod affine_map_validation;
 #[cfg(test)]
 mod compute_block_tests;
+mod direct_map_semantics;
 mod initialization_validation;
 mod layout;
 mod linear_op;
@@ -20,11 +19,13 @@ use rumoca_core::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use initialization_validation::InitializationTargetRange;
+pub use affine_map_validation::{AffineMapMetadataError, validate_affine_map_metadata};
+pub use initialization_validation::{
+    InitializationTargetRange, validate_compact_gpu_initialization,
+};
 use initialization_validation::{
     initialization_stored_row_count, validate_initialization_direct_families,
 };
-
 pub use layout::{
     ComponentReferenceKey, ComponentReferenceKeyError, ComponentReferenceKeyErrorKind,
     ComponentReferenceKeyPart, ComponentReferenceSubscriptKey, IndexedScalarSlot, ScalarSlot,
@@ -38,7 +39,6 @@ pub use visitor::{
     LinearOpSliceKind, SolveVisitor, VisitScope, walk_compute_block, walk_compute_node,
     walk_scalar_program_block, walk_solve_artifacts, walk_solve_model, walk_solve_problem,
 };
-
 pub const SOLVE_SCHEMA_VERSION: u16 = 16;
 
 pub fn source_span_from_offsets(source: u64, start: usize, end: usize) -> Span {
@@ -1299,7 +1299,11 @@ impl SolveProblem {
             "initialization.projection_plan",
             &self.initialization.projection_plan,
             initialization_rows,
-            self.solve_layout.solver_scalar_count(),
+            if self.initialization.direct_families.is_empty() {
+                self.solve_layout.solver_scalar_count()
+            } else {
+                self.layout.y_scalars()
+            },
         )?;
         self.discrete
             .runtime_assignment_rhs
@@ -1706,6 +1710,9 @@ pub struct InitializationSolveSystem {
     #[serde(default)]
     pub fixed_target_ranges: Vec<InitializationTargetRange>,
     pub projection_indices: Vec<usize>,
+    /// Initialization projection contract. Compact direct artifacts encode one
+    /// direct-family index per block in `rows` and its target-range anchor in
+    /// `y_indices`; scalar initialization keeps the ordinary scalar-row form.
     #[serde(default)]
     pub projection_plan: AlgebraicProjectionPlan,
     #[serde(default)]
@@ -1966,7 +1973,6 @@ pub struct SolveModel {
     pub visible_value_rows: ScalarProgramBlock,
     pub variable_meta: Vec<SolveVariableMeta>,
 }
-
 impl SolveModel {
     pub fn state_scalar_count(&self) -> usize {
         self.problem.solve_layout.state_scalar_count()

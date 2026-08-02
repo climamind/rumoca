@@ -23,15 +23,33 @@ fn direct_initialization_family(
     target_strides: Vec<AffineStencilIndexStrideTerm>,
 ) -> (ComputeNode, InitializationDirectFamily) {
     let domain = test_tensor_domain(3);
+    let target_load_strides = if target_strides.is_empty() {
+        Vec::new()
+    } else {
+        vec![AffineStencilLoadStride {
+            op_position: 0,
+            terms: target_strides.clone(),
+        }]
+    };
     let node = ComputeNode::Map {
         output_map: TensorOutputMap::dense_contiguous(node_index * 3, &domain)
             .expect("dense residual map"),
         domain,
         base_ops: vec![
-            LinearOp::Const { dst: 0, value: 0.0 },
-            LinearOp::StoreOutput { src: 0 },
+            LinearOp::LoadY {
+                dst: 0,
+                index: target_start,
+            },
+            LinearOp::Const { dst: 1, value: 0.0 },
+            LinearOp::Binary {
+                op: BinaryOp::Sub,
+                lhs: 0,
+                rhs: 1,
+                dst: 2,
+            },
+            LinearOp::StoreOutput { src: 2 },
         ],
-        load_strides: Vec::new(),
+        load_strides: target_load_strides,
         const_strides: Vec::new(),
         metadata: TensorNodeMetadata::default(),
         span: fixture_span(),
@@ -85,7 +103,7 @@ fn compact_initialization_validation_rejects_negative_target_strides() {
         required_target_ranges: vec![InitializationTargetRange {
             start: 0,
             end: 3,
-            span: None,
+            span: fixture_span(),
         }],
         ..Default::default()
     };
@@ -122,7 +140,7 @@ fn compact_initialization_validation_rejects_direct_fixed_overlap() {
     initialization.fixed_target_ranges = vec![InitializationTargetRange {
         start: 1,
         end: 2,
-        span: Some(fixture_span()),
+        span: fixture_span(),
     }];
 
     let error = validate_initialization_direct_families(&initialization, 3, 3)
@@ -137,18 +155,18 @@ fn compact_initialization_validation_rejects_fixed_fixed_overlap() {
         required_target_ranges: vec![InitializationTargetRange {
             start: 0,
             end: 3,
-            span: None,
+            span: fixture_span(),
         }],
         fixed_target_ranges: vec![
             InitializationTargetRange {
                 start: 0,
                 end: 2,
-                span: None,
+                span: fixture_span(),
             },
             InitializationTargetRange {
                 start: 1,
                 end: 3,
-                span: Some(fixture_span()),
+                span: fixture_span(),
             },
         ],
         ..Default::default()
@@ -166,18 +184,18 @@ fn compact_initialization_validation_merges_adjacent_fixed_ranges() {
         required_target_ranges: vec![InitializationTargetRange {
             start: 0,
             end: 3,
-            span: None,
+            span: fixture_span(),
         }],
         fixed_target_ranges: vec![
             InitializationTargetRange {
                 start: 0,
                 end: 1,
-                span: Some(fixture_span()),
+                span: fixture_span(),
             },
             InitializationTargetRange {
                 start: 1,
                 end: 3,
-                span: Some(fixture_span()),
+                span: fixture_span(),
             },
         ],
         ..Default::default()
@@ -202,10 +220,542 @@ fn complete_compact_initialization() -> InitializationSolveSystem {
         required_target_ranges: vec![InitializationTargetRange {
             start: 0,
             end: 3,
-            span: None,
+            span: fixture_span(),
         }],
+        projection_plan: AlgebraicProjectionPlan {
+            blocks: vec![AlgebraicProjectionBlock {
+                rows: vec![0],
+                y_indices: vec![0],
+                causal_steps: Vec::new(),
+            }],
+        },
         ..Default::default()
     }
+}
+
+fn assert_compact_wire_rejects(initialization: InitializationSolveSystem, expected: &str) {
+    let problem = compact_problem(initialization);
+    let json = serde_json::to_string(&problem).expect("serialize invalid compact JSON");
+    let json_error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("invalid compact JSON must fail semantic admission");
+    assert!(json_error.to_string().contains(expected), "{json_error}");
+    let bytes = bincode::serialize(&problem).expect("serialize invalid compact bincode");
+    let bincode_error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("invalid compact bincode must fail semantic admission");
+    assert!(
+        bincode_error.to_string().contains(expected),
+        "{bincode_error}"
+    );
+}
+
+fn compact_problem(initialization: InitializationSolveSystem) -> SolveProblem {
+    SolveProblem {
+        layout: make_layout(&[("x", vec![3])], &[]),
+        initialization,
+        ..Default::default()
+    }
+}
+
+fn compact_initialization_with_base_ops(base_ops: Vec<LinearOp>) -> InitializationSolveSystem {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map {
+        base_ops: actual, ..
+    } = &mut initialization.residual.nodes[0]
+    else {
+        unreachable!()
+    };
+    *actual = base_ops;
+    initialization
+}
+
+fn malformed_random_initialization() -> InitializationSolveSystem {
+    compact_initialization_with_base_ops(vec![
+        LinearOp::LoadY { dst: 0, index: 0 },
+        LinearOp::Const { dst: 1, value: 1.0 },
+        LinearOp::Const { dst: 2, value: 2.0 },
+        LinearOp::RandomInitialState {
+            dst: 3,
+            generator: RandomGenerator::Xorshift64Star,
+            local_seed: 1,
+            global_seed: 2,
+            state_len: 0,
+            state_index: 0,
+        },
+        LinearOp::Binary {
+            dst: 4,
+            op: BinaryOp::Sub,
+            lhs: 0,
+            rhs: 3,
+        },
+        LinearOp::StoreOutput { src: 4 },
+    ])
+}
+
+fn compact_initialization_with_const_stride(
+    op_position: usize,
+    dimension: usize,
+    stride: f64,
+) -> InitializationSolveSystem {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map { const_strides, .. } = &mut initialization.residual.nodes[0] else {
+        unreachable!()
+    };
+    const_strides.push(AffineStencilConstStride {
+        op_position,
+        terms: vec![AffineStencilConstStrideTerm { dimension, stride }],
+    });
+    initialization
+}
+
+fn compact_initialization_with_non_target_load_stride() -> InitializationSolveSystem {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map { load_strides, .. } = &mut initialization.residual.nodes[0] else {
+        unreachable!()
+    };
+    load_strides.push(AffineStencilLoadStride {
+        op_position: 1,
+        terms: vec![AffineStencilIndexStrideTerm {
+            dimension: 0,
+            stride: 1,
+        }],
+    });
+    initialization
+}
+
+#[test]
+fn compact_initialization_json_rejects_const_stride_targeting_load_y() {
+    let problem = compact_problem(compact_initialization_with_const_stride(0, 0, 1.0));
+    let json = serde_json::to_string(&problem).expect("serialize malformed affine JSON");
+
+    let error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("const stride targeting LoadY must fail JSON admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine constant stride does not point at Const"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_const_stride_targeting_load_y() {
+    let problem = compact_problem(compact_initialization_with_const_stride(0, 0, 1.0));
+    let bytes = bincode::serialize(&problem).expect("serialize malformed affine bincode");
+
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("const stride targeting LoadY must fail bincode admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine constant stride does not point at Const"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_json_rejects_non_target_load_stride_targeting_const() {
+    let problem = compact_problem(compact_initialization_with_non_target_load_stride());
+    let json = serde_json::to_string(&problem).expect("serialize malformed affine JSON");
+
+    let error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("non-target load stride targeting Const must fail JSON admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine load stride does not point at LoadY or LoadP"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_non_target_load_stride_targeting_const() {
+    let problem = compact_problem(compact_initialization_with_non_target_load_stride());
+    let bytes = bincode::serialize(&problem).expect("serialize malformed affine bincode");
+
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("non-target load stride targeting Const must fail bincode admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine load stride does not point at LoadY or LoadP"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_json_rejects_const_stride_dimension_out_of_bounds() {
+    let problem = compact_problem(compact_initialization_with_const_stride(1, 1, 1.0));
+    let json = serde_json::to_string(&problem).expect("serialize malformed affine JSON");
+
+    let error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("out-of-bounds const stride dimension must fail JSON admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine stride dimension is outside domain"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_const_stride_dimension_out_of_bounds() {
+    let problem = compact_problem(compact_initialization_with_const_stride(1, 1, 1.0));
+    let bytes = bincode::serialize(&problem).expect("serialize malformed affine bincode");
+
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("out-of-bounds const stride dimension must fail bincode admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine stride dimension is outside domain"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_nonfinite_const_stride() {
+    let problem = compact_problem(compact_initialization_with_const_stride(
+        1,
+        0,
+        f64::INFINITY,
+    ));
+    let bytes = bincode::serialize(&problem).expect("serialize non-finite affine bincode");
+
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("non-finite const stride must fail bincode admission");
+    assert!(
+        error
+            .to_string()
+            .contains("affine constant stride is non-finite"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_json_rejects_reachable_malformed_random_initial_state() {
+    let problem = compact_problem(malformed_random_initialization());
+    let json = serde_json::to_string(&problem).expect("serialize malformed random JSON");
+
+    let error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("malformed random JSON must fail semantic admission");
+    assert!(
+        error
+            .to_string()
+            .contains("random or impure direct Map operation"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_reachable_malformed_random_initial_state() {
+    let problem = compact_problem(malformed_random_initialization());
+    let bytes = bincode::serialize(&problem).expect("serialize malformed random bincode");
+
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("malformed random bincode must fail semantic admission");
+    assert!(
+        error
+            .to_string()
+            .contains("random or impure direct Map operation"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compact_initialization_rejects_every_random_and_impure_variant_with_owner_span() {
+    let variants = [
+        LinearOp::RandomInitialState {
+            dst: 4,
+            generator: RandomGenerator::Xorshift64Star,
+            local_seed: 1,
+            global_seed: 2,
+            state_len: 2,
+            state_index: 0,
+        },
+        LinearOp::RandomResult {
+            dst: 4,
+            generator: RandomGenerator::Xorshift128Plus,
+            state_start: 1,
+            state_len: 3,
+        },
+        LinearOp::RandomState {
+            dst: 4,
+            generator: RandomGenerator::Xorshift1024Star,
+            state_start: 1,
+            state_len: 3,
+            state_index: 2,
+        },
+        LinearOp::ImpureRandomInit { dst: 4, seed: 1 },
+        LinearOp::ImpureRandom {
+            dst: 4,
+            id: 1,
+            call_site: 7,
+        },
+        LinearOp::ImpureRandomInteger {
+            dst: 4,
+            id: 1,
+            imin: 2,
+            imax: 3,
+            call_site: 11,
+        },
+    ];
+
+    for random_op in variants {
+        let initialization = compact_initialization_with_base_ops(vec![
+            LinearOp::LoadY { dst: 0, index: 0 },
+            LinearOp::Const { dst: 1, value: 1.0 },
+            LinearOp::Const { dst: 2, value: 2.0 },
+            LinearOp::Const { dst: 3, value: 3.0 },
+            random_op,
+            LinearOp::Binary {
+                dst: 5,
+                op: BinaryOp::Sub,
+                lhs: 0,
+                rhs: 4,
+            },
+            LinearOp::StoreOutput { src: 5 },
+        ]);
+
+        let error = validate_compact_gpu_initialization(&initialization, 3)
+            .expect_err("random and impure direct Maps must fail semantic admission");
+        assert!(
+            error
+                .to_string()
+                .contains("random or impure direct Map operation"),
+            "{error}"
+        );
+        assert_eq!(error.source_span(), Some(fixture_span()));
+    }
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_target_minus_target() {
+    let initialization = compact_initialization_with_base_ops(vec![
+        LinearOp::LoadY { dst: 0, index: 0 },
+        LinearOp::Binary {
+            dst: 1,
+            op: BinaryOp::Sub,
+            lhs: 0,
+            rhs: 0,
+        },
+        LinearOp::StoreOutput { src: 1 },
+    ]);
+
+    assert_compact_wire_rejects(initialization, "depends on target LoadY");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_target_dependency_through_move() {
+    let initialization = compact_initialization_with_base_ops(vec![
+        LinearOp::LoadY { dst: 0, index: 0 },
+        LinearOp::Move { dst: 1, src: 0 },
+        LinearOp::Binary {
+            dst: 2,
+            op: BinaryOp::Sub,
+            lhs: 0,
+            rhs: 1,
+        },
+        LinearOp::StoreOutput { src: 2 },
+    ]);
+
+    assert_compact_wire_rejects(initialization, "depends on target LoadY");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_deep_target_dependency() {
+    let initialization = compact_initialization_with_base_ops(vec![
+        LinearOp::LoadY { dst: 0, index: 0 },
+        LinearOp::Const { dst: 1, value: 0.0 },
+        LinearOp::Unary {
+            dst: 2,
+            op: UnaryOp::Neg,
+            arg: 0,
+        },
+        LinearOp::Compare {
+            dst: 3,
+            op: CompareOp::Eq,
+            lhs: 1,
+            rhs: 1,
+        },
+        LinearOp::Select {
+            dst: 4,
+            cond: 3,
+            if_true: 2,
+            if_false: 1,
+        },
+        LinearOp::Binary {
+            dst: 5,
+            op: BinaryOp::Add,
+            lhs: 4,
+            rhs: 1,
+        },
+        LinearOp::Binary {
+            dst: 6,
+            op: BinaryOp::Sub,
+            lhs: 0,
+            rhs: 5,
+        },
+        LinearOp::StoreOutput { src: 6 },
+    ]);
+
+    assert_compact_wire_rejects(initialization, "depends on target LoadY");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_multiple_store_outputs() {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map { base_ops, .. } = &mut initialization.residual.nodes[0] else {
+        unreachable!()
+    };
+    base_ops.insert(3, LinearOp::StoreOutput { src: 2 });
+
+    assert_compact_wire_rejects(initialization, "exactly one StoreOutput");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_constant_zero_map() {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map {
+        base_ops,
+        load_strides,
+        ..
+    } = &mut initialization.residual.nodes[0]
+    else {
+        unreachable!()
+    };
+    *base_ops = vec![
+        LinearOp::Const { dst: 0, value: 0.0 },
+        LinearOp::StoreOutput { src: 0 },
+    ];
+    load_strides.clear();
+    assert_compact_wire_rejects(initialization, "target LoadY");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_output_register_overwrite() {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map { base_ops, .. } = &mut initialization.residual.nodes[0] else {
+        unreachable!()
+    };
+    base_ops.insert(3, LinearOp::Const { dst: 2, value: 0.0 });
+    assert_compact_wire_rejects(initialization, "defined more than once");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_target_register_overwrite() {
+    let mut initialization = complete_compact_initialization();
+    let ComputeNode::Map { base_ops, .. } = &mut initialization.residual.nodes[0] else {
+        unreachable!()
+    };
+    base_ops.insert(1, LinearOp::Const { dst: 0, value: 0.0 });
+    assert_compact_wire_rejects(initialization, "defined more than once");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_wrong_target_load_and_sign() {
+    let mut wrong_load = complete_compact_initialization();
+    let ComputeNode::Map { base_ops, .. } = &mut wrong_load.residual.nodes[0] else {
+        unreachable!()
+    };
+    let LinearOp::LoadY { index, .. } = &mut base_ops[0] else {
+        unreachable!()
+    };
+    *index = 1;
+    assert_compact_wire_rejects(wrong_load, "target LoadY");
+
+    let mut wrong_map = complete_compact_initialization();
+    let ComputeNode::Map { load_strides, .. } = &mut wrong_map.residual.nodes[0] else {
+        unreachable!()
+    };
+    load_strides.clear();
+    assert_compact_wire_rejects(wrong_map, "affine map");
+
+    let mut wrong_sign = complete_compact_initialization();
+    wrong_sign.direct_families[0].residual_sign = -1;
+    assert_compact_wire_rejects(wrong_sign, "residual direction");
+}
+
+fn dependent_compact_initialization(cycle: bool) -> InitializationSolveSystem {
+    let dense = vec![AffineStencilIndexStrideTerm {
+        dimension: 0,
+        stride: 1,
+    }];
+    let (mut first_node, mut first_family) = direct_initialization_family(0, 0, dense.clone());
+    let (mut second_node, mut second_family) = direct_initialization_family(1, 3, dense);
+    let second_span = Span::from_offsets(
+        SourceId::from_source_name("ir_solve_second_family.mo"),
+        10,
+        20,
+    );
+    second_family.span = second_span;
+    if let ComputeNode::Map { span, base_ops, .. } = &mut second_node {
+        *span = second_span;
+        base_ops[1] = LinearOp::LoadY { dst: 1, index: 0 };
+    }
+    if cycle {
+        let ComputeNode::Map { base_ops, .. } = &mut first_node else {
+            unreachable!()
+        };
+        base_ops[1] = LinearOp::LoadY { dst: 1, index: 3 };
+    }
+    first_family.span = fixture_span();
+    InitializationSolveSystem {
+        residual: ComputeBlock {
+            nodes: vec![first_node, second_node],
+        },
+        direct_families: vec![first_family, second_family],
+        required_target_ranges: vec![InitializationTargetRange {
+            start: 0,
+            end: 6,
+            span: fixture_span(),
+        }],
+        projection_plan: AlgebraicProjectionPlan {
+            blocks: vec![
+                AlgebraicProjectionBlock {
+                    rows: vec![0],
+                    y_indices: vec![0],
+                    causal_steps: Vec::new(),
+                },
+                AlgebraicProjectionBlock {
+                    rows: vec![1],
+                    y_indices: vec![3],
+                    causal_steps: Vec::new(),
+                },
+            ],
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_dependency_reorder() {
+    let mut initialization = dependent_compact_initialization(false);
+    initialization.projection_plan.blocks.swap(0, 1);
+    let problem = SolveProblem {
+        layout: make_layout(&[("x", vec![6])], &[]),
+        initialization,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&problem).expect("serialize reordered compact JSON");
+    let error = serde_json::from_str::<SolveProblem>(&json)
+        .expect_err("dependency reorder must fail JSON admission");
+    assert!(error.to_string().contains("dependency order"), "{error}");
+    let bytes = bincode::serialize(&problem).expect("serialize reordered compact bincode");
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("dependency reorder must fail bincode admission");
+    assert!(error.to_string().contains("dependency order"), "{error}");
+}
+
+#[test]
+fn compact_initialization_cycle_reports_first_blocked_owner_span() {
+    let initialization = dependent_compact_initialization(true);
+    let error = validate_compact_gpu_initialization(&initialization, 6)
+        .expect_err("direct dependency cycle must fail admission");
+    assert!(error.to_string().contains("dependency order"), "{error}");
+    assert_eq!(
+        error.source_span(),
+        Some(initialization.direct_families[0].span)
+    );
 }
 
 #[test]
@@ -234,7 +784,7 @@ fn compact_initialization_json_rejects_partial_required_union() {
 #[test]
 fn compact_initialization_range_span_survives_json_and_bincode() {
     let mut initialization = complete_compact_initialization();
-    initialization.required_target_ranges[0].span = Some(fixture_span());
+    initialization.required_target_ranges[0].span = fixture_span();
     let problem = SolveProblem {
         layout: make_layout(&[("x", vec![3])], &[]),
         initialization,
@@ -245,14 +795,14 @@ fn compact_initialization_range_span_survives_json_and_bincode() {
         serde_json::from_str(&json).expect("deserialize compact Solve JSON");
     assert_eq!(
         from_json.initialization.required_target_ranges[0].span,
-        Some(fixture_span())
+        fixture_span()
     );
     let bytes = bincode::serialize(&problem).expect("serialize compact Solve bincode");
     let from_bincode: SolveProblem =
         bincode::deserialize(&bytes).expect("deserialize compact Solve bincode");
     assert_eq!(
         from_bincode.initialization.required_target_ranges[0].span,
-        Some(fixture_span())
+        fixture_span()
     );
     assert_eq!(
         from_bincode.initialization.direct_families[0].span,
@@ -261,11 +811,92 @@ fn compact_initialization_range_span_survives_json_and_bincode() {
 }
 
 #[test]
+fn compact_initialization_json_rejects_missing_and_dummy_range_spans() {
+    let mut initialization = complete_compact_initialization();
+    initialization.required_target_ranges[0].span = fixture_span();
+    let problem = SolveProblem {
+        layout: make_layout(&[("x", vec![3])], &[]),
+        initialization,
+        ..Default::default()
+    };
+    let mut missing = serde_json::to_value(&problem).expect("serialize compact Solve artifact");
+    missing["initialization"]["required_target_ranges"][0]
+        .as_object_mut()
+        .expect("target range object")
+        .remove("span");
+    let missing_error = serde_json::from_value::<SolveProblem>(missing)
+        .expect_err("compact target range span is a mandatory wire field");
+    assert!(
+        missing_error.to_string().contains("span"),
+        "{missing_error}"
+    );
+
+    let mut dummy = serde_json::to_value(problem).expect("serialize compact Solve artifact");
+    dummy["initialization"]["required_target_ranges"][0]["span"] =
+        serde_json::to_value(Span::DUMMY).expect("serialize dummy span");
+    let dummy_error = serde_json::from_value::<SolveProblem>(dummy)
+        .expect_err("dummy compact target range spans must fail admission");
+    assert!(dummy_error.to_string().contains("span"), "{dummy_error}");
+}
+
+#[test]
+fn compact_initialization_bincode_rejects_missing_and_dummy_range_spans() {
+    #[derive(Serialize)]
+    struct SourceLessRange {
+        start: usize,
+        end: usize,
+    }
+    let source_less = bincode::serialize(&SourceLessRange { start: 0, end: 3 })
+        .expect("serialize source-less range");
+    let missing_error = bincode::deserialize::<InitializationTargetRange>(&source_less)
+        .expect_err("range bincode without a span must fail decoding");
+    assert!(!missing_error.to_string().is_empty());
+
+    let mut initialization = complete_compact_initialization();
+    initialization.required_target_ranges[0].span = Span::DUMMY;
+    let problem = SolveProblem {
+        layout: make_layout(&[("x", vec![3])], &[]),
+        initialization,
+        ..Default::default()
+    };
+    let bytes = bincode::serialize(&problem).expect("serialize invalid compact Solve bincode");
+    let error = bincode::deserialize::<SolveProblem>(&bytes)
+        .expect_err("dummy compact target range spans must fail bincode admission");
+    assert!(error.to_string().contains("span"), "{error}");
+}
+
+#[test]
+fn compact_initialization_json_and_bincode_reject_nonunit_residual_signs() {
+    for residual_sign in [0, -2] {
+        let mut initialization = complete_compact_initialization();
+        initialization.required_target_ranges[0].span = fixture_span();
+        initialization.direct_families[0].residual_sign = residual_sign;
+        let problem = SolveProblem {
+            layout: make_layout(&[("x", vec![3])], &[]),
+            initialization,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&problem).expect("serialize invalid compact Solve JSON");
+        let json_error = serde_json::from_str::<SolveProblem>(&json)
+            .expect_err("non-unit direct residual sign must fail JSON admission");
+        assert!(json_error.to_string().contains("sign"), "{json_error}");
+
+        let bytes = bincode::serialize(&problem).expect("serialize invalid compact Solve bincode");
+        let bincode_error = bincode::deserialize::<SolveProblem>(&bytes)
+            .expect_err("non-unit direct residual sign must fail bincode admission");
+        assert!(
+            bincode_error.to_string().contains("sign"),
+            "{bincode_error}"
+        );
+    }
+}
+
+#[test]
 fn invalid_initialization_range_reports_span_after_json_and_bincode() {
     let range = InitializationTargetRange {
         start: 2,
         end: 2,
-        span: Some(fixture_span()),
+        span: fixture_span(),
     };
     let json = serde_json::to_string(&range).expect("serialize invalid range JSON");
     let from_json: InitializationTargetRange =

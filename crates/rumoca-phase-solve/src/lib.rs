@@ -33,6 +33,7 @@ mod dummy_derivative;
 mod dynamic_events;
 mod event_actions;
 mod gpu_initialization;
+mod gpu_initialization_projection;
 mod implicit_rhs;
 mod initial_values;
 pub mod layout;
@@ -74,8 +75,10 @@ pub(crate) use discrete_pre_modes::expression_contains_event_entry_pre_operator;
 use gpu_initialization::lower_gpu_initialization_system;
 #[cfg(test)]
 use gpu_initialization::{
-    append_gpu_corner_strides, gpu_corner_cell_index, reject_nondeterministic_gpu_initial_ops,
+    append_gpu_corner_strides, gpu_corner_cell_index, gpu_initialization_proof_metrics,
+    reject_nondeterministic_gpu_initial_ops,
 };
+use gpu_initialization_projection::lower_gpu_initialization_projection_plan;
 #[cfg(test)]
 use implicit_rhs::zero_rhs_row;
 use implicit_rhs::{
@@ -87,7 +90,7 @@ pub use lower::LowerError;
 use lower::{
     lower_discrete_rhs_from_equations, lower_initial_residual, lower_initial_residual_cell,
     lower_initial_update_rhs, lower_residual_rows_and_targets_from_equations,
-    lower_root_conditions,
+    lower_root_conditions, visit_initial_residual_cells,
 };
 use lower::{
     lower_dynamic_time_event_rhs, lower_runtime_assignment_rhs,

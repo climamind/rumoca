@@ -54,7 +54,7 @@ DAE lowering, structural rewrites, or template policy.
 
 ### Stage 1 — AST (`rumoca-ir-ast`)
 
-**What it is:** The parser output: concrete syntax with comments and spans.
+**What it is:** Parser output: concrete syntax, comments, and spans.
 
 **Contract:**
 - Represents source text structure, not language semantics.
@@ -62,9 +62,9 @@ DAE lowering, structural rewrites, or template policy.
 - Every node carries a source `Span`; later AST merges must preserve parser
   provenance instead of rewriting source ids.
 
-**What to do here:** Parsing, formatting, early syntax diagnostics.
+**Do here:** Parsing, formatting, early syntax diagnostics.
 
-**What NOT to do here:** Name lookup, class instantiation, type inference,
+**Do NOT here:** Name lookup, class instantiation, type inference,
 equation manipulation.
 
 ---
@@ -192,17 +192,20 @@ Canonical terminology:
 Public APIs use `ScalarProgram`/`ScalarProgramBlock`; `RowBlock`/`ScalarRows`
 must not return.
 
-GPU initialization requires exact, nonoverlapping, source-spanned Y coverage;
-adjacency may merge, unsupported semantics never fall back, and settlement
-shares one runtime/table context.
+Initialization requires exact Y coverage, real spans, unit signs, direct
+ownership, and no scalar rows. Solve-IR owns
+target/map/dependency/affine checks: stride op positions/dimensions are
+in-bounds, op kinds match, and constant strides are finite. Direct Maps require
+SSA, one terminal `StoreOutput`, and a reaching `Sub` with one target-`LoadY`
+side and independent peer closure.
+Structural fallback is limited to direct-ineligible models without event/discrete
+or user/structured initialization.
 
-`ComputeNode::AffineStencil` is source-proven from preserved DAE family domains
-and affine operand proofs; Solve lowering must not recover stencils from
-unstructured scalar rows.
+`ComputeNode::AffineStencil` requires a preserved DAE domain plus affine-operand
+proof; unstructured-row recovery is forbidden.
 
-The root `schema_version` field is mandatory on serialized Solve payloads.
-Deserializers reject unsupported versions and the Solve wire format does not
-accept pre-versioned `ComputeBlock` row payloads.
+Serialized Solve payloads require the supported `schema_version`; pre-versioned
+`ComputeBlock` rows are rejected.
 
 `SolveProblem` is the base lowered problem. Backend products that are expensive
 or not part of the canonical MLS DAE, such as mass-matrix form and

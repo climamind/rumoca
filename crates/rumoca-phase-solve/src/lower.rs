@@ -12,7 +12,7 @@ use rumoca_ir_dae as dae;
 use rumoca_ir_solve::{
     BinaryOp, CompareOp, ComponentReferenceKey, ComputeBlock, LinearOp, Reg, UnaryOp,
 };
-use rumoca_ir_solve::{ScalarSlot, VarLayout};
+use rumoca_ir_solve::{IndexedScalarSlot, ScalarSlot, VarLayout};
 
 mod array_values;
 mod builtin_methods;
@@ -61,7 +61,7 @@ pub use expression_rows::{
 use function_projection::format_subscript_binding_key;
 use helpers::*;
 pub use initial_residual::{initial_residual_equations, lower_initial_residual};
-pub(crate) use initial_residual::{lower_initial_residual_cell, lower_initial_residual_cells};
+pub(crate) use initial_residual::{lower_initial_residual_cell, visit_initial_residual_cells};
 use misc_helpers::*;
 use scope::*;
 use source_refs::*;
@@ -77,13 +77,43 @@ pub(super) const SIZE_BINDING_PREFIX: &str = "__rumoca_size__.";
 const RETURN_FLAG_BINDING: &str = "__rumoca_returned__";
 pub(super) const BREAK_FLAG_BINDING: &str = "__rumoca_break__";
 
-#[derive(Debug, Clone)]
-pub(super) struct IndexedBinding {
-    slot: ScalarSlot,
-    indices: Vec<usize>,
-}
+pub(super) type IndexedBinding = IndexedScalarSlot;
 
 pub(super) type IndexedBindingMap = Arc<IndexMap<ComponentReferenceKey, Vec<IndexedBinding>>>;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct InitialResidualVisitMetrics {
+    pub(crate) peak_owned_rows: usize,
+    pub(crate) retained_indexed_context_entries: usize,
+    pub(crate) retained_direct_assignment_entries: usize,
+    pub(crate) retained_structural_binding_entries: usize,
+}
+
+#[derive(Clone)]
+pub(super) enum IndexedBindingSource<'a> {
+    Shared(IndexedBindingMap),
+    Borrowed(&'a IndexMap<ComponentReferenceKey, Vec<IndexedBinding>>),
+}
+
+impl std::ops::Deref for IndexedBindingSource<'_> {
+    type Target = IndexMap<ComponentReferenceKey, Vec<IndexedBinding>>;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(bindings) => bindings,
+            Self::Borrowed(bindings) => bindings,
+        }
+    }
+}
+
+impl IndexedBindingSource<'_> {
+    fn retained_owned_entries(&self) -> usize {
+        match self {
+            Self::Shared(bindings) => bindings.values().map(Vec::len).sum(),
+            Self::Borrowed(_) => 0,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LocalIndexedBinding {
@@ -394,7 +424,7 @@ struct LowerBuilder<'a> {
     structural_bindings: Arc<IndexMap<String, f64>>,
     direct_assignments: Arc<IndexMap<String, DirectAssignmentValue>>,
     direct_assignment_stack: Vec<String>,
-    indexed_bindings: IndexedBindingMap,
+    indexed_bindings: IndexedBindingSource<'a>,
     local_indexed_bindings: IndexMap<String, Vec<LocalIndexedBinding>>,
     local_binding_dims: IndexMap<String, Vec<i64>>,
     known_empty_local_arrays: IndexSet<String>,
@@ -431,7 +461,7 @@ pub(super) struct LowerBuilderMetadata<'a> {
     pub(super) discrete_valued_names: Option<&'a IndexMap<rumoca_core::VarName, dae::Variable>>,
     pub(super) variable_starts: Option<&'a IndexMap<String, rumoca_core::Expression>>,
     pub(super) dae_variables: Option<&'a dae::DaeVariables>,
-    pub(super) indexed_bindings: Option<&'a IndexedBindingMap>,
+    pub(super) indexed_bindings: Option<IndexedBindingSource<'a>>,
     pub(super) is_initial_mode: bool,
 }
 
@@ -496,10 +526,9 @@ impl<'a> LowerBuilder<'a> {
             structural_bindings: Arc::default(),
             direct_assignments: Arc::default(),
             direct_assignment_stack: Vec::new(),
-            indexed_bindings: metadata
-                .indexed_bindings
-                .cloned()
-                .unwrap_or_else(|| Arc::new(build_indexed_binding_map(layout))),
+            indexed_bindings: metadata.indexed_bindings.unwrap_or_else(|| {
+                IndexedBindingSource::Shared(Arc::new(build_indexed_binding_map(layout)))
+            }),
             local_indexed_bindings: IndexMap::new(),
             local_binding_dims: IndexMap::new(),
             known_empty_local_arrays: IndexSet::new(),
@@ -566,7 +595,7 @@ impl<'a> LowerBuilder<'a> {
             structural_bindings: self.structural_bindings.clone(),
             direct_assignments: Arc::default(),
             direct_assignment_stack: Vec::new(),
-            indexed_bindings: Arc::clone(&self.indexed_bindings),
+            indexed_bindings: self.indexed_bindings.clone(),
             local_indexed_bindings: IndexMap::new(),
             local_binding_dims: IndexMap::new(),
             known_empty_local_arrays: IndexSet::new(),
