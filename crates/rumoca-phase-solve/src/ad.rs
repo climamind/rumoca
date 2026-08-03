@@ -87,6 +87,7 @@ fn lower_compute_node_jvp(node: &ComputeNode) -> Result<ComputeNode, LowerError>
             matrix_start,
             rhs_start,
             n,
+            output_indices,
             metadata,
             span,
             ..
@@ -95,6 +96,7 @@ fn lower_compute_node_jvp(node: &ComputeNode) -> Result<ComputeNode, LowerError>
             *matrix_start,
             *rhs_start,
             *n,
+            output_indices,
             metadata.clone(),
             *span,
         ),
@@ -462,6 +464,7 @@ fn lower_linsolve_jvp_node(
     matrix_start: Reg,
     rhs_start: Reg,
     n: usize,
+    output_indices: &[usize],
     metadata: rumoca_ir_solve::TensorNodeMetadata,
     span: rumoca_core::Span,
 ) -> Result<ComputeNode, LowerError> {
@@ -529,6 +532,7 @@ fn lower_linsolve_jvp_node(
         rhs_start: tangent_rhs_start,
         n,
         next_reg,
+        output_indices: output_indices.to_vec(),
         metadata,
         span,
     })

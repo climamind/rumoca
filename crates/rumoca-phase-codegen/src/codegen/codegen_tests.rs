@@ -92,6 +92,7 @@ pub(super) fn solve_problem_with_two_by_two_linsolve_derivative() -> solve::Solv
             rhs_start: 4,
             n: 2,
             next_reg: 6,
+            output_indices: Vec::new(),
             metadata: Default::default(),
             span: fixture_span(),
         }],
