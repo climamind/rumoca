@@ -245,7 +245,7 @@ compiler/session → DAE structural → solve-IR lowering → runtime contracts 
 | Compact Map evaluation | `rumoca-eval-solve` | No scalar reconstruction |
 | GPU initialization settlement | `rumoca-sim` | Reuses Solve-IR admission; solver-free projection/verification |
 | Optimization/training orchestration | `rumoca-opt` | Consumes Solve/eval APIs; no Modelica semantics |
-| Textual generated artifacts and templates | `rumoca-phase-codegen` | Jinja/minijinja rendering owns generated C, Rust, CUDA C, MLIR, FMI/eFMI and FMU/eFMU packaging text |
+| Generated text/templates | `rumoca-phase-codegen` | Renders C, Rust, CUDA, MLIR, FMI/eFMI, and packaging text |
 | GALEC `.alg` text (recorded exception) | `rumoca-ir-galec` | Typed AST printing per eFMI conformance; routed via template context (SPEC_0034 GAL-009) |
 | eFMI packaging XML (`__content.xml`, manifests) | `rumoca-phase-codegen` | Rendered like FMI `modelDescription`; validators + generic checksum/container build step, not typed serializers (SPEC_0034 D3 amended) |
 | Compiled/JIT execution adapter crates | `rumoca-exec-*` | Invoke tools, load artifacts, wrap Cranelift/LLVM/CUDA/NVRTC APIs, expose ergonomic runtime calls; no compiler semantics |

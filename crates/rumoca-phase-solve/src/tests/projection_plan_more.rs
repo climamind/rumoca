@@ -9,6 +9,14 @@ fn projection_plan_span() -> rumoca_core::Span {
 }
 
 #[test]
+fn projection_plan_has_no_clippy_excessive_nesting_allow() {
+    assert!(
+        !include_str!("../projection_plan.rs").contains("#[allow(clippy::excessive_nesting)]"),
+        "projection planning must remain reviewable without a Clippy nesting exemption"
+    );
+}
+
+#[test]
 fn solve_problem_projection_plan_covers_every_algebraic_tail_row() {
     let span = projection_plan_span();
     let rows = vec![

@@ -41,9 +41,71 @@ pub(super) struct ProjectionPlanPolicy {
     pub(super) require_complete_algebraic_coverage: bool,
 }
 
-// SPEC_0021: Exception - projection planning keeps explicit target,
-// initialization incidence, and identity-row ownership decisions together.
-#[allow(clippy::excessive_nesting)]
+struct ProjectionPlanRowOwnership<'a> {
+    rows: &'a [Vec<solve::LinearOp>],
+    row_targets: &'a [Option<solve::ScalarSlot>],
+    projection_set: &'a BTreeSet<usize>,
+    identity_projection_rows: &'a BTreeMap<usize, usize>,
+    policy: ProjectionPlanPolicy,
+    implicit_incidence_rows: Option<&'a BTreeSet<usize>>,
+}
+
+impl ProjectionPlanRowOwnership<'_> {
+    fn y_indices_for_row(&self, row_idx: usize) -> BTreeSet<usize> {
+        match self.explicit_projection_target(row_idx) {
+            Some(index) => self.y_indices_with_explicit_target(row_idx, index),
+            None => self.y_indices_without_explicit_target(row_idx),
+        }
+    }
+
+    fn explicit_projection_target(&self, row_idx: usize) -> Option<usize> {
+        match self.row_targets.get(row_idx).copied().flatten() {
+            Some(solve::ScalarSlot::Y { index, .. }) if self.projection_set.contains(&index) => {
+                Some(index)
+            }
+            _ => None,
+        }
+    }
+
+    fn y_indices_with_explicit_target(&self, row_idx: usize, index: usize) -> BTreeSet<usize> {
+        if self.policy.include_explicit_row_targets {
+            let mut y_indices = self.implicit_y_indices_for_row(row_idx);
+            y_indices.insert(index);
+            y_indices
+        } else {
+            BTreeSet::from([index])
+        }
+    }
+
+    fn y_indices_without_explicit_target(&self, row_idx: usize) -> BTreeSet<usize> {
+        match identity_projection_y_index(self.rows[row_idx].as_slice(), self.projection_set) {
+            Some(index) => BTreeSet::from([index]),
+            None => self
+                .implicit_y_indices_for_row(row_idx)
+                .into_iter()
+                .filter(|index| {
+                    projection_index_not_claimed_by_identity(
+                        self.identity_projection_rows,
+                        *index,
+                        row_idx,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn implicit_y_indices_for_row(&self, row_idx: usize) -> BTreeSet<usize> {
+        if self
+            .implicit_incidence_rows
+            .is_none_or(|rows| rows.contains(&row_idx))
+        {
+            collect_algebraic_y_indices_for_row(self.rows[row_idx].as_slice(), self.projection_set)
+        } else {
+            BTreeSet::new()
+        }
+    }
+}
+
 pub(super) fn lower_projection_plan(
     rows: &[Vec<solve::LinearOp>],
     row_targets: &[Option<solve::ScalarSlot>],
@@ -63,43 +125,17 @@ pub(super) fn lower_projection_plan(
                 .map(|y_idx| (y_idx, *row_idx))
         })
         .collect::<BTreeMap<_, _>>();
+    let row_ownership = ProjectionPlanRowOwnership {
+        rows,
+        row_targets,
+        projection_set: &projection_set,
+        identity_projection_rows: &identity_projection_rows,
+        policy,
+        implicit_incidence_rows,
+    };
 
     for &row_idx in &row_indices {
-        let mut y_indices = if implicit_incidence_rows.is_none_or(|rows| rows.contains(&row_idx)) {
-            collect_algebraic_y_indices_for_row(rows[row_idx].as_slice(), &projection_set)
-        } else {
-            BTreeSet::new()
-        };
-        let explicit_target = if let Some(solve::ScalarSlot::Y { index, .. }) =
-            row_targets.get(row_idx).copied().flatten()
-            && projection_set.contains(&index)
-        {
-            if policy.include_explicit_row_targets {
-                y_indices.insert(index);
-            } else {
-                y_indices.clear();
-                y_indices.insert(index);
-            }
-            true
-        } else {
-            false
-        };
-        if !explicit_target {
-            if let Some(index) =
-                identity_projection_y_index(rows[row_idx].as_slice(), &projection_set)
-            {
-                y_indices.clear();
-                y_indices.insert(index);
-            } else {
-                y_indices.retain(|index| {
-                    projection_index_not_claimed_by_identity(
-                        &identity_projection_rows,
-                        *index,
-                        row_idx,
-                    )
-                });
-            }
-        }
+        let y_indices = row_ownership.y_indices_for_row(row_idx);
         if y_indices.is_empty() {
             continue;
         }
