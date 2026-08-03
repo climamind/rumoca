@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -17,8 +18,16 @@ pub(crate) fn run(root: &Path) -> Result<()> {
 }
 
 fn run_with_program(root: &Path, program: &Path) -> Result<()> {
+    run_with_program_arguments(root, program, &[])
+}
+
+fn run_with_program_arguments(
+    root: &Path,
+    program: &Path,
+    program_arguments: &[&OsStr],
+) -> Result<()> {
     let expected_identity = pinned_runtime_identity(root)?;
-    let version = run_version_command(program)?;
+    let version = run_version_command(program, program_arguments)?;
     let version_output = captured_output(&version);
     ensure!(
         version.status.success(),
@@ -40,7 +49,7 @@ fn run_with_program(root: &Path, program: &Path) -> Result<()> {
         format_output(&version_output),
     );
 
-    run_workspace_smoke(root, program)
+    run_workspace_smoke(root, program, program_arguments)
 }
 
 fn pinned_runtime_identity(root: &Path) -> Result<String> {
@@ -94,8 +103,14 @@ fn release_component(component: Option<&str>, label: &str) -> Result<u64> {
         .with_context(|| format!("invalid {label} release component `{component}`"))
 }
 
-fn run_version_command(program: &Path) -> Result<Output> {
-    Command::new(program)
+fn command_with_arguments(program: &Path, program_arguments: &[&OsStr]) -> Command {
+    let mut command = Command::new(program);
+    command.args(program_arguments);
+    command
+}
+
+fn run_version_command(program: &Path, program_arguments: &[&OsStr]) -> Result<Output> {
+    command_with_arguments(program, program_arguments)
         .arg("--version")
         .output()
         .map_err(|error| match error.kind() {
@@ -125,7 +140,7 @@ fn runtime_identity_from_version_output(output: &str) -> Result<String> {
     Ok(identity.to_owned())
 }
 
-fn run_workspace_smoke(root: &Path, program: &Path) -> Result<()> {
+fn run_workspace_smoke(root: &Path, program: &Path, program_arguments: &[&OsStr]) -> Result<()> {
     let workspace_root = root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize workspace root {}", root.display()))?;
@@ -138,7 +153,7 @@ fn run_workspace_smoke(root: &Path, program: &Path) -> Result<()> {
     let script = smoke_dir.path().join("rumoca-omc-preflight.mos");
     fs::write(&script, SMOKE_SCRIPT)
         .with_context(|| format!("failed to write OMC smoke script {}", script.display()))?;
-    let output = Command::new(program)
+    let output = command_with_arguments(program, program_arguments)
         .arg(&script)
         .current_dir(&workspace_root)
         .output()
@@ -190,12 +205,15 @@ fn is_container_runtime_storage_failure(output: &str) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::run_with_program;
+    use super::{run_with_program, run_with_program_arguments};
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     const PIN: &str = "1.27.0~1-gd7e2907-1";
+    const SYSTEM_SHELL: &str = "/bin/sh";
 
     fn test_root() -> tempfile::TempDir {
         let root = tempfile::tempdir().expect("create workspace root");
@@ -206,14 +224,93 @@ mod tests {
     }
 
     fn write_omc(root: &Path, name: &str, body: &str) -> PathBuf {
+        write_omc_with_staged_executable(root, name, body, |_, _| {})
+    }
+
+    fn run_with_omc_script(root: &Path, script: &Path) -> anyhow::Result<()> {
+        run_with_program_arguments(root, Path::new(SYSTEM_SHELL), &[script.as_os_str()])
+    }
+
+    fn write_omc_with_staged_executable(
+        root: &Path,
+        name: &str,
+        body: &str,
+        inspect_staged: impl FnOnce(&Path, &Path),
+    ) -> PathBuf {
         let path = root.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake omc");
-        let mut permissions = fs::metadata(&path)
-            .expect("read fake omc metadata")
+        let mut staged = tempfile::NamedTempFile::new_in(root).expect("create staged fake omc");
+        staged
+            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .expect("write staged fake omc");
+        let mut permissions = staged
+            .as_file()
+            .metadata()
+            .expect("read staged fake omc metadata")
             .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("make fake omc executable");
+        staged
+            .as_file()
+            .set_permissions(permissions)
+            .expect("make staged fake omc executable");
+        let staged_path = staged.into_temp_path();
+        inspect_staged(staged_path.as_ref(), &path);
+        let staged_path = staged_path.keep().expect("keep closed staged fake omc");
+        fs::rename(&staged_path, &path).expect("atomically publish fake omc");
         path
+    }
+
+    #[test]
+    fn fake_omc_is_published_only_after_its_staged_writer_closes() {
+        let root = test_root();
+        let omc = write_omc_with_staged_executable(
+            root.path(),
+            "staged-omc",
+            r#"
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'OpenModelica 1.27.0~1-gd7e2907'
+  exit 0
+fi
+printf '%s\n' 'OMC_PREFLIGHT_OK'
+"#,
+            |staged, published| {
+                assert!(staged.is_file(), "staged executable must exist");
+                assert!(
+                    !published.exists(),
+                    "published executable must stay hidden until publication"
+                );
+                let output = Command::new(staged)
+                    .arg("--version")
+                    .output()
+                    .expect("run closed staged executable");
+                assert!(output.status.success(), "{output:?}");
+            },
+        );
+
+        assert!(omc.is_file(), "published executable must exist");
+        let output = Command::new(&omc)
+            .arg("--version")
+            .output()
+            .expect("run published executable");
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
+    fn fake_omc_script_runs_through_the_system_shell() {
+        let root = test_root();
+        let omc = write_omc(
+            root.path(),
+            "shell-runner-omc",
+            r#"
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'OpenModelica 1.27.0~1-gd7e2907'
+  exit 0
+fi
+printf '%s\n' 'OMC_PREFLIGHT_OK'
+"#,
+        );
+
+        run_with_omc_script(root.path(), &omc)
+            .expect("system shell must run the fake OMC script as data");
     }
 
     #[test]
@@ -235,7 +332,7 @@ printf '%s\n' 'OMC_PREFLIGHT_OK'
 "#,
         );
 
-        run_with_program(root.path(), &omc).expect("healthy OMC must pass preflight");
+        run_with_omc_script(root.path(), &omc).expect("healthy OMC must pass preflight");
     }
 
     #[test]
@@ -259,7 +356,7 @@ exit 23
 "#,
         );
 
-        let error = run_with_program(root.path(), &omc)
+        let error = run_with_omc_script(root.path(), &omc)
             .expect_err("container storage failure must fail preflight");
         let diagnostic = format!("{error:#}");
         assert!(
@@ -287,8 +384,8 @@ printf '%s\n' 'OMC_PREFLIGHT_OK'
 "#,
         );
 
-        let error =
-            run_with_program(root.path(), &omc).expect_err("wrong OMC release must fail preflight");
+        let error = run_with_omc_script(root.path(), &omc)
+            .expect_err("wrong OMC release must fail preflight");
         let diagnostic = format!("{error:#}");
         assert!(
             diagnostic.contains("runtime identity mismatch"),
@@ -321,7 +418,7 @@ exit 19
         );
 
         let error =
-            run_with_program(root.path(), &omc).expect_err("smoke failure must fail preflight");
+            run_with_omc_script(root.path(), &omc).expect_err("smoke failure must fail preflight");
         let diagnostic = format!("{error:#}");
         assert!(diagnostic.contains("smoke script failed"), "{diagnostic}");
         assert!(diagnostic.contains("fake smoke failure"), "{diagnostic}");
@@ -342,7 +439,7 @@ printf '%s\n' 'OMC_PREFLIGHT_OK'
 "#,
         );
 
-        let error = run_with_program(root.path(), &omc)
+        let error = run_with_omc_script(root.path(), &omc)
             .expect_err("plain semver must not satisfy the pinned runtime identity");
         assert!(
             format!("{error:#}").contains("OpenModelica 1.27.0"),
@@ -365,7 +462,7 @@ printf '%s\n' 'OMC_PREFLIGHT_OK'
 "#,
         );
 
-        let error = run_with_program(root.path(), &omc)
+        let error = run_with_omc_script(root.path(), &omc)
             .expect_err("wrong git revision must not satisfy the pinned runtime identity");
         let diagnostic = format!("{error:#}");
         assert!(
@@ -390,7 +487,7 @@ printf '%s\n' 'OMC_PREFLIGHT_OK'
 "#,
         );
 
-        let error = run_with_program(root.path(), &omc)
+        let error = run_with_omc_script(root.path(), &omc)
             .expect_err("development build must not satisfy the pinned runtime identity");
         assert!(
             format!("{error:#}").contains("OpenModelica 1.27.0~dev-123"),

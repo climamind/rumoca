@@ -2,7 +2,9 @@
 //! This crate contains data consumed by simulation backends after DAE-level
 //! structural/lowering phases. It must stay free of DAE evaluation and phase
 //! logic.
-//! Focused modules own layout, linear ops, direct-initialization validation, and visitors.
+//!
+//! The facade defines the wire types while focused modules own layout, linear
+//! operations, direct-initialization validation, and visitor contracts.
 
 mod affine_map_validation;
 #[cfg(test)]
