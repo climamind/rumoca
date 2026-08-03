@@ -39,6 +39,35 @@ fn matrix_row_vector_product(name: &str, row: i64) -> Expression {
     )
 }
 
+fn scalar_dot_divided_by_if(condition: Expression) -> Model {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "A", &[2, 3]);
+    declare_array(&mut flat, "x", &[3]);
+    declare_array(&mut flat, "left", &[2]);
+    declare_array(&mut flat, "right", &[2]);
+    declare_array(&mut flat, "s", &[]);
+    declare_array(&mut flat, "y", &[]);
+    let denominator = builtin(
+        rumoca_core::BuiltinFunction::NoEvent,
+        vec![Expression::If {
+            branches: vec![(condition, make_structured_var_ref("s"))],
+            else_branch: Box::new(make_structured_var_ref("s")),
+            span: crate::test_support::test_span(),
+        }],
+    );
+    add_equation(
+        &mut flat,
+        make_structured_var_ref("y"),
+        binary(
+            rumoca_core::OpBinary::Div,
+            matrix_row_vector_product("A", 1),
+            denominator,
+        ),
+        1,
+    );
+    flat
+}
+
 fn wrapped_elementwise_vector_model(rhs: Expression) -> Model {
     let mut flat = Model::new();
     declare_array(&mut flat, "a", &[2]);
@@ -718,6 +747,155 @@ fn test_todae_accepts_scalar_relational_and_boolean_constructor_if_conditions() 
         )
         .expect("typed scalar Boolean constructors and relations must prove condition shape");
     }
+}
+
+#[test]
+fn test_todae_rejects_unresolved_function_if_condition() {
+    let condition = Expression::FunctionCall {
+        name: VarName::new("unresolvedCondition").into(),
+        args: Vec::new(),
+        is_constructor: false,
+        span: crate::test_support::test_span(),
+    };
+    let error = to_dae_with_options(
+        &scalar_dot_divided_by_if(condition),
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect_err("an unresolved condition function must fail closed");
+    let message = error.to_string();
+    assert!(message.contains("unresolved function call"));
+    assert!(message.contains("unresolvedCondition"));
+}
+
+#[test]
+fn test_todae_rejects_array_operands_in_logical_and_ordering_conditions() {
+    for op in [
+        rumoca_core::OpBinary::And,
+        rumoca_core::OpBinary::Or,
+        rumoca_core::OpBinary::Lt,
+        rumoca_core::OpBinary::Le,
+        rumoca_core::OpBinary::Gt,
+        rumoca_core::OpBinary::Ge,
+    ] {
+        let condition = binary(op, colon_vector("left"), colon_vector("right"));
+        assert_projection_error(
+            &scalar_dot_divided_by_if(condition),
+            "if condition must have proven scalar shape",
+        );
+    }
+}
+
+#[test]
+fn test_todae_validates_equality_operand_shapes_before_scalar_result() {
+    let equal = scalar_dot_divided_by_if(binary(
+        rumoca_core::OpBinary::Eq,
+        colon_vector("left"),
+        colon_vector("right"),
+    ));
+    to_dae_with_options(
+        &equal,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("equal-shape array equality has a scalar Boolean result");
+
+    let unknown = scalar_dot_divided_by_if(binary(
+        rumoca_core::OpBinary::Eq,
+        colon_vector("left"),
+        make_structured_var_ref("unknown"),
+    ));
+    let error = to_dae_with_options(
+        &unknown,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect_err("an unresolved equality operand must fail closed");
+    let message = error.to_string();
+    assert!(message.contains("if condition must have proven scalar shape"));
+
+    let mismatch = scalar_dot_divided_by_if(binary(
+        rumoca_core::OpBinary::Neq,
+        colon_vector("left"),
+        make_structured_var_ref("A"),
+    ));
+    let error = to_dae_with_options(
+        &mismatch,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect_err("mismatched equality operands must fail closed");
+    assert!(error.to_string().contains("result shape mismatch"));
+}
+
+#[test]
+fn test_todae_rejects_non_scalar_primitive_constructor_values() {
+    for value in [colon_vector("left"), matrix_vector_product("A")] {
+        let condition = Expression::FunctionCall {
+            name: VarName::new("Boolean").into(),
+            args: vec![value],
+            is_constructor: true,
+            span: crate::test_support::test_span(),
+        };
+        assert_projection_error(
+            &scalar_dot_divided_by_if(condition),
+            "if condition must have proven scalar shape",
+        );
+    }
+}
+
+#[test]
+fn test_todae_rejects_invalid_scalar_builtin_condition_arguments() {
+    let conditions = [
+        builtin(
+            rumoca_core::BuiltinFunction::Abs,
+            vec![colon_vector("left")],
+        ),
+        builtin(
+            rumoca_core::BuiltinFunction::Sqrt,
+            vec![make_structured_var_ref("s"), make_structured_var_ref("s")],
+        ),
+    ];
+    for condition in conditions {
+        assert_projection_error(
+            &scalar_dot_divided_by_if(condition),
+            "if condition must have proven scalar shape",
+        );
+    }
+}
+
+#[test]
+fn test_todae_finds_matrix_product_when_only_if_condition_contains_candidate() {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "A", &[2, 3]);
+    declare_array(&mut flat, "x", &[3]);
+    declare_array(&mut flat, "right", &[2]);
+    declare_array(&mut flat, "s", &[]);
+    declare_array(&mut flat, "y", &[]);
+    let condition = builtin(
+        rumoca_core::BuiltinFunction::NoEvent,
+        vec![binary(
+            rumoca_core::OpBinary::Eq,
+            matrix_vector_product("A"),
+            colon_vector("right"),
+        )],
+    );
+    add_equation(
+        &mut flat,
+        make_structured_var_ref("y"),
+        Expression::If {
+            branches: vec![(condition, make_structured_var_ref("s"))],
+            else_branch: Box::new(make_structured_var_ref("s")),
+            span: crate::test_support::test_span(),
+        },
+        1,
+    );
+
+    assert_projection_error(&flat, "unsupported matrix-product wrapper");
 }
 
 #[test]

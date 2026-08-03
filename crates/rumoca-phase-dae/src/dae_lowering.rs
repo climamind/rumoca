@@ -4020,9 +4020,6 @@ impl Projector<'_> {
                 None => Ok(None),
             };
         }
-        if is_scalar_primitive_constructor(expr) {
-            return Ok(Some(Vec::new()));
-        }
         match expr {
             Expr::BuiltinCall {
                 function: Builtin::Fill,
@@ -4033,17 +4030,7 @@ impl Projector<'_> {
                 function: Builtin::Homotopy,
                 args,
                 ..
-            } => {
-                let [actual, simplified] = args.as_slice() else {
-                    return Err(projection_error("unknown operand shape", span));
-                };
-                match (self.dims(actual, span)?, self.dims(simplified, span)?) {
-                    (Some(actual), Some(simplified)) => {
-                        elementwise_dims(&actual, &simplified, span).map(Some)
-                    }
-                    _ => Ok(None),
-                }
-            }
+            } => self.homotopy_dims(args, span),
             Expr::BuiltinCall {
                 function: Builtin::NoEvent,
                 args,
@@ -4069,8 +4056,21 @@ impl Projector<'_> {
                     _ => Err(projection_error("unsupported rank", span)),
                 }
             }
+            Expr::BuiltinCall { function, args, .. }
+                if scalar_builtin_arity(*function).is_some() =>
+            {
+                self.scalar_builtin_dims(*function, args, span)
+            }
             Expr::BuiltinCall { function, .. } => Ok(builtin_fixed_vector_output_width(*function)
                 .and_then(|width| i64::try_from(width).ok().map(|width| vec![width]))),
+            Expr::FunctionCall {
+                name,
+                args,
+                is_constructor: true,
+                ..
+            } if is_primitive_constructor_name(name.as_str()) => {
+                self.primitive_constructor_dims(args, span)
+            }
             Expr::FunctionCall {
                 name, args, span, ..
             } => self.function_call_output_dims(name, args, *span),
@@ -4081,10 +4081,10 @@ impl Projector<'_> {
                 else_branch,
                 ..
             } => self.if_expression_dims(branches, else_branch, span),
-            Expr::Binary { op, .. }
+            Expr::Binary { op, lhs, rhs, .. }
                 if op.is_relational() || matches!(op, OpBinary::And | OpBinary::Or) =>
             {
-                Ok(Some(Vec::new()))
+                self.condition_binary_dims(op, lhs, rhs, span)
             }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (Some(lhs_dims), Some(rhs_dims)) =
@@ -4106,6 +4106,96 @@ impl Projector<'_> {
                     _ => Err(projection_error("unknown operand shape", span)),
                 }
             }
+            _ => Ok(None),
+        }
+    }
+
+    fn homotopy_dims(&self, args: &[Expr], span: Span) -> Result<Option<Vec<i64>>, ToDaeError> {
+        let [actual, simplified] = args else {
+            return Err(projection_error("unknown operand shape", span));
+        };
+        match (self.dims(actual, span)?, self.dims(simplified, span)?) {
+            (Some(actual), Some(simplified)) => {
+                elementwise_dims(&actual, &simplified, span).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn scalar_builtin_dims(
+        &self,
+        function: Builtin,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Option<Vec<i64>>, ToDaeError> {
+        let Some(expected_arity) = scalar_builtin_arity(function) else {
+            return Ok(None);
+        };
+        if args.len() != expected_arity {
+            return Ok(None);
+        }
+        let mut all_scalar = true;
+        for arg in args {
+            all_scalar &= matches!(self.dims(arg, span)?, Some(dims) if dims.is_empty());
+        }
+        Ok(all_scalar.then(Vec::new))
+    }
+
+    fn primitive_constructor_dims(
+        &self,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Option<Vec<i64>>, ToDaeError> {
+        if args.is_empty() {
+            return Ok(None);
+        }
+        let mut positional_count = 0;
+        let mut named_args = Vec::new();
+        let mut saw_named_arg = false;
+        let mut all_scalar = true;
+        for arg in args {
+            let Some((name, value)) = primitive_constructor_actual(arg) else {
+                return Ok(None);
+            };
+            match name {
+                Some(name) if !named_args.contains(&name) => {
+                    saw_named_arg = true;
+                    named_args.push(name);
+                }
+                Some(_) => return Ok(None),
+                None if positional_count == 0 && !saw_named_arg => positional_count = 1,
+                None => return Ok(None),
+            }
+            all_scalar &= matches!(self.dims(value, span)?, Some(dims) if dims.is_empty());
+        }
+        Ok(all_scalar.then(Vec::new))
+    }
+
+    fn condition_binary_dims(
+        &self,
+        op: &OpBinary,
+        lhs: &Expr,
+        rhs: &Expr,
+        span: Span,
+    ) -> Result<Option<Vec<i64>>, ToDaeError> {
+        let lhs_dims = self.dims(lhs, span)?;
+        let rhs_dims = self.dims(rhs, span)?;
+        match op {
+            OpBinary::Eq | OpBinary::Neq => match (lhs_dims, rhs_dims) {
+                (Some(lhs), Some(rhs)) if lhs == rhs => Ok(Some(Vec::new())),
+                (Some(_), Some(_)) => Err(projection_error("result shape mismatch", span)),
+                _ => Ok(None),
+            },
+            OpBinary::And
+            | OpBinary::Or
+            | OpBinary::Lt
+            | OpBinary::Le
+            | OpBinary::Gt
+            | OpBinary::Ge => Ok(matches!(
+                (lhs_dims, rhs_dims),
+                (Some(lhs), Some(rhs)) if lhs.is_empty() && rhs.is_empty()
+            )
+            .then(Vec::new)),
             _ => Ok(None),
         }
     }
@@ -4659,15 +4749,27 @@ impl Projector<'_> {
                 branches,
                 else_branch,
                 ..
-            } => Ok(self.any_descendant_product_candidate(
-                branches.iter().map(|(_, value)| value),
-                allow_non_scalar_evidence,
-                include_elementwise,
-            )? || self.has_descendant_product_candidate(
-                else_branch,
-                allow_non_scalar_evidence,
-                include_elementwise,
-            )?),
+            } => {
+                let mut has_candidate = false;
+                for (condition, value) in branches {
+                    has_candidate |= self.has_descendant_product_candidate(
+                        condition,
+                        allow_non_scalar_evidence,
+                        include_elementwise,
+                    )?;
+                    has_candidate |= self.has_descendant_product_candidate(
+                        value,
+                        allow_non_scalar_evidence,
+                        include_elementwise,
+                    )?;
+                }
+                Ok(has_candidate
+                    || self.has_descendant_product_candidate(
+                        else_branch,
+                        allow_non_scalar_evidence,
+                        include_elementwise,
+                    )?)
+            }
             _ if allow_non_scalar_evidence => {
                 let Some(span) = expr.span() else {
                     return Ok(false);
@@ -4742,15 +4844,61 @@ impl Projector<'_> {
         Ok(has_candidate)
     }
 }
-fn is_scalar_primitive_constructor(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::FunctionCall {
-            name,
-            is_constructor: true,
-            ..
-        } if matches!(name.as_str(), "Boolean" | "Integer" | "Real" | "String")
-    )
+fn is_primitive_constructor_name(name: &str) -> bool {
+    matches!(name, "Boolean" | "Integer" | "Real" | "String")
+}
+
+fn primitive_constructor_actual(arg: &Expr) -> Option<(Option<&str>, &Expr)> {
+    let Some(name) = named_argument_input_name(arg) else {
+        return Some((None, arg));
+    };
+    let Expr::FunctionCall {
+        args,
+        is_constructor: true,
+        ..
+    } = arg
+    else {
+        return None;
+    };
+    let [value] = args.as_slice() else {
+        return None;
+    };
+    (!name.is_empty()).then_some((Some(name), value))
+}
+
+fn scalar_builtin_arity(function: Builtin) -> Option<usize> {
+    match function {
+        Builtin::Initial | Builtin::Terminal => Some(0),
+        Builtin::Pre
+        | Builtin::Abs
+        | Builtin::Sign
+        | Builtin::Sqrt
+        | Builtin::Floor
+        | Builtin::Ceil
+        | Builtin::Sin
+        | Builtin::Cos
+        | Builtin::Tan
+        | Builtin::Asin
+        | Builtin::Acos
+        | Builtin::Atan
+        | Builtin::Sinh
+        | Builtin::Cosh
+        | Builtin::Tanh
+        | Builtin::Exp
+        | Builtin::Log
+        | Builtin::Log10
+        | Builtin::Edge
+        | Builtin::Change
+        | Builtin::Integer => Some(1),
+        Builtin::Div
+        | Builtin::Mod
+        | Builtin::Rem
+        | Builtin::Min
+        | Builtin::Max
+        | Builtin::Atan2 => Some(2),
+        Builtin::SemiLinear => Some(3),
+        _ => None,
+    }
 }
 fn matrix_var_slice(expr: &Expr) -> Option<(&Reference, &[Subscript])> {
     match expr {
