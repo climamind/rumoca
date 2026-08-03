@@ -146,6 +146,51 @@ fn prepared_compute_block_scatters_noncontiguous_linsolve_outputs() {
 }
 
 #[test]
+fn prepared_compute_block_reuses_sparse_linsolve_scratch_but_keeps_contiguous_direct() {
+    let sparse = PreparedComputeBlock::new(&ComputeBlock {
+        nodes: vec![diagonal_linsolve_node(vec![0, 2])],
+    })
+    .expect("noncontiguous LinSolve should prepare");
+    assert_eq!(sparse.linsolve_output_scratch.borrow().capacity(), 0);
+
+    let mut sparse_out = vec![0.0; sparse.len()];
+    sparse
+        .eval_with_context(&[], &[], 0.0, RowEvalContext::default(), &mut sparse_out)
+        .expect("first sparse LinSolve evaluation should succeed");
+    let (scratch_ptr, scratch_capacity) = {
+        let scratch = sparse.linsolve_output_scratch.borrow();
+        (scratch.as_ptr(), scratch.capacity())
+    };
+    assert!(scratch_capacity >= 2);
+
+    sparse
+        .eval_with_context(&[], &[], 0.0, RowEvalContext::default(), &mut sparse_out)
+        .expect("second sparse LinSolve evaluation should reuse scratch");
+    let scratch = sparse.linsolve_output_scratch.borrow();
+    assert_eq!(scratch.as_ptr(), scratch_ptr);
+    assert_eq!(scratch.capacity(), scratch_capacity);
+    drop(scratch);
+
+    let contiguous = PreparedComputeBlock::new(&ComputeBlock {
+        nodes: vec![diagonal_linsolve_node(Vec::new())],
+    })
+    .expect("contiguous LinSolve should prepare");
+    let mut contiguous_out = vec![0.0; contiguous.len()];
+    contiguous
+        .eval_with_context(
+            &[],
+            &[],
+            0.0,
+            RowEvalContext::default(),
+            &mut contiguous_out,
+        )
+        .expect("contiguous LinSolve evaluation should write directly");
+
+    assert_eq!(contiguous_out, vec![4.0, 5.0]);
+    assert_eq!(contiguous.linsolve_output_scratch.borrow().capacity(), 0);
+}
+
+#[test]
 fn prepared_compute_block_writes_sparse_map_output_slots() {
     let domain = test_domain();
     let block = ComputeBlock {
