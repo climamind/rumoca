@@ -11,6 +11,7 @@ mod direct_map_semantics;
 mod initialization_validation;
 mod layout;
 mod linear_op;
+mod linsolve_output_indices;
 pub mod visitor;
 
 use indexmap::IndexMap;
@@ -18,6 +19,11 @@ use rumoca_core::{
     ExternalTableData, SourceId, Span, StructuredIndexDomain, StructuredIndexDomainError,
 };
 use serde::{Deserialize, Serialize};
+
+pub(crate) use linsolve_output_indices::{
+    linsolve_output_cursor, output_index_overflow, tensor_output_count_for_node,
+    tensor_output_map_error, validate_linsolve_output_indices,
+};
 
 pub use affine_map_validation::{AffineMapMetadataError, validate_affine_map_metadata};
 pub use initialization_validation::{
@@ -39,7 +45,7 @@ pub use visitor::{
     LinearOpSliceKind, SolveVisitor, VisitScope, walk_compute_block, walk_compute_node,
     walk_scalar_program_block, walk_solve_artifacts, walk_solve_model, walk_solve_problem,
 };
-pub const SOLVE_SCHEMA_VERSION: u16 = 16;
+pub const SOLVE_SCHEMA_VERSION: u16 = 17;
 
 pub fn source_span_from_offsets(source: u64, start: usize, end: usize) -> Span {
     Span::from_offsets(SourceId(source), start, end)
@@ -620,7 +626,7 @@ pub enum ComputeNode {
         span: Span,
     },
 
-    /// Dense linear solve: A (n×n) * x = b, writes n consecutive output values.
+    /// Dense linear solve: A (n×n) * x = b.
     ///
     /// `setup_ops` evaluates to n*n + n values:
     ///   regs `matrix_start..matrix_start+n*n` = A (row-major)
@@ -632,6 +638,10 @@ pub enum ComputeNode {
         rhs_start: Reg,
         n: usize,
         next_reg: Reg,
+        /// Empty retains contiguous placement at the current ComputeBlock
+        /// cursor. A populated map preserves native output ownership.
+        #[serde(default)]
+        output_indices: Vec<usize>,
         metadata: TensorNodeMetadata,
         span: Span,
     },
@@ -748,10 +758,20 @@ impl ComputeBlock {
                         .checked_add(output_count)
                         .ok_or_else(|| output_index_overflow(context, node_index, Some(*span)))?;
                 }
-                ComputeNode::LinSolve { n, span, .. } => {
-                    output_cursor = output_cursor
-                        .checked_add(*n)
-                        .ok_or_else(|| output_index_overflow(context, node_index, Some(*span)))?;
+                ComputeNode::LinSolve {
+                    n,
+                    output_indices,
+                    span,
+                    ..
+                } => {
+                    output_cursor = linsolve_output_cursor(
+                        context,
+                        node_index,
+                        output_cursor,
+                        *n,
+                        output_indices,
+                        *span,
+                    )?;
                 }
             }
         }
@@ -810,80 +830,6 @@ impl ComputeBlock {
     }
 }
 
-fn tensor_output_count_for_node(
-    context: &'static str,
-    node_index: usize,
-    node: &ComputeNode,
-    domain: &StructuredIndexDomain,
-    output_map: &TensorOutputMap,
-) -> Result<usize, SolveProblemShapeContractError> {
-    let (dimension, span) = match node {
-        ComputeNode::Map { span, .. } => ("Map", *span),
-        ComputeNode::AffineStencil { span, .. } => ("AffineStencil", *span),
-        ComputeNode::ScalarPrograms(_)
-        | ComputeNode::MatMul { .. }
-        | ComputeNode::LinSolve { .. } => unreachable!("tensor output count requires tensor node"),
-    };
-    output_map
-        .output_count(domain)
-        .map_err(|error| tensor_output_map_error(context, node_index, dimension, error, span))
-}
-
-fn tensor_output_map_error(
-    context: &'static str,
-    node_index: usize,
-    dimension: &'static str,
-    error: TensorOutputMapError,
-    span: Span,
-) -> SolveProblemShapeContractError {
-    match error {
-        TensorOutputMapError::Dimension {
-            output_dimension,
-            domain_rank,
-        } => SolveProblemShapeContractError::TensorOutputMapDimension {
-            context: context.to_string(),
-            node_index,
-            dimension,
-            output_dimension,
-            domain_rank,
-            span,
-        },
-        TensorOutputMapError::StructuredIndexDomain { error } => {
-            SolveProblemShapeContractError::StructuredIndexDomain {
-                context: context.to_string(),
-                node_index,
-                dimension,
-                error,
-                span,
-            }
-        }
-        TensorOutputMapError::NegativeIndex { value } => {
-            SolveProblemShapeContractError::TensorOutputMapNegativeIndex {
-                context: context.to_string(),
-                node_index,
-                dimension,
-                value,
-                span,
-            }
-        }
-        TensorOutputMapError::OutputIndexOverflow => {
-            output_index_overflow(context, node_index, Some(span))
-        }
-    }
-}
-
-fn output_index_overflow(
-    context: impl Into<String>,
-    node_index: usize,
-    span: Option<Span>,
-) -> SolveProblemShapeContractError {
-    SolveProblemShapeContractError::OutputIndexOverflow {
-        context: context.into(),
-        node_index,
-        span,
-    }
-}
-
 impl ComputeNode {
     pub fn validate_shape_contract(
         &self,
@@ -930,7 +876,12 @@ impl ComputeNode {
                     });
                 }
             }
-            ComputeNode::LinSolve { n, span, .. } => {
+            ComputeNode::LinSolve {
+                n,
+                output_indices,
+                span,
+                ..
+            } => {
                 if *n == 0 {
                     return Err(SolveProblemShapeContractError::ZeroTensorDimension {
                         context: context.to_string(),
@@ -939,6 +890,7 @@ impl ComputeNode {
                         span: *span,
                     });
                 }
+                validate_linsolve_output_indices(context, node_index, *n, output_indices, *span)?;
             }
             ComputeNode::Map {
                 domain,
@@ -1480,6 +1432,19 @@ pub enum SolveProblemShapeContractError {
         value: isize,
         span: Span,
     },
+    LinSolveOutputIndexMismatch {
+        context: String,
+        node_index: usize,
+        components: usize,
+        output_indices: usize,
+        span: Span,
+    },
+    LinSolveDuplicateOutputIndex {
+        context: String,
+        node_index: usize,
+        output_index: usize,
+        span: Span,
+    },
     OutputIndexOverflow {
         context: String,
         node_index: usize,
@@ -1513,7 +1478,9 @@ impl SolveProblemShapeContractError {
             Self::ZeroTensorDimension { span, .. }
             | Self::StructuredIndexDomain { span, .. }
             | Self::TensorOutputMapDimension { span, .. }
-            | Self::TensorOutputMapNegativeIndex { span, .. } => Some(*span),
+            | Self::TensorOutputMapNegativeIndex { span, .. }
+            | Self::LinSolveOutputIndexMismatch { span, .. }
+            | Self::LinSolveDuplicateOutputIndex { span, .. } => Some(*span),
         }
     }
 }
@@ -1558,6 +1525,25 @@ impl std::fmt::Display for SolveProblemShapeContractError {
             Self::InitializationTargetCoverage { reason, .. } => {
                 write!(f, "initialization target coverage is invalid: {reason}")
             }
+            Self::LinSolveOutputIndexMismatch {
+                context,
+                node_index,
+                components,
+                output_indices,
+                ..
+            } => write!(
+                f,
+                "{context} node {node_index} LinSolve has {components} components but {output_indices} output indices"
+            ),
+            Self::LinSolveDuplicateOutputIndex {
+                context,
+                node_index,
+                output_index,
+                ..
+            } => write!(
+                f,
+                "{context} node {node_index} LinSolve has duplicate output index {output_index}"
+            ),
             error @ (Self::ZeroTensorDimension { .. }
             | Self::StructuredIndexDomain { .. }
             | Self::TensorOutputMapDimension { .. }
