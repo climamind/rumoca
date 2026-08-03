@@ -361,6 +361,90 @@ fn test_todae_rejects_nonscalar_builtin_wrapper_around_matrix_product() {
 }
 
 #[test]
+fn test_todae_projects_homotopy_wrapper_around_matrix_products() {
+    let flat = wrapped_matrix_vector_model(builtin(
+        rumoca_core::BuiltinFunction::Homotopy,
+        vec![matrix_vector_product("A"), matrix_vector_product("A")],
+    ));
+
+    let dae = to_dae_with_options(
+        &flat,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("homotopy preserves its operand shape and must remain lane-projectable");
+    assert_eq!(dae.continuous.equations.len(), 2);
+    for (lane, equation) in dae.continuous.equations.iter().enumerate() {
+        let Expression::BuiltinCall {
+            function: rumoca_core::BuiltinFunction::Homotopy,
+            args,
+            ..
+        } = residual_rhs(equation)
+        else {
+            panic!(
+                "expected projected homotopy wrapper, got {:?}",
+                equation.rhs
+            );
+        };
+        let [actual, simplified] = args.as_slice() else {
+            panic!("expected homotopy actual and simplified operands, got {args:?}");
+        };
+        let row = i64::try_from(lane + 1).expect("lane fits i64");
+        assert_complete_matrix_vector_lane(actual, row);
+        assert_complete_matrix_vector_lane(simplified, row);
+    }
+}
+
+#[test]
+fn test_todae_projects_homotopy_with_scalar_simplified_operand() {
+    let flat = wrapped_matrix_vector_model(builtin(
+        rumoca_core::BuiltinFunction::Homotopy,
+        vec![
+            matrix_vector_product("A"),
+            multiply(make_structured_var_ref("s"), make_structured_var_ref("s")),
+        ],
+    ));
+
+    let dae = to_dae_with_options(
+        &flat,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("homotopy must scalar-expand a simplified operand across the actual result shape");
+    assert_eq!(dae.continuous.equations.len(), 2);
+    for (lane, equation) in dae.continuous.equations.iter().enumerate() {
+        let Expression::BuiltinCall {
+            function: rumoca_core::BuiltinFunction::Homotopy,
+            args,
+            ..
+        } = residual_rhs(equation)
+        else {
+            panic!(
+                "expected projected homotopy wrapper, got {:?}",
+                equation.rhs
+            );
+        };
+        let [actual, simplified] = args.as_slice() else {
+            panic!("expected homotopy actual and simplified operands, got {args:?}");
+        };
+        assert_complete_matrix_vector_lane(actual, i64::try_from(lane + 1).expect("lane fits i64"));
+        let Expression::Binary {
+            op: rumoca_core::OpBinary::Mul,
+            lhs,
+            rhs,
+            ..
+        } = simplified
+        else {
+            panic!("expected preserved scalar product, got {simplified:?}");
+        };
+        assert_eq!(literal_subscripts(lhs), Some(("s", vec![])));
+        assert_eq!(literal_subscripts(rhs), Some(("s", vec![])));
+    }
+}
+
+#[test]
 fn test_todae_accepts_if_wrapped_scalar_scaled_dot_product() {
     let mut flat = Model::new();
     declare_array(&mut flat, "A", &[2, 3]);
@@ -425,6 +509,57 @@ fn test_todae_accepts_if_wrapped_scalar_scaled_dot_product() {
     };
     assert_eq!(literal_subscripts(lhs), Some(("s", vec![])));
     assert_complete_matrix_vector_lane(rhs, 1);
+}
+
+#[test]
+fn test_todae_projects_scalar_division_with_unary_and_no_event_if_operands() {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "A", &[2, 3]);
+    declare_array(&mut flat, "x", &[3]);
+    declare_array(&mut flat, "c", &[]);
+    declare_array(&mut flat, "s", &[]);
+    declare_array(&mut flat, "y", &[]);
+    let numerator = binary(
+        rumoca_core::OpBinary::Sub,
+        Expression::Unary {
+            op: rumoca_core::OpUnary::Minus,
+            rhs: Box::new(make_structured_var_ref("s")),
+            span: crate::test_support::test_span(),
+        },
+        matrix_row_vector_product("A", 1),
+    );
+    let denominator = builtin(
+        rumoca_core::BuiltinFunction::NoEvent,
+        vec![Expression::If {
+            branches: vec![(make_structured_var_ref("c"), make_structured_var_ref("s"))],
+            else_branch: Box::new(make_structured_var_ref("s")),
+            span: crate::test_support::test_span(),
+        }],
+    );
+    add_equation(
+        &mut flat,
+        make_structured_var_ref("y"),
+        binary(rumoca_core::OpBinary::Div, numerator, denominator),
+        1,
+    );
+
+    let dae = to_dae_with_options(
+        &flat,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("scalar shape must propagate through unary, noEvent, and if wrappers");
+    let [equation] = dae.continuous.equations.as_slice() else {
+        panic!("expected one scalar equation");
+    };
+    assert!(matches!(
+        residual_rhs(equation),
+        Expression::Binary {
+            op: rumoca_core::OpBinary::Div,
+            ..
+        }
+    ));
 }
 
 #[test]

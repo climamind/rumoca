@@ -200,6 +200,84 @@ fn test_todae_preserves_scalar_scaling_of_vector_scalar_division() {
 }
 
 #[test]
+fn test_todae_projects_scalar_quotient_scaling_of_vector() {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "V", &[2]);
+    declare_array(&mut flat, "s", &[]);
+    declare_array(&mut flat, "t", &[]);
+    declare_array(&mut flat, "Y", &[2]);
+    let scalar_quotient = binary(
+        rumoca_core::OpBinary::Div,
+        make_structured_var_ref("s"),
+        make_structured_var_ref("t"),
+    );
+    flat.add_equation(flat::Equation {
+        residual: binary(
+            rumoca_core::OpBinary::Sub,
+            Expression::Index {
+                base: Box::new(make_structured_var_ref("Y")),
+                subscripts: vec![rumoca_core::Subscript::Colon {
+                    span: crate::test_support::test_span(),
+                }],
+                span: crate::test_support::test_span(),
+            },
+            binary(
+                rumoca_core::OpBinary::Mul,
+                scalar_quotient,
+                make_structured_var_ref("V"),
+            ),
+        ),
+        span: crate::test_support::test_span(),
+        origin: flat::EquationOrigin::ComponentEquation {
+            component: "ScalarQuotientArrayScaling".to_string(),
+        },
+        scalar_count: 2,
+    });
+
+    let dae = to_dae_with_options(
+        &flat,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("a proven scalar quotient must scale every vector lane");
+    assert_eq!(dae.continuous.equations.len(), 2);
+    for (lane, equation) in dae.continuous.equations.iter().enumerate() {
+        let Expression::Binary {
+            op: rumoca_core::OpBinary::Sub,
+            rhs: projected,
+            ..
+        } = &equation.rhs
+        else {
+            panic!("expected scalar residual, got {:?}", equation.rhs);
+        };
+        let Expression::Binary {
+            op: rumoca_core::OpBinary::Mul,
+            lhs,
+            rhs,
+            ..
+        } = projected.as_ref()
+        else {
+            panic!(
+                "expected scalar-quotient product residual, got {:?}",
+                equation.rhs
+            );
+        };
+        assert!(matches!(
+            lhs.as_ref(),
+            Expression::Binary {
+                op: rumoca_core::OpBinary::Div,
+                ..
+            }
+        ));
+        assert_eq!(
+            literal_subscripts(rhs),
+            Some(("V", vec![i64::try_from(lane + 1).expect("lane fits i64")]))
+        );
+    }
+}
+
+#[test]
 fn test_todae_rejects_bare_divided_array_operands_in_matrix_product() {
     let mut flat = Model::new();
     for (name, dims) in [
