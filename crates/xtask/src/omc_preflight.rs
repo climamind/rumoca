@@ -192,8 +192,10 @@ fn is_container_runtime_storage_failure(output: &str) -> bool {
 mod tests {
     use super::run_with_program;
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     const PIN: &str = "1.27.0~1-gd7e2907-1";
 
@@ -206,14 +208,70 @@ mod tests {
     }
 
     fn write_omc(root: &Path, name: &str, body: &str) -> PathBuf {
+        write_omc_with_staged_executable(root, name, body, |_, _| {})
+    }
+
+    fn write_omc_with_staged_executable(
+        root: &Path,
+        name: &str,
+        body: &str,
+        inspect_staged: impl FnOnce(&Path, &Path),
+    ) -> PathBuf {
         let path = root.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake omc");
-        let mut permissions = fs::metadata(&path)
-            .expect("read fake omc metadata")
+        let mut staged = tempfile::NamedTempFile::new_in(root).expect("create staged fake omc");
+        staged
+            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .expect("write staged fake omc");
+        let mut permissions = staged
+            .as_file()
+            .metadata()
+            .expect("read staged fake omc metadata")
             .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("make fake omc executable");
+        staged
+            .as_file()
+            .set_permissions(permissions)
+            .expect("make staged fake omc executable");
+        let staged_path = staged.into_temp_path();
+        inspect_staged(staged_path.as_ref(), &path);
+        let staged_path = staged_path.keep().expect("keep closed staged fake omc");
+        fs::rename(&staged_path, &path).expect("atomically publish fake omc");
         path
+    }
+
+    #[test]
+    fn fake_omc_is_published_only_after_its_staged_writer_closes() {
+        let root = test_root();
+        let omc = write_omc_with_staged_executable(
+            root.path(),
+            "staged-omc",
+            r#"
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'OpenModelica 1.27.0~1-gd7e2907'
+  exit 0
+fi
+printf '%s\n' 'OMC_PREFLIGHT_OK'
+"#,
+            |staged, published| {
+                assert!(staged.is_file(), "staged executable must exist");
+                assert!(
+                    !published.exists(),
+                    "published executable must stay hidden until publication"
+                );
+                let output = Command::new(staged)
+                    .arg("--version")
+                    .output()
+                    .expect("run closed staged executable");
+                assert!(output.status.success(), "{output:?}");
+            },
+        );
+
+        assert!(omc.is_file(), "published executable must exist");
+        let output = Command::new(&omc)
+            .arg("--version")
+            .output()
+            .expect("run published executable");
+        assert!(output.status.success(), "{output:?}");
     }
 
     #[test]
