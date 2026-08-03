@@ -20,6 +20,25 @@ fn matrix_vector_product(name: &str) -> Expression {
     multiply(colon_array(name, 2), colon_vector("x"))
 }
 
+fn matrix_row_vector_product(name: &str, row: i64) -> Expression {
+    multiply(
+        Expression::Index {
+            base: Box::new(make_structured_var_ref(name)),
+            subscripts: vec![
+                rumoca_core::Subscript::Index {
+                    value: row,
+                    span: crate::test_support::test_span(),
+                },
+                rumoca_core::Subscript::Colon {
+                    span: crate::test_support::test_span(),
+                },
+            ],
+            span: crate::test_support::test_span(),
+        },
+        colon_vector("x"),
+    )
+}
+
 fn wrapped_elementwise_vector_model(rhs: Expression) -> Model {
     let mut flat = Model::new();
     declare_array(&mut flat, "a", &[2]);
@@ -339,6 +358,73 @@ fn test_todae_rejects_nonscalar_builtin_wrapper_around_matrix_product() {
     ));
 
     assert_projection_error(&flat, "unsupported matrix-product wrapper");
+}
+
+#[test]
+fn test_todae_accepts_if_wrapped_scalar_scaled_dot_product() {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "A", &[2, 3]);
+    declare_array(&mut flat, "x", &[3]);
+    declare_array(&mut flat, "c", &[]);
+    declare_array(&mut flat, "s", &[]);
+    declare_array(&mut flat, "y", &[]);
+    add_equation(
+        &mut flat,
+        make_structured_var_ref("y"),
+        Expression::If {
+            branches: vec![(
+                make_structured_var_ref("c"),
+                Expression::Unary {
+                    op: rumoca_core::OpUnary::Minus,
+                    rhs: Box::new(multiply(
+                        make_structured_var_ref("s"),
+                        matrix_row_vector_product("A", 1),
+                    )),
+                    span: crate::test_support::test_span(),
+                },
+            )],
+            else_branch: Box::new(Expression::Literal {
+                value: rumoca_core::Literal::Integer(0),
+                span: crate::test_support::test_span(),
+            }),
+            span: crate::test_support::test_span(),
+        },
+        1,
+    );
+
+    let dae = to_dae_with_options(
+        &flat,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("a scalar if wrapper around a scalar-scaled dot product must lower");
+    let [equation] = dae.continuous.equations.as_slice() else {
+        panic!(
+            "expected one scalar equation, got {:?}",
+            dae.continuous.equations
+        );
+    };
+    let Expression::If { branches, .. } = residual_rhs(equation) else {
+        panic!(
+            "expected preserved scalar if wrapper, got {:?}",
+            equation.rhs
+        );
+    };
+    let [(_, Expression::Unary { rhs, .. })] = branches.as_slice() else {
+        panic!("expected scalar-scaled dot-product branch, got {branches:?}");
+    };
+    let Expression::Binary {
+        op: rumoca_core::OpBinary::Mul,
+        lhs,
+        rhs,
+        ..
+    } = rhs.as_ref()
+    else {
+        panic!("expected scalar scale around dot product, got {rhs:?}");
+    };
+    assert_eq!(literal_subscripts(lhs), Some(("s", vec![])));
+    assert_complete_matrix_vector_lane(rhs, 1);
 }
 
 #[test]
