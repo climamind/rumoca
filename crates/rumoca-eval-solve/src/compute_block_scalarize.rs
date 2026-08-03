@@ -365,6 +365,7 @@ impl SolveVisitor for ScalarProgramCollector {
                 rhs_start,
                 n,
                 next_reg,
+                output_indices,
                 span,
                 ..
             } => {
@@ -373,9 +374,14 @@ impl SolveVisitor for ScalarProgramCollector {
                 }
                 let program =
                     scalarize_linsolve(setup_ops, *matrix_start, *rhs_start, *n, *next_reg, *span)?;
-                let start = self.next_output;
-                let end = checked_contiguous_output_count(start, *n, "linsolve", *span)?;
-                self.append_contiguous_programs(vec![program], start, end, *span, "linsolve")?;
+                let output_indices = if output_indices.is_empty() {
+                    let end =
+                        checked_contiguous_output_count(self.next_output, *n, "linsolve", *span)?;
+                    (self.next_output..end).collect()
+                } else {
+                    output_indices.clone()
+                };
+                self.append_tensor_programs(vec![program], output_indices, *span, "linsolve")?;
             }
             ComputeNode::Map {
                 domain,
