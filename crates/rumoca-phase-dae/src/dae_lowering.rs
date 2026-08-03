@@ -4213,15 +4213,20 @@ impl Projector<'_> {
                 ..
             } => {
                 let branches_are_scalar =
-                    branches.iter().try_fold(true, |all_scalar, (_, value)| {
-                        Ok::<bool, ToDaeError>(
-                            all_scalar
-                                && self
-                                    .has_only_scalar_descendant_matrix_multiply_candidates(value)?,
-                        )
-                    })?;
-                Ok(branches_are_scalar
-                    && self.has_only_scalar_descendant_matrix_multiply_candidates(else_branch)?)
+                    branches
+                        .iter()
+                        .try_fold(true, |all_scalar, (condition, value)| {
+                            let condition_is_scalar = self
+                                .has_only_scalar_descendant_matrix_multiply_candidates(condition)?;
+                            let value_is_scalar =
+                                self.has_only_scalar_descendant_matrix_multiply_candidates(value)?;
+                            Ok::<bool, ToDaeError>(
+                                all_scalar && condition_is_scalar && value_is_scalar,
+                            )
+                        })?;
+                let else_is_scalar =
+                    self.has_only_scalar_descendant_matrix_multiply_candidates(else_branch)?;
+                Ok(branches_are_scalar && else_is_scalar)
             }
             _ => Ok(true),
         }

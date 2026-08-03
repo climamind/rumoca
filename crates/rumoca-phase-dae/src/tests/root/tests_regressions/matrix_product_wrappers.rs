@@ -428,6 +428,33 @@ fn test_todae_accepts_if_wrapped_scalar_scaled_dot_product() {
 }
 
 #[test]
+fn test_todae_rejects_array_matrix_product_in_if_condition_with_scalar_dot_value() {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "A", &[2, 3]);
+    declare_array(&mut flat, "B", &[2, 3]);
+    declare_array(&mut flat, "x", &[3]);
+    declare_array(&mut flat, "y", &[]);
+    add_equation(
+        &mut flat,
+        make_structured_var_ref("y"),
+        Expression::If {
+            branches: vec![(
+                matrix_vector_product("A"),
+                matrix_row_vector_product("B", 1),
+            )],
+            else_branch: Box::new(Expression::Literal {
+                value: rumoca_core::Literal::Integer(0),
+                span: crate::test_support::test_span(),
+            }),
+            span: crate::test_support::test_span(),
+        },
+        1,
+    );
+
+    assert_projection_error(&flat, "unsupported matrix-product wrapper");
+}
+
+#[test]
 fn test_todae_rejects_if_wrapper_around_matrix_products() {
     let flat = wrapped_matrix_vector_model(Expression::If {
         branches: vec![(make_structured_var_ref("c"), matrix_vector_product("A"))],
