@@ -336,3 +336,106 @@ fn lower_derivative_rhs_scalar_programs_reuse_coupled_state_components() {
         )
     }));
 }
+
+#[test]
+fn noncontiguous_coupled_state_outputs_survive_implicit_remap_and_jvp() {
+    let mut dae_model = dae::Dae::default();
+    for name in ["x", "y", "z"] {
+        dae_model
+            .variables
+            .states
+            .insert(rumoca_core::VarName::new(name), scalar_var(name));
+    }
+    for name in ["u", "v", "w"] {
+        dae_model
+            .variables
+            .algebraics
+            .insert(rumoca_core::VarName::new(name), scalar_var(name));
+    }
+    dae_model
+        .continuous
+        .equations
+        .push(residual(sub(add(der(var("x")), der(var("z"))), var("u"))));
+    dae_model
+        .continuous
+        .equations
+        .push(residual(sub(der(var("z")), var("v"))));
+    dae_model
+        .continuous
+        .equations
+        .push(residual(sub(der(var("y")), var("w"))));
+
+    let layout = build_var_layout(&dae_model).expect("test DAE layout should build");
+    let derivative =
+        lower_derivative_rhs(&dae_model, &layout).expect("coupled state SCC should lower");
+    let linsolve = derivative
+        .nodes
+        .iter()
+        .find(|node| matches!(node, ComputeNode::LinSolve { .. }))
+        .expect("coupled x/z derivatives should own a LinSolve node");
+    let ComputeNode::LinSolve { output_indices, .. } = linsolve else {
+        unreachable!();
+    };
+    assert_eq!(output_indices, &[0, 2]);
+
+    let mut y = vec![0.0; layout.y_scalars()];
+    set_y_value(&layout, &mut y, "u", 5.0);
+    set_y_value(&layout, &mut y, "v", 2.0);
+    set_y_value(&layout, &mut y, "w", 7.0);
+    let mut derivative_out = vec![0.0; 3];
+    rumoca_eval_solve::PreparedComputeBlock::new(&derivative)
+        .expect("noncontiguous derivative block should prepare")
+        .eval_with_context(
+            &y,
+            &[],
+            0.0,
+            rumoca_eval_solve::RowEvalContext::default(),
+            &mut derivative_out,
+        )
+        .expect("noncontiguous derivative block should evaluate");
+    assert_eq!(derivative_out, vec![3.0, 7.0, 2.0]);
+
+    let remapped_nodes = crate::implicit_rhs::remap_residual_compute_nodes(
+        &rumoca_ir_solve::ComputeBlock {
+            nodes: vec![linsolve.clone()],
+        },
+        &[Some(3), Some(4), Some(5)],
+        3,
+        lower_test_span(),
+    )
+    .expect("implicit RHS remap should succeed")
+    .expect("LinSolve remap should remain tensor-native");
+    let remapped = rumoca_ir_solve::ComputeBlock {
+        nodes: remapped_nodes,
+    };
+    let ComputeNode::LinSolve { output_indices, .. } = &remapped.nodes[0] else {
+        panic!("implicit remap should preserve LinSolve ownership");
+    };
+    assert_eq!(output_indices, &[3, 5]);
+
+    let jvp = crate::ad::lower_compute_block_jvp(&remapped)
+        .expect("remapped noncontiguous LinSolve JVP should lower");
+    let ComputeNode::LinSolve { output_indices, .. } = &jvp.nodes[0] else {
+        panic!("JVP should preserve the remapped LinSolve node");
+    };
+    assert_eq!(output_indices, &[3, 5]);
+
+    let mut seed = vec![0.0; layout.y_scalars()];
+    set_y_value(&layout, &mut seed, "u", 1.0);
+    set_y_value(&layout, &mut seed, "v", 0.25);
+    let mut jvp_out = vec![0.0; 6];
+    rumoca_eval_solve::PreparedComputeBlock::new(&jvp)
+        .expect("noncontiguous JVP should prepare")
+        .eval_with_context(
+            &y,
+            &[],
+            0.0,
+            rumoca_eval_solve::RowEvalContext {
+                seed: Some(&seed),
+                ..Default::default()
+            },
+            &mut jvp_out,
+        )
+        .expect("noncontiguous JVP should evaluate");
+    assert_eq!(jvp_out, vec![0.0, 0.0, 0.0, 0.75, 0.0, 0.25]);
+}

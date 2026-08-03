@@ -1191,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn settlement_invalid_range_reports_span_after_json() {
+    fn settlement_invalid_range_reports_span_after_json_and_bincode() {
         let span = rumoca_core::Span::from_offsets(
             rumoca_core::SourceId::from_source_name("invalid_range_roundtrip.mo"),
             70,
@@ -1205,17 +1205,23 @@ mod tests {
         let json = serde_json::to_string(&range).expect("serialize invalid range JSON");
         let from_json: solve::InitializationTargetRange =
             serde_json::from_str(&json).expect("deserialize invalid range JSON");
-        let mut model = solve::SolveModel {
-            initial_y: vec![0.0, 0.0],
-            ..Default::default()
-        };
-        model.problem.initialization.required_target_ranges = vec![from_json];
-        let error = settle_gpu_initial_conditions(&model, 0.0)
-            .expect_err("out-of-bounds range must fail closed");
-        assert!(matches!(
-            error,
-            GpuInitializationError::Malformed { span: Some(actual), .. } if actual == span
-        ));
+        let bytes = bincode::serialize(&range).expect("serialize invalid range bincode");
+        let from_bincode: solve::InitializationTargetRange =
+            bincode::deserialize(&bytes).expect("deserialize invalid range bincode");
+
+        for decoded in [from_json, from_bincode] {
+            let mut model = solve::SolveModel {
+                initial_y: vec![0.0, 0.0],
+                ..Default::default()
+            };
+            model.problem.initialization.required_target_ranges = vec![decoded];
+            let error = settle_gpu_initial_conditions(&model, 0.0)
+                .expect_err("out-of-bounds range must fail closed");
+            assert!(matches!(
+                error,
+                GpuInitializationError::Malformed { span: Some(actual), .. } if actual == span
+            ));
+        }
     }
 
     #[test]
