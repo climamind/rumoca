@@ -4016,7 +4016,7 @@ impl Projector<'_> {
         target_dims: &[i64],
     ) -> Result<Option<Expr>, ToDaeError> {
         let Expr::Binary { op, lhs, rhs, span } = expr else {
-            return self.project_non_binary(expr);
+            return self.project_non_binary(expr, target_dims);
         };
         if matches!(op, OpBinary::Add | OpBinary::Sub) {
             let has_array_syntax = has_array_slice_syntax(expr);
@@ -4044,7 +4044,7 @@ impl Projector<'_> {
             return self.project_lanewise_binary(expr, k, target_dims);
         }
         if !matches!(op, OpBinary::Mul) {
-            return self.project_non_binary(expr);
+            return self.project_non_binary(expr, target_dims);
         }
         if target_dims.iter().any(|dim| *dim < 0) {
             return Err(projection_error("negative dimension", *span));
@@ -4151,8 +4151,16 @@ impl Projector<'_> {
         )))
     }
 
-    fn project_non_binary(&self, expr: &Expr) -> Result<Option<Expr>, ToDaeError> {
-        if self.has_descendant_matrix_multiply_candidate(expr, false)? {
+    fn project_non_binary(
+        &self,
+        expr: &Expr,
+        target_dims: &[i64],
+    ) -> Result<Option<Expr>, ToDaeError> {
+        let has_matrix_product = self.has_descendant_matrix_multiply_candidate(expr, false)?;
+        if has_matrix_product
+            && !(target_dims.is_empty()
+                && self.has_only_scalar_descendant_matrix_multiply_candidates(expr)?)
+        {
             return Err(match expr.span() {
                 Some(span) => projection_error("unsupported matrix-product wrapper", span),
                 None => ToDaeError::runtime_contract_violation(
@@ -4161,6 +4169,62 @@ impl Projector<'_> {
             });
         }
         Ok(None)
+    }
+
+    fn has_only_scalar_descendant_matrix_multiply_candidates(
+        &self,
+        expr: &Expr,
+    ) -> Result<bool, ToDaeError> {
+        match expr {
+            Expr::Binary {
+                op: OpBinary::Mul,
+                lhs,
+                rhs,
+                span,
+            } => {
+                if self.has_product_candidate_at_root(lhs, rhs, *span, false)? {
+                    Ok(matches!(self.dims(expr, *span)?, Some(dims) if dims.is_empty()))
+                } else {
+                    Ok(
+                        self.has_only_scalar_descendant_matrix_multiply_candidates(lhs)?
+                            && self.has_only_scalar_descendant_matrix_multiply_candidates(rhs)?,
+                    )
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => Ok(self
+                .has_only_scalar_descendant_matrix_multiply_candidates(lhs)?
+                && self.has_only_scalar_descendant_matrix_multiply_candidates(rhs)?),
+            Expr::Unary { rhs, .. } => {
+                self.has_only_scalar_descendant_matrix_multiply_candidates(rhs)
+            }
+            Expr::BuiltinCall { function, args, .. }
+                if !builtin_is_scalar_boundary(function, args.len()) =>
+            {
+                args.iter().try_fold(true, |all_scalar, arg| {
+                    Ok::<bool, ToDaeError>(
+                        all_scalar
+                            && self.has_only_scalar_descendant_matrix_multiply_candidates(arg)?,
+                    )
+                })
+            }
+            Expr::If {
+                branches,
+                else_branch,
+                ..
+            } => {
+                let branches_are_scalar =
+                    branches.iter().try_fold(true, |all_scalar, (_, value)| {
+                        Ok::<bool, ToDaeError>(
+                            all_scalar
+                                && self
+                                    .has_only_scalar_descendant_matrix_multiply_candidates(value)?,
+                        )
+                    })?;
+                Ok(branches_are_scalar
+                    && self.has_only_scalar_descendant_matrix_multiply_candidates(else_branch)?)
+            }
+            _ => Ok(true),
+        }
     }
 
     fn element(&self, expr: &Expr, indices: &[i64], span: Span) -> Result<Expr, ToDaeError> {
