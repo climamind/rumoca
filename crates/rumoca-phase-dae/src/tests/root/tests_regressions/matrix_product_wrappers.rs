@@ -445,6 +445,48 @@ fn test_todae_projects_homotopy_with_scalar_simplified_operand() {
 }
 
 #[test]
+fn test_todae_broadcasts_scalar_dot_in_each_homotopy_operand_position() {
+    for scalar_actual in [true, false] {
+        let scalar_dot = matrix_row_vector_product("A", 1);
+        let vector_product = matrix_vector_product("A");
+        let args = if scalar_actual {
+            vec![scalar_dot, vector_product]
+        } else {
+            vec![vector_product, scalar_dot]
+        };
+        let flat =
+            wrapped_matrix_vector_model(builtin(rumoca_core::BuiltinFunction::Homotopy, args));
+
+        let dae = to_dae_with_options(
+            &flat,
+            ToDaeOptions {
+                error_on_unbalanced: false,
+            },
+        )
+        .expect("a scalar dot must broadcast from either homotopy operand");
+        assert_eq!(dae.continuous.equations.len(), 2);
+        for (lane, equation) in dae.continuous.equations.iter().enumerate() {
+            let Expression::BuiltinCall { args, .. } = residual_rhs(equation) else {
+                panic!("expected projected homotopy");
+            };
+            let [actual, simplified] = args.as_slice() else {
+                panic!("expected two homotopy arguments");
+            };
+            let (scalar, vector) = if scalar_actual {
+                (actual, simplified)
+            } else {
+                (simplified, actual)
+            };
+            assert_complete_matrix_vector_lane(scalar, 1);
+            assert_complete_matrix_vector_lane(
+                vector,
+                i64::try_from(lane + 1).expect("lane fits i64"),
+            );
+        }
+    }
+}
+
+#[test]
 fn test_todae_accepts_if_wrapped_scalar_scaled_dot_product() {
     let mut flat = Model::new();
     declare_array(&mut flat, "A", &[2, 3]);
@@ -560,6 +602,122 @@ fn test_todae_projects_scalar_division_with_unary_and_no_event_if_operands() {
             ..
         }
     ));
+}
+
+#[test]
+fn test_todae_rejects_array_or_unknown_if_condition_shape() {
+    let conditions = [
+        colon_vector("condition"),
+        make_structured_var_ref("unknown"),
+    ];
+    for condition in conditions {
+        let mut flat = Model::new();
+        declare_array(&mut flat, "A", &[2, 3]);
+        declare_array(&mut flat, "x", &[3]);
+        declare_array(&mut flat, "condition", &[2]);
+        declare_array(&mut flat, "s", &[]);
+        declare_array(&mut flat, "y", &[]);
+        let guarded_denominator = builtin(
+            rumoca_core::BuiltinFunction::NoEvent,
+            vec![Expression::If {
+                branches: vec![(condition, make_structured_var_ref("s"))],
+                else_branch: Box::new(make_structured_var_ref("s")),
+                span: crate::test_support::test_span(),
+            }],
+        );
+        add_equation(
+            &mut flat,
+            make_structured_var_ref("y"),
+            binary(
+                rumoca_core::OpBinary::Div,
+                matrix_row_vector_product("A", 1),
+                guarded_denominator,
+            ),
+            1,
+        );
+
+        assert_projection_error(&flat, "if condition must have proven scalar shape");
+    }
+}
+
+#[test]
+fn test_todae_accepts_scalar_relational_and_boolean_constructor_if_conditions() {
+    let boolean_constructor = Expression::FunctionCall {
+        name: VarName::new("Boolean").into(),
+        args: vec![Expression::FunctionCall {
+            name: VarName::new("__rumoca_named_arg__.fixed").into(),
+            args: vec![Expression::Literal {
+                value: rumoca_core::Literal::Boolean(false),
+                span: crate::test_support::test_span(),
+            }],
+            is_constructor: true,
+            span: crate::test_support::test_span(),
+        }],
+        is_constructor: true,
+        span: crate::test_support::test_span(),
+    };
+    let relational = binary(
+        rumoca_core::OpBinary::Gt,
+        builtin(
+            rumoca_core::BuiltinFunction::Abs,
+            vec![Expression::FunctionCall {
+                name: VarName::new("scalarSource").into(),
+                args: Vec::new(),
+                is_constructor: false,
+                span: crate::test_support::test_span(),
+            }],
+        ),
+        Expression::Literal {
+            value: rumoca_core::Literal::Real(0.0),
+            span: crate::test_support::test_span(),
+        },
+    );
+    for condition in [boolean_constructor, relational] {
+        let mut flat = Model::new();
+        declare_array(&mut flat, "A", &[2, 3]);
+        declare_array(&mut flat, "x", &[3]);
+        declare_array(&mut flat, "s", &[]);
+        declare_array(&mut flat, "y", &[]);
+        let mut scalar_source =
+            rumoca_core::Function::new("scalarSource", crate::test_support::test_span());
+        scalar_source.add_output(rumoca_core::FunctionParam::new(
+            "result",
+            "Real",
+            crate::test_support::test_span(),
+        ));
+        scalar_source.external = Some(rumoca_core::ExternalFunction {
+            language: "C".to_string(),
+            function_name: Some("scalar_source".to_string()),
+            output_name: Some("result".to_string()),
+            ..Default::default()
+        });
+        flat.add_function(scalar_source);
+        add_equation(
+            &mut flat,
+            make_structured_var_ref("y"),
+            binary(
+                rumoca_core::OpBinary::Div,
+                matrix_row_vector_product("A", 1),
+                builtin(
+                    rumoca_core::BuiltinFunction::NoEvent,
+                    vec![Expression::If {
+                        branches: vec![(condition, make_structured_var_ref("s"))],
+                        else_branch: Box::new(make_structured_var_ref("s")),
+                        span: crate::test_support::test_span(),
+                    }],
+                ),
+            ),
+            1,
+        );
+
+        to_dae_with_options(
+            &flat,
+            ToDaeOptions {
+                error_on_unbalanced: false,
+            },
+        )
+        .expect("typed scalar Boolean constructors and relations must prove condition shape");
+    }
 }
 
 #[test]

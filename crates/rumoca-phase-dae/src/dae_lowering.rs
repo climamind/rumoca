@@ -1512,12 +1512,17 @@ fn literal_integer_range(expr: &rumoca_core::Expression) -> Option<(i64, i64, us
 }
 
 fn literal_array_expression_dims(expr: &Expr) -> Option<Vec<i64>> {
-    let Expr::Array { elements, .. } = expr else {
-        return Some(Vec::new());
+    let Expr::Array {
+        elements,
+        is_matrix,
+        ..
+    } = expr
+    else {
+        return matches!(expr, Expr::Literal { .. }).then(Vec::new);
     };
     let length = i64::try_from(elements.len()).ok()?;
     let Some((first, rest)) = elements.split_first() else {
-        return Some(vec![0]);
+        return Some(if *is_matrix { vec![1, 0] } else { vec![0] });
     };
     let element_dims = literal_array_expression_dims(first)?;
     if rest
@@ -1526,7 +1531,20 @@ fn literal_array_expression_dims(expr: &Expr) -> Option<Vec<i64>> {
     {
         return None;
     }
-    Some(std::iter::once(length).chain(element_dims).collect())
+    if !is_matrix {
+        return Some(std::iter::once(length).chain(element_dims).collect());
+    }
+    if element_dims.is_empty() {
+        return Some(vec![1, length]);
+    }
+    let [1, row_dims @ ..] = element_dims.as_slice() else {
+        return None;
+    };
+    Some(
+        std::iter::once(length)
+            .chain(row_dims.iter().copied())
+            .collect(),
+    )
 }
 
 fn structured_template_row_base(
@@ -4002,6 +4020,9 @@ impl Projector<'_> {
                 None => Ok(None),
             };
         }
+        if is_scalar_primitive_constructor(expr) {
+            return Ok(Some(Vec::new()));
+        }
         match expr {
             Expr::BuiltinCall {
                 function: Builtin::Fill,
@@ -4060,6 +4081,11 @@ impl Projector<'_> {
                 else_branch,
                 ..
             } => self.if_expression_dims(branches, else_branch, span),
+            Expr::Binary { op, .. }
+                if op.is_relational() || matches!(op, OpBinary::And | OpBinary::Or) =>
+            {
+                Ok(Some(Vec::new()))
+            }
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (Some(lhs_dims), Some(rhs_dims)) =
                     (self.dims(lhs, span)?, self.dims(rhs, span)?)
@@ -4090,18 +4116,32 @@ impl Projector<'_> {
         else_branch: &Expr,
         span: Span,
     ) -> Result<Option<Vec<i64>>, ToDaeError> {
-        let Some(result_dims) = self.dims(else_branch, span)? else {
-            return Ok(None);
-        };
-        for (_, value) in branches {
-            let Some(value_dims) = self.dims(value, span)? else {
-                return Ok(None);
-            };
-            if value_dims != result_dims {
-                return Err(projection_error("result shape mismatch", span));
+        for (condition, _) in branches {
+            if !matches!(self.dims(condition, span)?, Some(dims) if dims.is_empty()) {
+                return Err(projection_error(
+                    "if condition must have proven scalar shape",
+                    span,
+                ));
             }
         }
-        Ok(Some(result_dims))
+        let mut result_dims = self.dims(else_branch, span)?;
+        let mut has_unknown_value = result_dims.is_none();
+        for (_, value) in branches {
+            let value_dims = self.dims(value, span)?;
+            match (&result_dims, value_dims) {
+                (Some(result), Some(value)) if result != &value => {
+                    return Err(projection_error("result shape mismatch", span));
+                }
+                (None, Some(value)) => result_dims = Some(value),
+                (_, None) => has_unknown_value = true,
+                _ => {}
+            }
+        }
+        if has_unknown_value {
+            Ok(None)
+        } else {
+            Ok(result_dims)
+        }
     }
 
     fn function_call_output_dims(
@@ -4348,7 +4388,9 @@ impl Projector<'_> {
                 function: Builtin::Homotopy,
                 args: args
                     .iter()
-                    .map(|arg| self.element(arg, &indices, *span))
+                    .map(|arg| {
+                        self.project_shape_preserving_arg(arg, &result_dims, &indices, *span)
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
                 span: *span,
             }));
@@ -4365,6 +4407,25 @@ impl Projector<'_> {
             });
         }
         Ok(None)
+    }
+
+    fn project_shape_preserving_arg(
+        &self,
+        arg: &Expr,
+        result_dims: &[i64],
+        result_indices: &[i64],
+        span: Span,
+    ) -> Result<Expr, ToDaeError> {
+        let arg_dims = self
+            .dims(arg, span)?
+            .ok_or_else(|| projection_error("unknown operand shape", span))?;
+        if arg_dims.is_empty() {
+            return self.element(arg, &[], span);
+        }
+        if arg_dims == result_dims {
+            return self.element(arg, result_indices, span);
+        }
+        Err(projection_error("result shape mismatch", span))
     }
 
     fn has_only_scalar_descendant_matrix_multiply_candidates(
@@ -4510,20 +4571,20 @@ impl Projector<'_> {
                 let dims = self
                     .dims(expr, *span)?
                     .ok_or_else(|| projection_error("unknown operand shape", *span))?;
-                let lane = linear_lane_for_indices(indices, &dims)
+                linear_lane_for_indices(indices, &dims)
                     .ok_or_else(|| projection_error("result shape mismatch", *span))?;
-                let index = one_based_scalar_index(
-                    lane,
-                    *span,
-                    "DAE matrix-product function output projection",
-                )?;
                 Ok(Expr::Index {
                     base: Box::new(expr.clone()),
-                    subscripts: vec![generated_index_subscript(
-                        index,
-                        *span,
-                        "DAE matrix-product function output projection",
-                    )?],
+                    subscripts: indices
+                        .iter()
+                        .map(|index| {
+                            generated_index_subscript(
+                                *index,
+                                *span,
+                                "DAE matrix-product function output projection",
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
                     span: *span,
                 })
             }
@@ -4680,6 +4741,16 @@ impl Projector<'_> {
         }
         Ok(has_candidate)
     }
+}
+fn is_scalar_primitive_constructor(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::FunctionCall {
+            name,
+            is_constructor: true,
+            ..
+        } if matches!(name.as_str(), "Boolean" | "Integer" | "Real" | "String")
+    )
 }
 fn matrix_var_slice(expr: &Expr) -> Option<(&Reference, &[Subscript])> {
     match expr {
