@@ -882,6 +882,7 @@ pub struct PreparedComputeBlock {
     len: usize,
     requirements: RowInputRequirements,
     scratch: RefCell<RowEvalScratch>,
+    linsolve_output_scratch: RefCell<Vec<f64>>,
 }
 
 pub(crate) struct ComputeNodeOutputRangeRequest<'a> {
@@ -902,6 +903,7 @@ impl Clone for PreparedComputeBlock {
             len: self.len,
             requirements: self.requirements,
             scratch: RefCell::new(RowEvalScratch::default()),
+            linsolve_output_scratch: RefCell::new(Vec::new()),
         }
     }
 }
@@ -945,6 +947,7 @@ impl PreparedComputeBlock {
             len: declared_len,
             requirements,
             scratch: RefCell::new(RowEvalScratch::default()),
+            linsolve_output_scratch: RefCell::new(Vec::new()),
         })
     }
 
@@ -977,8 +980,19 @@ impl PreparedComputeBlock {
         out.fill(0.0);
         record_solve_block_eval(self.label, self.len, self.len);
         let mut scratch = self.scratch.borrow_mut();
+        let mut linsolve_output_scratch = self.linsolve_output_scratch.borrow_mut();
         for node in &self.nodes {
-            node.eval_into(y, p, t, context, out, &mut scratch)?;
+            node.eval_into(
+                y,
+                p,
+                t,
+                context,
+                out,
+                PreparedComputeScratch {
+                    row: &mut scratch,
+                    linsolve_output: &mut linsolve_output_scratch,
+                },
+            )?;
         }
         Ok(())
     }
@@ -1013,13 +1027,17 @@ impl PreparedComputeBlock {
         request.out.resize(self.len, 0.0);
         record_solve_block_eval(self.label, self.len, request.len);
         let mut scratch = self.scratch.borrow_mut();
+        let mut linsolve_output_scratch = self.linsolve_output_scratch.borrow_mut();
         node.eval_into(
             request.y,
             request.p,
             request.t,
             context,
             request.out,
-            &mut scratch,
+            PreparedComputeScratch {
+                row: &mut scratch,
+                linsolve_output: &mut linsolve_output_scratch,
+            },
         )?;
         Ok(true)
     }
@@ -1049,6 +1067,11 @@ enum PreparedComputeNode {
         matrix_len: usize,
         n: usize,
     },
+}
+
+struct PreparedComputeScratch<'a> {
+    row: &'a mut RowEvalScratch,
+    linsolve_output: &'a mut Vec<f64>,
 }
 
 struct PreparedMatMulInput<'a> {
@@ -1319,12 +1342,7 @@ impl PreparedComputeNode {
                 ..
             } => Some((*output_start, *output_len)),
             Self::LinSolve { output_indices, .. } => {
-                let start = *output_indices.first()?;
-                output_indices
-                    .iter()
-                    .copied()
-                    .eq(start..start.checked_add(output_indices.len())?)
-                    .then_some((start, output_indices.len()))
+                contiguous_indices_range(output_indices).map(|range| (range.start, range.len()))
             }
             Self::ScalarPrograms(_) => None,
         }
@@ -1337,11 +1355,11 @@ impl PreparedComputeNode {
         t: f64,
         context: RowEvalContext<'_>,
         out: &mut [f64],
-        scratch: &mut RowEvalScratch,
+        scratch: PreparedComputeScratch<'_>,
     ) -> Result<(), EvalSolveError> {
         match self {
             Self::ScalarPrograms(block) => {
-                block.eval_rows_unchecked(y, p, t, context, out, scratch)
+                block.eval_rows_unchecked(y, p, t, context, out, scratch.row)
             }
             Self::MatMul {
                 setup,
@@ -1356,14 +1374,14 @@ impl PreparedComputeNode {
                 n,
                 kernel,
             } => {
-                setup.eval(y, p, t, context, scratch)?;
-                ensure_register_range(&scratch.regs, "read", *lhs_start, *lhs_len)?;
-                ensure_register_range(&scratch.regs, "read", *rhs_start, *rhs_len)?;
+                setup.eval(y, p, t, context, scratch.row)?;
+                ensure_register_range(&scratch.row.regs, "read", *lhs_start, *lhs_len)?;
+                ensure_register_range(&scratch.row.regs, "read", *rhs_start, *rhs_len)?;
                 let output_end = output_start.checked_add(*output_len).ok_or_else(|| {
                     invalid_prepared_row("prepared matmul output range overflows")
                 })?;
                 eval_matmul_with_policy(
-                    &scratch.regs,
+                    &scratch.row.regs,
                     *lhs_start as usize,
                     *rhs_start as usize,
                     *m,
@@ -1381,18 +1399,39 @@ impl PreparedComputeNode {
                 matrix_len,
                 n,
             } => {
-                setup.eval(y, p, t, context, scratch)?;
-                ensure_register_range(&scratch.regs, "read", *matrix_start, *matrix_len)?;
-                ensure_register_range(&scratch.regs, "read", *rhs_start, *n)?;
-                let mut values = vec![0.0; *n];
-                solve_all_unchecked(&scratch.regs, *matrix_start, *rhs_start, *n, &mut values)?;
-                for (value, output_index) in values.iter().zip(output_indices) {
+                setup.eval(y, p, t, context, scratch.row)?;
+                ensure_register_range(&scratch.row.regs, "read", *matrix_start, *matrix_len)?;
+                ensure_register_range(&scratch.row.regs, "read", *rhs_start, *n)?;
+                if let Some(output_range) = contiguous_indices_range(output_indices) {
+                    return solve_all_unchecked(
+                        &scratch.row.regs,
+                        *matrix_start,
+                        *rhs_start,
+                        *n,
+                        &mut out[output_range],
+                    );
+                }
+                scratch.linsolve_output.resize(*n, 0.0);
+                solve_all_unchecked(
+                    &scratch.row.regs,
+                    *matrix_start,
+                    *rhs_start,
+                    *n,
+                    scratch.linsolve_output,
+                )?;
+                for (value, output_index) in scratch.linsolve_output.iter().zip(output_indices) {
                     out[*output_index] = *value;
                 }
                 Ok(())
             }
         }
     }
+}
+
+fn contiguous_indices_range(indices: &[usize]) -> Option<std::ops::Range<usize>> {
+    let start = *indices.first()?;
+    let end = start.checked_add(indices.len())?;
+    indices.iter().copied().eq(start..end).then_some(start..end)
 }
 
 fn prepared_domain_scalar_count(
