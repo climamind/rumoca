@@ -143,6 +143,56 @@ fn flatten_dot_terms<'a>(expr: &'a Expression, terms: &mut Vec<ProductTerm<'a>>)
     }
 }
 
+fn indexed_function_output(expr: &Expression) -> Option<(&str, Vec<i64>)> {
+    let Expression::Index {
+        base, subscripts, ..
+    } = expr
+    else {
+        return None;
+    };
+    let Expression::FunctionCall { name, .. } = base.as_ref() else {
+        return None;
+    };
+    let indices = subscripts
+        .iter()
+        .map(|subscript| match subscript {
+            rumoca_core::Subscript::Index { value, .. } => Some(*value),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((name.as_str(), indices))
+}
+
+type FunctionProductTerm<'a> = ((&'a str, Vec<i64>), (&'a str, Vec<i64>));
+
+fn flatten_function_dot_terms<'a>(
+    expr: &'a Expression,
+    terms: &mut Vec<FunctionProductTerm<'a>>,
+) -> bool {
+    match expr {
+        Expression::Binary {
+            op: rumoca_core::OpBinary::Add,
+            lhs,
+            rhs,
+            ..
+        } => flatten_function_dot_terms(lhs, terms) && flatten_function_dot_terms(rhs, terms),
+        Expression::Binary {
+            op: rumoca_core::OpBinary::Mul,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let (Some(lhs), Some(rhs)) = (indexed_function_output(lhs), literal_subscripts(rhs))
+            else {
+                return false;
+            };
+            terms.push((lhs, rhs));
+            true
+        }
+        _ => false,
+    }
+}
+
 type LiteralProductTerm<'a> = ((&'a str, Vec<i64>), f64);
 
 fn flatten_literal_dot_terms<'a>(
@@ -246,6 +296,46 @@ pub(super) fn assert_projection_error(flat: &Model, expected: &str) {
         "expected `{expected}` in {error}"
     );
     assert_eq!(error.source_span(), Some(crate::test_support::test_span()));
+}
+
+fn add_size_shaped_function(flat: &mut Model, name: &str, rank: usize) {
+    let mut function = rumoca_core::Function::new(name, crate::test_support::test_span());
+    let mut input = rumoca_core::FunctionParam::new("v", "Real", crate::test_support::test_span())
+        .with_dims(vec![0; rank]);
+    input.shape_expr = (0..rank)
+        .map(|_| rumoca_core::Subscript::Colon {
+            span: crate::test_support::test_span(),
+        })
+        .collect();
+    function.add_input(input);
+    let mut output =
+        rumoca_core::FunctionParam::new("result", "Real", crate::test_support::test_span())
+            .with_dims(vec![0; rank]);
+    output.shape_expr = (1..=rank)
+        .map(|dimension| rumoca_core::Subscript::Expr {
+            expr: Box::new(builtin(
+                rumoca_core::BuiltinFunction::Size,
+                vec![
+                    make_structured_var_ref("v"),
+                    Expression::Literal {
+                        value: Literal::Integer(
+                            i64::try_from(dimension).expect("test rank fits i64"),
+                        ),
+                        span: crate::test_support::test_span(),
+                    },
+                ],
+            )),
+            span: crate::test_support::test_span(),
+        })
+        .collect();
+    function.add_output(output);
+    function.external = Some(rumoca_core::ExternalFunction {
+        language: "C".to_string(),
+        function_name: Some(name.to_string()),
+        output_name: Some("result".to_string()),
+        ..Default::default()
+    });
+    flat.add_function(function);
 }
 
 fn expression_row_slice(name: &str, selector: Expression) -> Expression {
@@ -1077,6 +1167,59 @@ fn test_todae_projects_matrix_matrix_cells_as_three_term_dots() {
 }
 
 #[test]
+fn test_todae_projects_matrix_valued_function_times_vector_with_multidimensional_indices() {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "x", &[3]);
+    declare_array(&mut flat, "y", &[2]);
+    let mut function = rumoca_core::Function::new("matrixSource", crate::test_support::test_span());
+    function.add_output(
+        rumoca_core::FunctionParam::new("result", "Real", crate::test_support::test_span())
+            .with_dims(vec![2, 3]),
+    );
+    function.external = Some(rumoca_core::ExternalFunction {
+        language: "C".to_string(),
+        function_name: Some("matrix_source".to_string()),
+        output_name: Some("result".to_string()),
+        ..Default::default()
+    });
+    flat.add_function(function);
+    let call = Expression::FunctionCall {
+        name: VarName::new("matrixSource").into(),
+        args: Vec::new(),
+        is_constructor: false,
+        span: crate::test_support::test_span(),
+    };
+    add_equation(
+        &mut flat,
+        colon_vector("y"),
+        multiply(call, make_structured_var_ref("x")),
+        2,
+    );
+
+    let dae = to_dae_with_options(
+        &flat,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("matrix-valued function output must retain row and inner indices");
+    for (lane, equation) in dae.continuous.equations.iter().enumerate() {
+        let row = i64::try_from(lane + 1).expect("lane fits i64");
+        let mut terms = Vec::new();
+        assert!(flatten_function_dot_terms(
+            residual_rhs(equation),
+            &mut terms
+        ));
+        assert_eq!(
+            terms,
+            (1_i64..=3)
+                .map(|inner| { (("matrixSource", vec![row, inner]), ("x", vec![inner]),) })
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
 fn test_todae_specializes_function_output_size_from_array_actual() {
     let mut flat = Model::new();
     declare_array(&mut flat, "x", &[3]);
@@ -1137,6 +1280,147 @@ fn test_todae_specializes_function_output_size_from_array_actual() {
     )
     .expect("size(v, 1) must specialize from the array actual before dot projection");
     assert_eq!(dae.continuous.equations.len(), 1);
+}
+
+#[test]
+fn test_todae_specializes_size_dimensions_from_single_row_and_nested_matrix_literals() {
+    let single_row = Expression::Array {
+        elements: vec![real(1.0), real(2.0), real(3.0)],
+        is_matrix: true,
+        span: crate::test_support::test_span(),
+    };
+    let nested_rows = Expression::Array {
+        elements: vec![
+            Expression::Array {
+                elements: vec![real(1.0), real(2.0), real(3.0)],
+                is_matrix: true,
+                span: crate::test_support::test_span(),
+            },
+            Expression::Array {
+                elements: vec![real(4.0), real(5.0), real(6.0)],
+                is_matrix: true,
+                span: crate::test_support::test_span(),
+            },
+        ],
+        is_matrix: true,
+        span: crate::test_support::test_span(),
+    };
+    for (actual, rows) in [(single_row, 1_i64), (nested_rows, 2_i64)] {
+        let mut flat = Model::new();
+        declare_array(&mut flat, "B", &[3, 2]);
+        declare_array(&mut flat, "Y", &[rows, 2]);
+        add_size_shaped_function(&mut flat, "matrixIdentity", 2);
+        let call = Expression::FunctionCall {
+            name: VarName::new("matrixIdentity").into(),
+            args: vec![actual],
+            is_constructor: false,
+            span: crate::test_support::test_span(),
+        };
+        add_equation(
+            &mut flat,
+            colon_array("Y", 2),
+            multiply(call, make_structured_var_ref("B")),
+            usize::try_from(rows * 2).expect("positive matrix size"),
+        );
+
+        let dae = to_dae_with_options(
+            &flat,
+            ToDaeOptions {
+                error_on_unbalanced: false,
+            },
+        )
+        .expect("size(actual, 1/2) must preserve matrix literal row and column counts");
+        assert_eq!(
+            dae.continuous.equations.len(),
+            usize::try_from(rows * 2).expect("positive matrix size")
+        );
+        for (lane, equation) in dae.continuous.equations.iter().enumerate() {
+            let row = i64::try_from(lane / 2 + 1).expect("row fits i64");
+            let column = i64::try_from(lane % 2 + 1).expect("column fits i64");
+            let mut terms = Vec::new();
+            assert!(
+                flatten_function_dot_terms(residual_rhs(equation), &mut terms),
+                "unexpected projected matrix literal product: {:?}",
+                residual_rhs(equation)
+            );
+            assert_eq!(
+                terms,
+                (1_i64..=3)
+                    .map(|inner| {
+                        (
+                            ("matrixIdentity", vec![row, inner]),
+                            ("B", vec![inner, column]),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn test_todae_rejects_unprovable_literal_array_actual_shapes() {
+    let expression_element = Expression::Array {
+        elements: vec![real(1.0), make_structured_var_ref("element")],
+        is_matrix: false,
+        span: crate::test_support::test_span(),
+    };
+    let mut expression_flat = Model::new();
+    declare_array(&mut expression_flat, "element", &[]);
+    declare_array(&mut expression_flat, "x", &[2]);
+    declare_array(&mut expression_flat, "y", &[]);
+    add_size_shaped_function(&mut expression_flat, "vectorIdentity", 1);
+    add_equation(
+        &mut expression_flat,
+        make_structured_var_ref("y"),
+        multiply(
+            Expression::FunctionCall {
+                name: VarName::new("vectorIdentity").into(),
+                args: vec![expression_element],
+                is_constructor: false,
+                span: crate::test_support::test_span(),
+            },
+            make_structured_var_ref("x"),
+        ),
+        1,
+    );
+    assert_projection_error(&expression_flat, "unknown operand shape");
+
+    let ragged_matrix = Expression::Array {
+        elements: vec![
+            Expression::Array {
+                elements: vec![real(1.0), real(2.0)],
+                is_matrix: true,
+                span: crate::test_support::test_span(),
+            },
+            Expression::Array {
+                elements: vec![real(3.0)],
+                is_matrix: true,
+                span: crate::test_support::test_span(),
+            },
+        ],
+        is_matrix: true,
+        span: crate::test_support::test_span(),
+    };
+    let mut ragged_flat = Model::new();
+    declare_array(&mut ragged_flat, "x", &[2]);
+    declare_array(&mut ragged_flat, "y", &[2]);
+    add_size_shaped_function(&mut ragged_flat, "matrixIdentity", 2);
+    add_equation(
+        &mut ragged_flat,
+        colon_vector("y"),
+        multiply(
+            Expression::FunctionCall {
+                name: VarName::new("matrixIdentity").into(),
+                args: vec![ragged_matrix],
+                is_constructor: false,
+                span: crate::test_support::test_span(),
+            },
+            make_structured_var_ref("x"),
+        ),
+        2,
+    );
+    assert_projection_error(&ragged_flat, "unknown operand shape");
 }
 
 #[test]
