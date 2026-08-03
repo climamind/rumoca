@@ -2805,11 +2805,11 @@ mod tests {
     fn record_param_lowering_projects_equal_arity_field_access_actuals_before_positional_guard() {
         let mut flat = flat::Model::new();
         let mut function = rumoca_core::Function::new("Pkg.recordProjection", Span::DUMMY);
-        for input in ["record_a", "record_b"] {
+        for input in ["a", "b"] {
             function.add_input(rumoca_core::FunctionParam::new(input, "Real", test_span()));
         }
         function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span()));
-        function.body.push(assignment_to("y", var_ref("record_a")));
+        function.body.push(assignment_to("y", var_ref("a")));
         flat.add_function(function);
 
         let field_a = field_access(var_ref("state"), "a");
