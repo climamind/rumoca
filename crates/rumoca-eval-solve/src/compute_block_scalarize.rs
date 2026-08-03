@@ -316,6 +316,34 @@ impl ScalarProgramCollector {
         append_vec(&mut self.output_indices, &mut output_indices, kind, span)?;
         append_vec(&mut self.rows, &mut programs, kind, span)
     }
+
+    fn append_linsolve(&mut self, node: &ComputeNode) -> Result<(), ScalarizeError> {
+        let ComputeNode::LinSolve {
+            setup_ops,
+            matrix_start,
+            rhs_start,
+            n,
+            next_reg,
+            output_indices,
+            span,
+            ..
+        } = node
+        else {
+            unreachable!("append_linsolve requires a LinSolve node");
+        };
+        if *n == 0 {
+            return Ok(());
+        }
+        let program =
+            scalarize_linsolve(setup_ops, *matrix_start, *rhs_start, *n, *next_reg, *span)?;
+        let output_indices = if output_indices.is_empty() {
+            let end = checked_contiguous_output_count(self.next_output, *n, "linsolve", *span)?;
+            (self.next_output..end).collect()
+        } else {
+            output_indices.clone()
+        };
+        self.append_tensor_programs(vec![program], output_indices, *span, "linsolve")
+    }
 }
 
 impl SolveVisitor for ScalarProgramCollector {
@@ -359,30 +387,7 @@ impl SolveVisitor for ScalarProgramCollector {
                 let end = checked_contiguous_output_count(start, output_len, "matmul", *span)?;
                 self.append_contiguous_programs(vec![program], start, end, *span, "matmul")?;
             }
-            ComputeNode::LinSolve {
-                setup_ops,
-                matrix_start,
-                rhs_start,
-                n,
-                next_reg,
-                output_indices,
-                span,
-                ..
-            } => {
-                if *n == 0 {
-                    return Ok(());
-                }
-                let program =
-                    scalarize_linsolve(setup_ops, *matrix_start, *rhs_start, *n, *next_reg, *span)?;
-                let output_indices = if output_indices.is_empty() {
-                    let end =
-                        checked_contiguous_output_count(self.next_output, *n, "linsolve", *span)?;
-                    (self.next_output..end).collect()
-                } else {
-                    output_indices.clone()
-                };
-                self.append_tensor_programs(vec![program], output_indices, *span, "linsolve")?;
-            }
+            ComputeNode::LinSolve { .. } => self.append_linsolve(node)?,
             ComputeNode::Map {
                 domain,
                 output_map,
