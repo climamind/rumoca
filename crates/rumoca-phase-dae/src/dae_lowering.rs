@@ -1442,6 +1442,11 @@ fn projected_dims_for_subscripts(
                 dim_idx += 1;
             }
             rumoca_core::Subscript::Expr { expr, .. } => {
+                if let Some(count) = literal_integer_range_dimension(expr, dims[dim_idx]) {
+                    remaining.push(count);
+                    dim_idx += 1;
+                    continue;
+                }
                 if subscript_expr_selects_vector(expr)? {
                     return None;
                 }
@@ -1457,6 +1462,16 @@ fn projected_dims_for_subscripts(
     Some(remaining)
 }
 
+fn literal_integer_range_dimension(expr: &rumoca_core::Expression, dimension: i64) -> Option<i64> {
+    let (start, step, count) = literal_integer_range(expr)?;
+    let count = i64::try_from(count).ok()?;
+    if count == 0 {
+        return Some(0);
+    }
+    let last = start.checked_add(step.checked_mul(count - 1)?)?;
+    (start >= 1 && start <= dimension && last >= 1 && last <= dimension).then_some(count)
+}
+
 fn subscript_expr_selects_vector(expr: &rumoca_core::Expression) -> Option<bool> {
     match expr {
         rumoca_core::Expression::Literal {
@@ -1469,6 +1484,49 @@ fn subscript_expr_selects_vector(expr: &rumoca_core::Expression) -> Option<bool>
         rumoca_core::Expression::Range { .. } | rumoca_core::Expression::Array { .. } => Some(true),
         _ => None,
     }
+}
+
+fn literal_integer_range(expr: &rumoca_core::Expression) -> Option<(i64, i64, usize)> {
+    let rumoca_core::Expression::Range {
+        start, step, end, ..
+    } = expr
+    else {
+        return None;
+    };
+    let start = integer_constant_value(start)?;
+    let step = match step.as_deref() {
+        Some(step) => integer_constant_value(step)?,
+        None => 1,
+    };
+    let end = integer_constant_value(end)?;
+    if step == 0 {
+        return None;
+    }
+    let distance = end.checked_sub(start)?;
+    if (step > 0 && distance < 0) || (step < 0 && distance > 0) {
+        return Some((start, step, 0));
+    }
+    let intervals = distance.checked_div(step)?;
+    let count = usize::try_from(intervals.checked_add(1)?).ok()?;
+    Some((start, step, count))
+}
+
+fn literal_array_expression_dims(expr: &Expr) -> Option<Vec<i64>> {
+    let Expr::Array { elements, .. } = expr else {
+        return Some(Vec::new());
+    };
+    let length = i64::try_from(elements.len()).ok()?;
+    let Some((first, rest)) = elements.split_first() else {
+        return Some(vec![0]);
+    };
+    let element_dims = literal_array_expression_dims(first)?;
+    if rest
+        .iter()
+        .any(|element| literal_array_expression_dims(element).as_ref() != Some(&element_dims))
+    {
+        return None;
+    }
+    Some(std::iter::once(length).chain(element_dims).collect())
 }
 
 fn structured_template_row_base(
@@ -3950,6 +4008,31 @@ impl Projector<'_> {
                 args,
                 ..
             } => literal_fill_dims(args, span),
+            Expr::BuiltinCall {
+                function: Builtin::Homotopy,
+                args,
+                ..
+            } => {
+                let [actual, simplified] = args.as_slice() else {
+                    return Err(projection_error("unknown operand shape", span));
+                };
+                match (self.dims(actual, span)?, self.dims(simplified, span)?) {
+                    (Some(actual), Some(simplified)) => {
+                        elementwise_dims(&actual, &simplified, span).map(Some)
+                    }
+                    _ => Ok(None),
+                }
+            }
+            Expr::BuiltinCall {
+                function: Builtin::NoEvent,
+                args,
+                ..
+            } => {
+                let [arg] = args.as_slice() else {
+                    return Err(projection_error("unknown operand shape", span));
+                };
+                self.dims(arg, span)
+            }
             Expr::BuiltinCall { function, args, .. }
                 if matches!(function, Builtin::Transpose | Builtin::Der) =>
             {
@@ -3967,12 +4050,16 @@ impl Projector<'_> {
             }
             Expr::BuiltinCall { function, .. } => Ok(builtin_fixed_vector_output_width(*function)
                 .and_then(|width| i64::try_from(width).ok().map(|width| vec![width]))),
-            Expr::FunctionCall { name, .. } => Ok(self
-                .1
-                .get(name.var_name())
-                .and_then(|f| f.outputs.first())
-                .map(|v| v.dims.clone())),
+            Expr::FunctionCall {
+                name, args, span, ..
+            } => self.function_call_output_dims(name, args, *span),
             Expr::Literal { .. } => Ok(Some(Vec::new())),
+            Expr::Unary { rhs, .. } => self.dims(rhs, span),
+            Expr::If {
+                branches,
+                else_branch,
+                ..
+            } => self.if_expression_dims(branches, else_branch, span),
             Expr::Binary { op, lhs, rhs, .. } => {
                 let (Some(lhs_dims), Some(rhs_dims)) =
                     (self.dims(lhs, span)?, self.dims(rhs, span)?)
@@ -3996,6 +4083,98 @@ impl Projector<'_> {
             _ => Ok(None),
         }
     }
+
+    fn if_expression_dims(
+        &self,
+        branches: &[(Expr, Expr)],
+        else_branch: &Expr,
+        span: Span,
+    ) -> Result<Option<Vec<i64>>, ToDaeError> {
+        let Some(result_dims) = self.dims(else_branch, span)? else {
+            return Ok(None);
+        };
+        for (_, value) in branches {
+            let Some(value_dims) = self.dims(value, span)? else {
+                return Ok(None);
+            };
+            if value_dims != result_dims {
+                return Err(projection_error("result shape mismatch", span));
+            }
+        }
+        Ok(Some(result_dims))
+    }
+
+    fn function_call_output_dims(
+        &self,
+        name: &Reference,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Option<Vec<i64>>, ToDaeError> {
+        let Some(function) = self.1.get(name.var_name()) else {
+            return Ok(None);
+        };
+        let Some(output) = function.outputs.first() else {
+            return Ok(None);
+        };
+        if output.shape_expr.is_empty() {
+            return Ok(Some(output.dims.clone()));
+        }
+        let mut dims = Vec::with_capacity(output.shape_expr.len());
+        for shape in &output.shape_expr {
+            let dimension = match shape {
+                Subscript::Index { value, .. } => Some(*value),
+                Subscript::Expr { expr, .. } => {
+                    self.function_shape_dimension(expr, function, args, span)?
+                }
+                Subscript::Colon { .. } => None,
+            };
+            let Some(dimension) = dimension else {
+                return Ok(None);
+            };
+            dims.push(dimension);
+        }
+        Ok(Some(dims))
+    }
+
+    fn function_shape_dimension(
+        &self,
+        shape: &Expr,
+        function: &Function,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<Option<i64>, ToDaeError> {
+        let Expr::BuiltinCall {
+            function: Builtin::Size,
+            args: size_args,
+            ..
+        } = shape
+        else {
+            return Ok(integer_constant_value(shape));
+        };
+        let [Expr::VarRef { name, .. }, dimension] = size_args.as_slice() else {
+            return Ok(None);
+        };
+        let Some(dimension) = integer_constant_value(dimension)
+            .and_then(|dimension| usize::try_from(dimension.checked_sub(1)?).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(input_index) = function
+            .inputs
+            .iter()
+            .position(|input| input.name == name.as_str())
+        else {
+            return Ok(None);
+        };
+        let Some(actual) = args.get(input_index) else {
+            return Ok(None);
+        };
+        let actual_dims = match actual {
+            Expr::Array { .. } => literal_array_expression_dims(actual),
+            _ => self.dims(actual, span)?,
+        };
+        Ok(actual_dims.and_then(|dims| dims.get(dimension).copied()))
+    }
     fn validate_known_result_dims(
         &self,
         expr: &Expr,
@@ -4016,7 +4195,7 @@ impl Projector<'_> {
         target_dims: &[i64],
     ) -> Result<Option<Expr>, ToDaeError> {
         let Expr::Binary { op, lhs, rhs, span } = expr else {
-            return self.project_non_binary(expr, target_dims);
+            return self.project_non_binary(expr, k, target_dims);
         };
         if matches!(op, OpBinary::Add | OpBinary::Sub) {
             let has_array_syntax = has_array_slice_syntax(expr);
@@ -4044,7 +4223,7 @@ impl Projector<'_> {
             return self.project_lanewise_binary(expr, k, target_dims);
         }
         if !matches!(op, OpBinary::Mul) {
-            return self.project_non_binary(expr, target_dims);
+            return self.project_non_binary(expr, k, target_dims);
         }
         if target_dims.iter().any(|dim| *dim < 0) {
             return Err(projection_error("negative dimension", *span));
@@ -4063,14 +4242,6 @@ impl Projector<'_> {
         }
         let lhs_dims = lhs_dims.ok_or_else(|| projection_error("unknown operand shape", *span))?;
         let rhs_dims = rhs_dims.ok_or_else(|| projection_error("unknown operand shape", *span))?;
-        if (!lhs_dims.is_empty() && matches!(lhs.as_ref(), Expr::FunctionCall { .. }))
-            || (!rhs_dims.is_empty() && matches!(rhs.as_ref(), Expr::FunctionCall { .. }))
-        {
-            return Err(projection_error(
-                "array-valued function output cannot be projected",
-                *span,
-            ));
-        }
         let result_dims = product_dims(op, &lhs_dims, &rhs_dims, *span)?;
         if result_dims != target_dims {
             let detail = if target_dims.is_empty() {
@@ -4154,9 +4325,34 @@ impl Projector<'_> {
     fn project_non_binary(
         &self,
         expr: &Expr,
+        k: usize,
         target_dims: &[i64],
     ) -> Result<Option<Expr>, ToDaeError> {
         let has_matrix_product = self.has_descendant_matrix_multiply_candidate(expr, false)?;
+        if has_matrix_product
+            && let Expr::BuiltinCall {
+                function: Builtin::Homotopy,
+                args,
+                span,
+            } = expr
+        {
+            let result_dims = self
+                .dims(expr, *span)?
+                .ok_or_else(|| projection_error("unknown operand shape", *span))?;
+            if result_dims != target_dims {
+                return Err(projection_error("result shape mismatch", *span));
+            }
+            let indices = projection_lane_indices(k, target_dims)
+                .ok_or_else(|| projection_error("result shape mismatch", *span))?;
+            return Ok(Some(Expr::BuiltinCall {
+                function: Builtin::Homotopy,
+                args: args
+                    .iter()
+                    .map(|arg| self.element(arg, &indices, *span))
+                    .collect::<Result<Vec<_>, _>>()?,
+                span: *span,
+            }));
+        }
         if has_matrix_product
             && !(target_dims.is_empty()
                 && self.has_only_scalar_descendant_matrix_multiply_candidates(expr)?)
@@ -4233,8 +4429,9 @@ impl Projector<'_> {
     }
 
     fn element(&self, expr: &Expr, indices: &[i64], span: Span) -> Result<Expr, ToDaeError> {
-        if !matches!(expr, Expr::Binary { .. })
-            && matches!(self.dims(expr, span)?, Some(dims) if dims.is_empty())
+        if matches!(self.dims(expr, span)?, Some(dims) if dims.is_empty())
+            && (!matches!(expr, Expr::Binary { .. })
+                || !self.has_descendant_matrix_multiply_candidate(expr, false)?)
         {
             return Ok(expr.clone());
         }
@@ -4461,7 +4658,7 @@ impl Projector<'_> {
                     OpBinary::Add | OpBinary::Sub | OpBinary::Mul | OpBinary::MulElem
                 ) =>
             {
-                Ok(None)
+                Ok(self.dims(operand, span)?.filter(|dims| dims.is_empty()))
             }
             _ => self.dims(operand, span),
         }
@@ -4641,7 +4838,36 @@ fn project_slice_subscripts_for_lane(
                     "DAE scalarized colon slice projection",
                 )?);
             }
-            rumoca_core::Subscript::Index { .. } | rumoca_core::Subscript::Expr { .. } => {
+            rumoca_core::Subscript::Expr { expr, .. } => {
+                let Some((start, step, count)) = literal_integer_range(expr) else {
+                    projected.push(subscript.clone());
+                    continue;
+                };
+                let Some(index) = lane_iter.next() else {
+                    return Ok(None);
+                };
+                let Some(zero_based) = index.checked_sub(1) else {
+                    return Ok(None);
+                };
+                let Some(value) = step
+                    .checked_mul(zero_based)
+                    .and_then(|offset| start.checked_add(offset))
+                else {
+                    return Ok(None);
+                };
+                if usize::try_from(zero_based)
+                    .ok()
+                    .is_none_or(|index| index >= count)
+                {
+                    return Ok(None);
+                }
+                projected.push(generated_index_subscript(
+                    value,
+                    span,
+                    "DAE scalarized literal-range slice projection",
+                )?);
+            }
+            rumoca_core::Subscript::Index { .. } => {
                 projected.push(subscript.clone());
             }
         }

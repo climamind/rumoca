@@ -1077,6 +1077,69 @@ fn test_todae_projects_matrix_matrix_cells_as_three_term_dots() {
 }
 
 #[test]
+fn test_todae_specializes_function_output_size_from_array_actual() {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "x", &[3]);
+    declare_array(&mut flat, "y", &[]);
+    let mut function = rumoca_core::Function::new("normalize", crate::test_support::test_span());
+    let mut input = rumoca_core::FunctionParam::new("v", "Real", crate::test_support::test_span())
+        .with_dims(vec![0]);
+    input.shape_expr = vec![rumoca_core::Subscript::Colon {
+        span: crate::test_support::test_span(),
+    }];
+    function.add_input(input);
+    let mut output =
+        rumoca_core::FunctionParam::new("result", "Real", crate::test_support::test_span())
+            .with_dims(vec![0]);
+    output.shape_expr = vec![rumoca_core::Subscript::Expr {
+        expr: Box::new(builtin(
+            rumoca_core::BuiltinFunction::Size,
+            vec![
+                make_structured_var_ref("v"),
+                Expression::Literal {
+                    value: Literal::Integer(1),
+                    span: crate::test_support::test_span(),
+                },
+            ],
+        )),
+        span: crate::test_support::test_span(),
+    }];
+    function.add_output(output);
+    function.external = Some(rumoca_core::ExternalFunction {
+        language: "C".to_string(),
+        function_name: Some("normalize".to_string()),
+        output_name: Some("result".to_string()),
+        ..Default::default()
+    });
+    flat.add_function(function);
+    let call = Expression::FunctionCall {
+        name: VarName::new("normalize").into(),
+        args: vec![Expression::Array {
+            elements: vec![real(1.0), real(0.0), real(0.0)],
+            is_matrix: false,
+            span: crate::test_support::test_span(),
+        }],
+        is_constructor: false,
+        span: crate::test_support::test_span(),
+    };
+    add_equation(
+        &mut flat,
+        make_structured_var_ref("y"),
+        multiply(call, make_structured_var_ref("x")),
+        1,
+    );
+
+    let dae = to_dae_with_options(
+        &flat,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("size(v, 1) must specialize from the array actual before dot projection");
+    assert_eq!(dae.continuous.equations.len(), 1);
+}
+
+#[test]
 fn test_todae_projects_proven_scalar_scaling_forms() {
     let mut flat = Model::new();
     declare_array(&mut flat, "x", &[3]);
@@ -1387,10 +1450,7 @@ fn test_todae_rejects_dynamic_range_and_unknown_product_operands() {
             span: crate::test_support::test_span(),
         }),
         step: None,
-        end: Box::new(Expression::Literal {
-            value: Literal::Integer(2),
-            span: crate::test_support::test_span(),
-        }),
+        end: Box::new(make_structured_var_ref("i")),
         span: crate::test_support::test_span(),
     };
     let operands = [
@@ -1588,6 +1648,58 @@ fn test_todae_preserves_scalar_scaled_sum_of_vector_slices() {
             ..
         }
     ));
+}
+
+#[test]
+fn test_todae_projects_literal_range_slice_dot_product() {
+    let mut flat = Model::new();
+    declare_array(&mut flat, "a", &[2]);
+    declare_array(&mut flat, "x", &[1]);
+    declare_array(&mut flat, "y", &[]);
+    let last_a = Expression::VarRef {
+        name: VarName::new("a").into(),
+        subscripts: vec![rumoca_core::Subscript::Expr {
+            expr: Box::new(Expression::Range {
+                start: Box::new(Expression::Literal {
+                    value: Literal::Integer(2),
+                    span: crate::test_support::test_span(),
+                }),
+                step: None,
+                end: Box::new(Expression::Literal {
+                    value: Literal::Integer(2),
+                    span: crate::test_support::test_span(),
+                }),
+                span: crate::test_support::test_span(),
+            }),
+            span: crate::test_support::test_span(),
+        }],
+        span: crate::test_support::test_span(),
+    };
+    add_equation(
+        &mut flat,
+        make_structured_var_ref("y"),
+        multiply(last_a, make_structured_var_ref("x")),
+        1,
+    );
+
+    let dae = to_dae_with_options(
+        &flat,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("a compile-time literal range has a provable dot-product shape");
+    let Expression::Binary {
+        op: rumoca_core::OpBinary::Mul,
+        lhs,
+        rhs,
+        ..
+    } = residual_rhs(&dae.continuous.equations[0])
+    else {
+        panic!("expected one projected dot term");
+    };
+    assert_eq!(literal_subscripts(lhs), Some(("a", vec![2])));
+    assert_eq!(literal_subscripts(rhs), Some(("x", vec![1])));
 }
 
 #[test]
@@ -1825,7 +1937,7 @@ fn test_todae_rejects_vectorized_builtins_hiding_dynamic_row_slices() {
 }
 
 #[test]
-fn test_todae_rejects_array_valued_function_product_operand() {
+fn test_todae_projects_array_valued_function_product_operand() {
     let mut flat = Model::new();
     declare_array(&mut flat, "x", &[3]);
     declare_array(&mut flat, "z", &[]);
@@ -1856,7 +1968,13 @@ fn test_todae_rejects_array_valued_function_product_operand() {
         ),
         1,
     );
-    assert_projection_error(&flat, "array-valued function output cannot be projected");
+    to_dae_with_options(
+        &flat,
+        ToDaeOptions {
+            error_on_unbalanced: false,
+        },
+    )
+    .expect("an array-valued function with a proven output shape is projectable");
 }
 
 #[test]
