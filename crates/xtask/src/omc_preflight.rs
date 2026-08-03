@@ -278,21 +278,19 @@ printf '%s\n' 'OMC_PREFLIGHT_OK'
                     !published.exists(),
                     "published executable must stay hidden until publication"
                 );
-                let output = Command::new(SYSTEM_SHELL)
-                    .arg(staged)
+                let output = Command::new(staged)
                     .arg("--version")
                     .output()
-                    .expect("run closed staged fake OMC script");
+                    .expect("run closed staged executable");
                 assert!(output.status.success(), "{output:?}");
             },
         );
 
         assert!(omc.is_file(), "published executable must exist");
-        let output = Command::new(SYSTEM_SHELL)
-            .arg(&omc)
+        let output = Command::new(&omc)
             .arg("--version")
             .output()
-            .expect("run published fake OMC script");
+            .expect("run published executable");
         assert!(output.status.success(), "{output:?}");
     }
 
