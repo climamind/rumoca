@@ -416,6 +416,7 @@ fn lower_gpu_direct_family(
         GpuDirectFamilyBase {
             ops: &base_ops,
             target: base_target,
+            equation: base_equation,
         },
     )?;
     prove_gpu_direct_family_affine(
@@ -427,6 +428,7 @@ fn lower_gpu_direct_family(
         GpuDirectFamilyBase {
             ops: &base_ops,
             target: base_target,
+            equation: base_equation,
         },
         &strides,
     )?;
@@ -468,6 +470,7 @@ struct GpuDirectFamilyStrides {
 struct GpuDirectFamilyBase<'a> {
     ops: &'a [solve::LinearOp],
     target: usize,
+    equation: &'a dae::Equation,
 }
 
 struct GpuDirectFamilyProof<'a> {
@@ -509,6 +512,12 @@ fn lower_gpu_direct_family_strides(
             dae_model.continuous.equations.len() + corner_index,
             corner_equation,
         )?;
+        if !stencil::dae_equation_body_shapes_match(base.equation, corner_equation)? {
+            return Err(gpu_initial_unsupported(
+                "GPU initial projection requires identical conservative equation body shapes",
+                corner_equation.span,
+            ));
+        }
         let corner_target = direct_initial_target(dae_model, layout, corner_equation, family.span)?;
         target_strides.push(solve::AffineStencilIndexStrideTerm {
             dimension,
@@ -640,6 +649,12 @@ fn prove_gpu_direct_family_cell(
     equation: &dae::Equation,
     ops: &[solve::LinearOp],
 ) -> Result<(), LowerError> {
+    if !stencil::dae_equation_body_shapes_match(proof.base.equation, equation)? {
+        return Err(gpu_initial_unsupported(
+            "GPU initial projection requires identical conservative equation body shapes",
+            equation.span,
+        ));
+    }
     reject_nondeterministic_gpu_initial_ops(ops, equation.span)?;
     prove_gpu_affine_ops(proof.base.ops, ops, ordinals, proof.strides, equation.span)?;
     let target = direct_initial_target(proof.dae_model, proof.layout, equation, equation.span)?;
@@ -897,48 +912,6 @@ fn direct_initial_target(
             span,
         )),
     }
-}
-
-fn lower_contiguous_y_target_range_for_equation(
-    dae_model: &dae::Dae,
-    equation: &dae::Equation,
-    layout: &solve::VarLayout,
-) -> Result<std::ops::Range<usize>, LowerError> {
-    let scalar_count = equation.scalar_count.max(1);
-    let targets = lower_continuous_row_targets_for_equation(dae_model, equation, layout, 1)?;
-    let [Some(solve::ScalarSlot::Y { index: start, .. })] = targets.as_slice() else {
-        return Err(LowerError::contract_violation(
-            "GPU fixed-start initialization requires a resolved Y target",
-            equation.span,
-        ));
-    };
-    let matching_shape = layout.bindings().iter().find_map(|(name, slot)| {
-        if slot != &solve::scalar_slot_y(*start) {
-            return None;
-        }
-        let shape_count = layout.shape(name).map_or(Some(1usize), |shape| {
-            shape
-                .iter()
-                .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
-        })?;
-        (shape_count == scalar_count).then_some(shape_count)
-    });
-    let Some(shape_count) = matching_shape else {
-        return Err(LowerError::contract_violation(
-            "GPU fixed-start target must cover one complete contiguous resolved shape",
-            equation.span,
-        ));
-    };
-    let end = start.checked_add(shape_count).ok_or_else(|| {
-        LowerError::contract_violation("GPU fixed-start target range overflow", equation.span)
-    })?;
-    if end > layout.y_scalars() {
-        return Err(LowerError::contract_violation(
-            "GPU fixed-start target is outside the solver Y vector",
-            equation.span,
-        ));
-    }
-    Ok(*start..end)
 }
 
 pub(super) fn gpu_corner_cell_index(

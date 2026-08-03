@@ -1226,6 +1226,7 @@ fn solve_appendix_b_validation_rejects_invalid_linsolve_operand_range() {
             rhs_start: 4,
             n: 2,
             next_reg: 5,
+            output_indices: Vec::new(),
             metadata: solve::TensorNodeMetadata::default(),
             span: solve_test_span(),
         }],

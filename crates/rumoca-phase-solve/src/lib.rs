@@ -66,8 +66,8 @@ use continuous_row_targets::{
     continuous_equation_scalar_name, scalarized_record_target_names, target_expr_scalar_name,
 };
 use continuous_row_targets::{
-    dedupe_continuous_y_targets, lower_continuous_row_targets,
-    lower_continuous_row_targets_for_equation,
+    dedupe_continuous_y_targets, lower_contiguous_y_target_range_for_equation,
+    lower_continuous_row_targets, lower_continuous_row_targets_for_equation,
 };
 use discrete_pre_modes::discrete_pre_mode_for_equation;
 #[cfg(test)]
@@ -593,7 +593,12 @@ fn lower_event_partition_for_profile(
             .map_err(|err| lower_problem_context(err, "lower root relation memory targets"))?,
         scheduled_root_conditions: lower::lower_scheduled_root_conditions(dae_model)
             .map_err(|err| lower_problem_context(err, "lower scheduled root conditions"))?,
-        scheduled_time_events: dae_model.events.scheduled_time_events.clone(),
+        scheduled_time_events: dae_model
+            .events
+            .scheduled_time_events
+            .iter()
+            .map(|event| event.time)
+            .collect(),
         dynamic_time_event_names: dynamic_events::collect_dynamic_time_event_names(dae_model),
         dynamic_time_event_rhs: solve::ScalarProgramBlock::with_program_spans(
             lower_dynamic_time_event_rhs(dae_model, layout, dynamic_time_event_exprs)

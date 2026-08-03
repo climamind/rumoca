@@ -245,7 +245,7 @@ compiler/session → DAE structural → solve-IR lowering → runtime contracts 
 | Compact Map evaluation | `rumoca-eval-solve` | No scalar reconstruction |
 | GPU initialization settlement | `rumoca-sim` | Reuses Solve-IR admission; solver-free projection/verification |
 | Optimization/training orchestration | `rumoca-opt` | Consumes Solve/eval APIs; no Modelica semantics |
-| Textual generated artifacts and templates | `rumoca-phase-codegen` | Jinja/minijinja rendering owns generated C, Rust, CUDA C, MLIR, FMI/eFMI and FMU/eFMU packaging text |
+| Generated text/templates | `rumoca-phase-codegen` | Renders C, Rust, CUDA, MLIR, FMI/eFMI, and packaging text |
 | GALEC `.alg` text (recorded exception) | `rumoca-ir-galec` | Typed AST printing per eFMI conformance; routed via template context (SPEC_0034 GAL-009) |
 | eFMI packaging XML (`__content.xml`, manifests) | `rumoca-phase-codegen` | Rendered like FMI `modelDescription`; validators + generic checksum/container build step, not typed serializers (SPEC_0034 D3 amended) |
 | Compiled/JIT execution adapter crates | `rumoca-exec-*` | Invoke tools, load artifacts, wrap Cranelift/LLVM/CUDA/NVRTC APIs, expose ergonomic runtime calls; no compiler semantics |
@@ -267,18 +267,20 @@ Inkwell, LLVM ORC bindings, CUDA Driver APIs, or NVRTC; backend bytecode,
 native/JIT execution, and device launch policy belong in `rumoca-exec-*`, above
 the IR-lowering phase.
 
-Target-language and target-format policy belongs in manifests/templates, not
-Rust control flow. Rust MAY provide generic manifest parsing, template
-rendering, safe path handling, schema validation, and language-neutral feature
-probes over IR data. Rust MUST NOT hard-code target-language capabilities, file
-layouts, emitted language names, or backend feature tables for textual targets
+Target-language/format policy belongs in manifests/templates, not Rust control
+flow. Rust MAY provide generic parsing, rendering, safe paths, schema validation,
+and language-neutral IR probes. Rust MUST NOT hard-code target capabilities,
+layouts, emitted language names, or feature tables for textual targets
 (C, Rust, CUDA C, MLIR, FMI/eFMI, or future custom targets). A textual/codegen
-target should be addable with `target.toml` plus Jinja templates; required
-capability declarations or unsupported-feature contracts must live in that
-manifest schema and be enforced by generic validation. Unsupported manifest
-capability failures MUST report stable `unsupported-feature:<feature_id>` from
+target should be addable with `target.toml` plus Jinja; required capabilities
+and unsupported-feature contracts must live in its schema and use generic
+validation. Unsupported capability failures MUST report stable
+`unsupported-feature:<feature_id>` from
 the manifest feature ID so CI, MSL reports, and release summaries can aggregate
 gaps without knowing the target language.
+
+Textual `[[files]]` default non-empty. Format-required empty artifacts MUST set
+`allow_empty = true` per entry; render coverage MUST enforce it.
 
 JIT targets follow the same layering rule as execution adapters, not textual
 template targets. Cranelift, LLVM ORC/Inkwell, CUDA NVRTC/Driver, and browser
