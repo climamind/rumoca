@@ -696,6 +696,9 @@ fn project_actuals_to_input_slots_with_known_vars(
     project_mixed_decomposed_input_slots(actuals, inputs, flat_variable_names)
         .or_else(|| project_field_access_actuals(actuals, inputs))
         .or_else(|| {
+            if actuals.len() == inputs.len() {
+                return Some(actuals.to_vec());
+            }
             let mut projected = Vec::new();
             for input in inputs {
                 let actual = actuals
@@ -2743,6 +2746,93 @@ mod tests {
             &args[1],
             rumoca_core::Expression::VarRef { name, .. } if name.as_str() == "rec_b"
         ));
+    }
+
+    #[test]
+    fn record_param_lowering_preserves_equal_arity_positional_function_actual_order() {
+        let mut flat = flat::Model::new();
+        let mut function = rumoca_core::Function::new("Pkg.positionState", Span::DUMMY);
+        function.add_input(
+            rumoca_core::FunctionParam::new("foot_position_deck", "Real", test_span())
+                .with_dims(vec![3, 4]),
+        );
+        function.add_input(
+            rumoca_core::FunctionParam::new("point_deck", "Real", test_span()).with_dims(vec![2]),
+        );
+        function.add_input(
+            rumoca_core::FunctionParam::new("loaded", "Boolean", test_span()).with_dims(vec![4]),
+        );
+        function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span()));
+        function.body.push(assignment_to("y", var_ref("loaded")));
+        flat.add_function(function);
+
+        let point = rumoca_core::Expression::Array {
+            elements: vec![
+                var_ref("cg_position_deck[1]"),
+                var_ref("cg_position_deck[2]"),
+            ],
+            is_matrix: false,
+            span: test_span(),
+        };
+        let expected_args = vec![
+            var_ref("leg_position_deck"),
+            point.clone(),
+            var_ref("leg_loaded"),
+        ];
+
+        flat.add_equation(flat::Equation::new(
+            rumoca_core::Expression::FunctionCall {
+                name: rumoca_core::Reference::new("Pkg.positionState"),
+                args: expected_args.clone(),
+                is_constructor: false,
+                span: Span::DUMMY,
+            },
+            Span::DUMMY,
+            flat::EquationOrigin::ComponentEquation {
+                component: "probe".to_string(),
+            },
+        ));
+
+        lower_record_function_params(&mut flat).expect("record parameter lowering should pass");
+
+        let rumoca_core::Expression::FunctionCall { args, .. } = &flat.equations[0].residual else {
+            panic!("expected function call");
+        };
+        assert_eq!(args, &expected_args);
+    }
+
+    #[test]
+    fn record_param_lowering_projects_equal_arity_field_access_actuals_before_positional_guard() {
+        let mut flat = flat::Model::new();
+        let mut function = rumoca_core::Function::new("Pkg.recordProjection", Span::DUMMY);
+        for input in ["a", "b"] {
+            function.add_input(rumoca_core::FunctionParam::new(input, "Real", test_span()));
+        }
+        function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span()));
+        function.body.push(assignment_to("y", var_ref("a")));
+        flat.add_function(function);
+
+        let field_a = field_access(var_ref("state"), "a");
+        let field_b = field_access(var_ref("state"), "b");
+        flat.add_equation(flat::Equation::new(
+            rumoca_core::Expression::FunctionCall {
+                name: rumoca_core::Reference::new("Pkg.recordProjection"),
+                args: vec![field_b.clone(), field_a.clone()],
+                is_constructor: false,
+                span: Span::DUMMY,
+            },
+            Span::DUMMY,
+            flat::EquationOrigin::ComponentEquation {
+                component: "probe".to_string(),
+            },
+        ));
+
+        lower_record_function_params(&mut flat).expect("record parameter lowering should pass");
+
+        let rumoca_core::Expression::FunctionCall { args, .. } = &flat.equations[0].residual else {
+            panic!("expected function call");
+        };
+        assert_eq!(args, &vec![field_a, field_b]);
     }
 
     #[test]
