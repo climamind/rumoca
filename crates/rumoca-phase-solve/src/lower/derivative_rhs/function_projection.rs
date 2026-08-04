@@ -222,6 +222,24 @@ fn function_call_declared_output_count(
         .map(|function| function.outputs.len())
 }
 
+fn is_direct_single_array_output_call(
+    expr: &rumoca_core::Expression,
+    dae_model: &dae::Dae,
+) -> bool {
+    let rumoca_core::Expression::FunctionCall {
+        name,
+        is_constructor: false,
+        ..
+    } = expr
+    else {
+        return false;
+    };
+    matches!(
+        dae_model.symbols.functions.get(name.var_name()),
+        Some(function) if matches!(function.outputs.as_slice(), [output] if !output.dims.is_empty())
+    )
+}
+
 fn checked_shape_dimension(value: f64, span: rumoca_core::Span) -> Result<i64, LowerError> {
     let rounded = value.round();
     if !value.is_finite() || (rounded - value).abs() > 1e-9 {
@@ -3505,6 +3523,9 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                         .map(Some)
                 })
                 .unwrap_or(Ok(None));
+        }
+        if is_direct_single_array_output_call(expr, self.dae_model) {
+            return Ok(None);
         }
         let span = inherited_projection_source_span(expr.span(), owner_span);
         let mut call =
