@@ -238,6 +238,27 @@ fn function_call_declared_output_count(
         .map(|function| function.outputs.len())
 }
 
+fn is_direct_single_array_output_call(
+    expr: &rumoca_core::Expression,
+    dae_model: &dae::Dae,
+) -> bool {
+    let rumoca_core::Expression::FunctionCall {
+        name,
+        is_constructor: false,
+        ..
+    } = expr
+    else {
+        return false;
+    };
+    let Some((_, function)) = resolve_function_reference(&dae_model.symbols.functions, name) else {
+        return false;
+    };
+    name.resolved_function().is_some_and(|resolved| {
+        name.component_ref()
+            .is_some_and(|reference| reference.parts.len() == resolved.base_part_count)
+    }) && matches!(function.outputs.as_slice(), [output] if !output.dims.is_empty())
+}
+
 fn checked_shape_dimension(value: f64, span: rumoca_core::Span) -> Result<i64, LowerError> {
     let rounded = value.round();
     if !value.is_finite() || (rounded - value).abs() > 1e-9 {
@@ -1439,12 +1460,26 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 request.span,
             ));
         }
+        let instance_id = callee.instance_id.ok_or_else(|| {
+            LowerError::contract_violation(
+                "budgeted procedure projection lacks resolved function instance identity",
+                request.span,
+            )
+        })?;
         for (target, output) in request.output_targets.iter().zip(callee.outputs.iter()) {
+            let mut reference = request.comp.clone();
+            let base_part_count = reference.parts.len();
+            reference.parts.push(rumoca_core::ComponentRefPart {
+                ident: output.name.clone(),
+                span: output.span,
+                subs: Vec::new(),
+            });
             let selected_call = rumoca_core::Expression::FunctionCall {
-                name: rumoca_core::Reference::from_var_name(rumoca_core::VarName::new(format!(
-                    "{callee_name}.{}",
-                    output.name
-                ))),
+                name: rumoca_core::Reference::from_component_reference(reference)
+                    .with_resolved_function(rumoca_core::ResolvedFunctionReference {
+                        instance_id,
+                        base_part_count,
+                    }),
                 args: request.args.to_vec(),
                 is_constructor: false,
                 span: request.span,

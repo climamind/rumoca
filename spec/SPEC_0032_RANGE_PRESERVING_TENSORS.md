@@ -83,6 +83,7 @@ slot.
 | `ComputeNode::AffineStencil` is neighborhood access | Solve IR | Affine offset semantics |
 | Solve grouping is semantic | `rumoca-phase-solve` | Backends do not redefine IR |
 | Scalar fallback uses shared scalarization | `rumoca-eval-solve` | One ordering implementation |
+| A direct non-constructor call whose exact function symbol declares exactly one output with non-empty dimensions declines per-lane projection when whole-call symbolic projection declines | `rumoca-phase-solve` | The array runtime receives one whole call instead of one duplicated array-valued call per scalar lane |
 
 `Map` represents canonical DAE residual families that are elementwise over a
 compact domain, including `der(u) = w` after DAE canonicalization. `AffineStencil`
