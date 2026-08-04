@@ -3707,6 +3707,28 @@ fn over_budget_function() -> rumoca_core::Function {
     }
 }
 
+fn over_budget_array_function() -> rumoca_core::Function {
+    let mut function = rumoca_core::Function::new("My.explodeArray", test_span());
+    function.inputs.push(scalar_function_param("x"));
+    function.outputs.push(function_param_with_dims("y", &[2]));
+    function.body.push(scalar_assignment(
+        "y",
+        array(vec![local_var("x"), local_var("x")], false),
+    ));
+    for _ in 0..16 {
+        function.body.push(scalar_assignment(
+            "y",
+            binary(
+                rumoca_core::OpBinary::Add,
+                local_var("y"),
+                local_var("y"),
+                test_span(),
+            ),
+        ));
+    }
+    function
+}
+
 #[test]
 fn over_budget_projection_is_a_typed_error_and_declines_at_the_boundary() {
     let mut dae_model = dae::Dae::default();
@@ -3737,6 +3759,31 @@ fn over_budget_projection_is_a_typed_error_and_declines_at_the_boundary() {
             .expect("budget decline must not fail the outer lowering");
         assert!(outputs.is_none());
     }
+}
+
+#[test]
+fn single_array_output_budget_exhaustion_keeps_lane_fallback_call() {
+    let function = over_budget_array_function();
+    let mut dae_model = dae::Dae::default();
+    dae_model
+        .symbols
+        .functions
+        .insert(function.name.clone(), function);
+    let structural_bindings = IndexMap::new();
+    let analysis = FunctionProjectionAnalysis::new(&dae_model, &structural_bindings);
+    let scope = FunctionProjectionScope::default();
+    let call = rumoca_core::Expression::FunctionCall {
+        name: rumoca_core::VarName::new("My.explodeArray").into(),
+        args: vec![real(2.0)],
+        is_constructor: false,
+        span: test_span(),
+    };
+
+    let projected = analysis
+        .project_function_call_value(&call, &[2], 0, &scope, 0, test_span())
+        .expect("budget exhaustion should preserve the runtime lane fallback");
+
+    assert_eq!(projected.as_ref(), Some(&call));
 }
 
 #[test]
