@@ -178,9 +178,6 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 })
                 .unwrap_or(Ok(None));
         }
-        if is_direct_single_array_output_call(expr, self.dae_model) {
-            return Ok(None);
-        }
         let span = inherited_projection_source_span(expr.span(), owner_span);
         let mut call =
             self.project_function_call_with_lane_args(expr, dims, flat_index, scope, depth, span)?;
@@ -193,6 +190,9 @@ impl<'a> FunctionProjectionAnalysis<'a> {
             Err(err) => return Err(err),
         };
         let Some(outputs) = outputs else {
+            if is_direct_single_array_output_call(expr, self.dae_model) {
+                return Ok(None);
+            }
             return Ok(Some(call));
         };
         if let [output] = outputs.as_slice() {
