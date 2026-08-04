@@ -77,6 +77,7 @@ fn linsolve_node() -> ComputeNode {
         rhs_start: 1,
         n: 1,
         next_reg: 2,
+        output_indices: Vec::new(),
         metadata: TensorNodeMetadata::default(),
         span: Span::DUMMY,
     }
@@ -165,6 +166,27 @@ fn compute_block_len_advances_after_absolute_sparse_scalar_outputs() {
     };
 
     assert_eq!(block.len(), Ok(5));
+}
+
+#[test]
+fn compute_block_len_preserves_noncontiguous_linsolve_output_slots() {
+    let block = ComputeBlock {
+        nodes: vec![
+            ComputeNode::LinSolve {
+                setup_ops: Vec::new(),
+                matrix_start: 0,
+                rhs_start: 0,
+                n: 2,
+                next_reg: 0,
+                output_indices: vec![0, 2],
+                metadata: TensorNodeMetadata::default(),
+                span: fixture_span(),
+            },
+            tensor_node(1),
+        ],
+    };
+
+    assert_eq!(block.len(), Ok(4));
 }
 
 #[test]

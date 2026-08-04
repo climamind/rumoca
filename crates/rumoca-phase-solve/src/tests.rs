@@ -1226,6 +1226,7 @@ fn solve_appendix_b_validation_rejects_invalid_linsolve_operand_range() {
             rhs_start: 4,
             n: 2,
             next_reg: 5,
+            output_indices: Vec::new(),
             metadata: solve::TensorNodeMetadata::default(),
             span: solve_test_span(),
         }],
@@ -1415,6 +1416,60 @@ fn solve_appendix_b_validation_rejects_invalid_map_const_stride_target() {
     );
     assert!(
         !err.to_string().contains("LoadY {"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn solve_appendix_b_validation_rejects_nonfinite_map_const_stride() {
+    let span = solve_numbered_span(142, 4, 12);
+    let mut problem = solve::SolveProblem::default();
+    problem.continuous.derivative_rhs = solve::ComputeBlock {
+        nodes: vec![solve::ComputeNode::Map {
+            domain: rumoca_core::StructuredIndexDomain {
+                binders: vec![rumoca_core::StructuredIndexBinder {
+                    id: 0,
+                    display_name: "i".to_string(),
+                    lower: 1,
+                    upper: 2,
+                    step: 1,
+                }],
+            },
+            output_map: solve::TensorOutputMap {
+                start: 0,
+                strides: vec![solve::AffineStencilIndexStrideTerm {
+                    dimension: 0,
+                    stride: 1,
+                }],
+            },
+            base_ops: vec![
+                solve::LinearOp::Const { dst: 0, value: 1.0 },
+                solve::LinearOp::StoreOutput { src: 0 },
+            ],
+            load_strides: Vec::new(),
+            const_strides: vec![solve::AffineStencilConstStride {
+                op_position: 0,
+                terms: vec![solve::AffineStencilConstStrideTerm {
+                    dimension: 0,
+                    stride: f64::NEG_INFINITY,
+                }],
+            }],
+            metadata: solve::TensorNodeMetadata::default(),
+            span,
+        }],
+    };
+
+    let err = appendix_b_validation::validate_solve_problem_appendix_b_invariants(&problem)
+        .expect_err("Map const stride must be finite");
+    assert!(matches!(
+        err,
+        LowerError::ContractViolation {
+            span: actual_span,
+            ..
+        } if actual_span == span
+    ));
+    assert!(
+        err.to_string().contains("const stride") && err.to_string().contains("not finite"),
         "unexpected error: {err}"
     );
 }

@@ -47,22 +47,7 @@ fn subscript_span_with_owner(
 pub(super) fn build_indexed_binding_map(
     layout: &VarLayout,
 ) -> IndexMap<ComponentReferenceKey, Vec<IndexedBinding>> {
-    layout
-        .indexed_bindings()
-        .iter()
-        .map(|(base, entries)| {
-            (
-                base.clone(),
-                entries
-                    .iter()
-                    .map(|entry| IndexedBinding {
-                        slot: entry.slot,
-                        indices: entry.indices.clone(),
-                    })
-                    .collect(),
-            )
-        })
-        .collect()
+    layout.indexed_bindings().clone()
 }
 
 pub(super) fn variable_size(var: &dae::Variable) -> Result<usize, LowerError> {

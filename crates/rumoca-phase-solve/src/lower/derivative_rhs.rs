@@ -363,7 +363,7 @@ pub(crate) fn lower_derivative_rhs_with_analysis(
             for idx in component {
                 group.push(analysis.states[*idx].clone());
             }
-            let node = lower_linsolve_group(&group, &lowering_ctx)?;
+            let node = lower_linsolve_group(component, &group, &lowering_ctx)?;
             reserve_derivative_capacity(
                 &mut block.nodes,
                 1,
@@ -1532,6 +1532,7 @@ fn lower_coupled_row(
 /// does for one component. Unlike that function, we do it once and emit a
 /// single tensor node that backends can execute without repeating the solve.
 fn lower_linsolve_group(
+    output_indices: &[usize],
     states: &[StateScalar],
     ctx: &DerivativeRhsLoweringContext<'_>,
 ) -> Result<ComputeNode, LowerError> {
@@ -1543,6 +1544,7 @@ fn lower_linsolve_group(
         rhs_start: setup.rhs_start,
         n: setup.n,
         next_reg: setup.next_reg,
+        output_indices: output_indices.to_vec(),
         metadata: rumoca_ir_solve::TensorNodeMetadata::default(),
         span: setup.span,
     })
@@ -1874,7 +1876,9 @@ fn row_builder<'a>(
             discrete_valued_names: Some(&dae_model.variables.discrete_valued),
             variable_starts: Some(&dae_model.metadata.variable_starts),
             dae_variables: Some(&dae_model.variables),
-            indexed_bindings: Some(indexed_bindings),
+            indexed_bindings: Some(super::IndexedBindingSource::Shared(Arc::clone(
+                indexed_bindings,
+            ))),
             is_initial_mode: false,
         },
     )

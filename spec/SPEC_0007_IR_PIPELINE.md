@@ -54,7 +54,7 @@ DAE lowering, structural rewrites, or template policy.
 
 ### Stage 1 — AST (`rumoca-ir-ast`)
 
-**What it is:** The parser output: concrete syntax with comments and spans.
+**What it is:** Parser output: concrete syntax, comments, and spans.
 
 **Contract:**
 - Represents source text structure, not language semantics.
@@ -62,9 +62,9 @@ DAE lowering, structural rewrites, or template policy.
 - Every node carries a source `Span`; later AST merges must preserve parser
   provenance instead of rewriting source ids.
 
-**What to do here:** Parsing, formatting, early syntax diagnostics.
+**Do here:** Parsing, formatting, early syntax diagnostics.
 
-**What NOT to do here:** Name lookup, class instantiation, type inference,
+**Do NOT here:** Name lookup, class instantiation, type inference,
 equation manipulation.
 
 ---
@@ -143,6 +143,7 @@ has the same meaning as the default. Incompatible schema changes bump
 
 | Rule | Where | Why |
 |---|---|---|
+| Each proven matrix-product result lane expands to a complete inner-dimension dot sum; unknown or mismatched shapes fail closed | DAE lowering | Preserves matrix-product semantics without guessing shape facts |
 | No source temporal operators (`pre`, `edge`, `change`, `sample`, `previous`) survive in f_x, f_z, f_m, f_c, relations, or initialization equations | DAE lowering rewrites them into Appendix B constructs: explicit `__pre__.*` inputs, relation/c variables, scheduled events, clock metadata, and ordinary equations over `v` | MLS Appendix B states the DAE as functions over `v` and `relation(v)`; source temporal operators are not computable DAE/Solve graph nodes |
 | No `der()` on RHS | derivatives flow via `dae.states` + equation structure | Inline `der()` would hide state identity |
 | No `initial()` in f_x/f_z/f_m/f_c | initial phase is handled separately | Avoids mixing initialization into runtime equations |
@@ -188,18 +189,23 @@ Canonical terminology:
 | `TensorProgramNode` | `ComputeNode::{MatMul, LinSolve, AffineStencil, ...}` | A tensor-level kernel with explicit shape/layout metadata and scalar fallback |
 | `ComputeBlock` | `ComputeBlock` | Ordered mix of scalar program blocks and tensor program nodes |
 
-`ScalarProgramBlock` and `ComputeNode::ScalarPrograms` are the public source-code
-names. New Solve-IR APIs must use `ScalarProgram` / `ScalarProgramBlock`
-terminology and must not reintroduce `RowBlock` / `ScalarRows` naming.
+Public APIs use `ScalarProgram`/`ScalarProgramBlock`; `RowBlock`/`ScalarRows`
+must not return.
 
-`ComputeNode::AffineStencil` is source-proven: it comes from preserved DAE
-structured-family domains plus affine operand proofs. It carries the compact
-iteration domain and strides; Solve lowering must not recover stencils by
-scanning unstructured scalar rows after structured-family metadata is discarded.
+Initialization requires exact Y coverage, real spans, unit signs, direct
+ownership, and no scalar rows. Solve-IR owns
+target/map/dependency/affine checks: stride op positions/dimensions are
+in-bounds, op kinds match, and constant strides are finite. Direct Maps require
+SSA, one terminal `StoreOutput`, and a reaching `Sub` with one target-`LoadY`
+side and independent peer closure.
+Structural fallback is limited to direct-ineligible models without event/discrete
+or user/structured initialization.
 
-The root `schema_version` field is mandatory on serialized Solve payloads.
-Deserializers reject unsupported versions and the Solve wire format does not
-accept pre-versioned `ComputeBlock` row payloads.
+`ComputeNode::AffineStencil` requires a preserved DAE domain plus affine-operand
+proof; unstructured-row recovery is forbidden.
+
+Serialized Solve payloads require the supported `schema_version`; pre-versioned
+`ComputeBlock` rows are rejected.
 
 `SolveProblem` is the base lowered problem. Backend products that are expensive
 or not part of the canonical MLS DAE, such as mass-matrix form and
@@ -280,10 +286,7 @@ rendering (those live in DAE-IR/upstream lowering, `rumoca-exec-*`, or
 
 ## Structural Lowering Scope
 
-Rumoca performs OpenModelica-class structural lowering between DAE and Solve.
-Structural lowering is DAE-to-DAE: it rewrites or annotates mathematical
-structure for downstream lowering without changing IR stage. The supported
-transformations are listed here to keep scope and ownership clear.
+Rumoca performs these DAE-to-DAE transformations before Solve.
 
 **In scope:**
 

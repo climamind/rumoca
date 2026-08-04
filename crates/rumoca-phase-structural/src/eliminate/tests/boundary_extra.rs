@@ -290,6 +290,375 @@ fn test_orphan_drop_does_not_keep_scalarized_unknown_by_base_alias_only() {
 }
 
 #[test]
+fn test_orphan_drop_keeps_exact_scalarized_lhs_owner() {
+    let mut dae = Dae::new();
+
+    dae.variables.algebraics.insert(
+        VarName::new("resistor.plug_p.pin[2].v.im"),
+        test_dae_variable("resistor.plug_p.pin[2].v.im"),
+    );
+    dae.continuous
+        .equations
+        .push(dae::Equation::explicit_with_scalar_count(
+            VarName::new("resistor.plug_p.pin[2].v.im"),
+            lit(0.0),
+            Span::DUMMY,
+            "exact scalarized lhs",
+            1,
+        ));
+
+    drop_unreferenced_continuous_unknowns(&mut dae);
+
+    let sorted = crate::sort_dae(&dae)
+        .expect("the retained explicit scalarized lhs must remain structurally matchable");
+    assert!(
+        dae.variables
+            .algebraics
+            .contains_key(&VarName::new("resistor.plug_p.pin[2].v.im")),
+        "an exact scalarized lhs must keep its owning unknown live"
+    );
+    assert_eq!(dae.continuous.equations.len(), 1);
+    assert_eq!(
+        sorted.matching.len(),
+        1,
+        "the retained equation must match its one exact scalarized unknown"
+    );
+}
+
+#[test]
+fn test_orphan_drop_keeps_exact_scalarized_slice_lhs_owners() {
+    let mut dae = Dae::new();
+    let span = test_span();
+
+    let mut aggregate_metadata = component_var("leg_force_w");
+    aggregate_metadata.dims = vec![3, 2];
+    dae.variables
+        .inputs
+        .insert(VarName::new("leg_force_w"), aggregate_metadata);
+    for row in 1..=3 {
+        let name = format!("leg_force_w[{row},1]");
+        dae.variables
+            .algebraics
+            .insert(VarName::new(&name), component_var(&name));
+    }
+    dae.variables.algebraics.insert(
+        VarName::new("leg_force_w[1,2]"),
+        component_var("leg_force_w[1,2]"),
+    );
+
+    let lhs = Reference::with_component_reference(
+        "leg_force_w",
+        rumoca_core::ComponentReference {
+            local: false,
+            span,
+            parts: vec![rumoca_core::ComponentRefPart {
+                ident: "leg_force_w".to_string(),
+                span,
+                subs: vec![
+                    rumoca_core::Subscript::Colon { span },
+                    rumoca_core::Subscript::Index { value: 1, span },
+                ],
+            }],
+            def_id: None,
+        },
+    );
+    dae.continuous
+        .equations
+        .push(dae::Equation::explicit_with_scalar_count(
+            lhs,
+            array(vec![lit(0.0), lit(0.0), lit(0.0)]),
+            span,
+            "three-row slice lhs",
+            3,
+        ));
+
+    drop_unreferenced_continuous_unknowns(&mut dae);
+
+    for row in 1..=3 {
+        let name = VarName::new(format!("leg_force_w[{row},1]"));
+        assert!(
+            dae.variables.algebraics.contains_key(&name),
+            "slice lhs must keep exact owner `{}` live",
+            name.as_str()
+        );
+    }
+    assert!(
+        !dae.variables
+            .algebraics
+            .contains_key(&VarName::new("leg_force_w[1,2]")),
+        "slice lhs must not keep an unrelated scalar leaf by base alias"
+    );
+    let mut mismatched = dae.clone();
+    mismatched.continuous.equations[0].scalar_count = 2;
+    drop_unreferenced_continuous_unknowns(&mut mismatched);
+    assert!(
+        mismatched.variables.algebraics.is_empty(),
+        "a slice whose DAE shape disagrees with scalar_count must fail closed"
+    );
+    let resolver = crate::incidence::ScalarUnknownResolver::from_entries(
+        (1..=3).map(|row| (format!("leg_force_w[{row},1]"), row - 1)),
+    );
+    let mut lhs_columns = std::collections::HashSet::new();
+    crate::incidence::collect_equation_lhs_unknown(
+        dae.continuous.equations[0].lhs.as_ref(),
+        &resolver,
+        &mut lhs_columns,
+    );
+    assert_eq!(
+        lhs_columns.len(),
+        3,
+        "the retained slice lhs must expose all three exact owners to structural incidence"
+    );
+}
+
+#[test]
+fn test_orphan_drop_rejects_structured_lhs_with_cached_scalar_spelling() {
+    let mut dae = Dae::new();
+    let span = test_span();
+
+    let mut aggregate_metadata = component_var("cached_target");
+    aggregate_metadata.dims = vec![2, 2];
+    dae.variables
+        .inputs
+        .insert(VarName::new("cached_target"), aggregate_metadata);
+    for name in ["cached_target[1,1]", "cached_target[2,1]"] {
+        dae.variables
+            .algebraics
+            .insert(VarName::new(name), component_var(name));
+    }
+
+    let lhs = Reference::with_component_reference(
+        "cached_target[1,1]",
+        rumoca_core::ComponentReference {
+            local: false,
+            span,
+            parts: vec![rumoca_core::ComponentRefPart {
+                ident: "cached_target".to_string(),
+                span,
+                subs: vec![
+                    rumoca_core::Subscript::Expr {
+                        expr: Box::new(var_ref("dynamic_selector")),
+                        span,
+                    },
+                    rumoca_core::Subscript::Index { value: 1, span },
+                ],
+            }],
+            def_id: None,
+        },
+    );
+    dae.continuous
+        .equations
+        .push(dae::Equation::explicit_with_scalar_count(
+            lhs,
+            lit(0.0),
+            span,
+            "dynamic selector must fail closed despite cached scalar spelling",
+            1,
+        ));
+
+    drop_unreferenced_continuous_unknowns(&mut dae);
+
+    assert!(
+        dae.variables.algebraics.is_empty(),
+        "structured LHS owner preservation must not trust cached scalar spelling"
+    );
+}
+
+#[test]
+fn test_orphan_drop_rejects_unproven_structured_lhs_projections() {
+    let span = test_span();
+    let cases = [
+        (
+            "missing base metadata",
+            "missing_metadata",
+            None,
+            Vec::new(),
+            1,
+            "missing_metadata[1]",
+        ),
+        (
+            "selector rank mismatch",
+            "rank_target",
+            Some(vec![2, 2]),
+            vec![rumoca_core::Subscript::Index { value: 1, span }],
+            1,
+            "rank_target[1]",
+        ),
+        (
+            "invalid aggregate dimensions",
+            "invalid_dimensions_target",
+            Some(vec![0]),
+            vec![rumoca_core::Subscript::Colon { span }],
+            1,
+            "invalid_dimensions_target[1]",
+        ),
+        (
+            "out-of-range selector",
+            "out_of_range_target",
+            Some(vec![2]),
+            vec![rumoca_core::Subscript::Index { value: 3, span }],
+            1,
+            "out_of_range_target[3]",
+        ),
+        (
+            "missing projected leaf",
+            "incomplete_projection_target",
+            Some(vec![2]),
+            vec![rumoca_core::Subscript::Colon { span }],
+            2,
+            "incomplete_projection_target[1]",
+        ),
+    ];
+
+    for (case, base_name, dims, selectors, scalar_count, scalar_leaf) in cases {
+        let mut dae = Dae::new();
+        if let Some(dims) = dims {
+            let mut metadata = component_var(base_name);
+            metadata.dims = dims;
+            dae.variables
+                .inputs
+                .insert(VarName::new(base_name), metadata);
+        }
+        dae.variables
+            .algebraics
+            .insert(VarName::new(scalar_leaf), component_var(scalar_leaf));
+        dae.continuous
+            .equations
+            .push(dae::Equation::explicit_with_scalar_count(
+                Reference::with_component_reference(
+                    base_name,
+                    rumoca_core::ComponentReference {
+                        local: false,
+                        span,
+                        parts: vec![rumoca_core::ComponentRefPart {
+                            ident: base_name.to_string(),
+                            span,
+                            subs: selectors,
+                        }],
+                        def_id: None,
+                    },
+                ),
+                lit(0.0),
+                span,
+                format!("{case} must fail closed"),
+                scalar_count,
+            ));
+
+        drop_unreferenced_continuous_unknowns(&mut dae);
+        assert!(
+            dae.variables.algebraics.is_empty(),
+            "{case} must not retain its scalar leaf `{scalar_leaf}`"
+        );
+    }
+}
+
+#[test]
+fn test_orphan_drop_keeps_shaped_singleton_base_lhs_owner() {
+    let mut dae = Dae::new();
+    let span = test_span();
+
+    let mut aggregate_metadata = component_var("singleton_target");
+    aggregate_metadata.dims = vec![1, 1];
+    dae.variables
+        .inputs
+        .insert(VarName::new("singleton_target"), aggregate_metadata);
+    dae.variables.algebraics.insert(
+        VarName::new("singleton_target[1,1]"),
+        component_var("singleton_target[1,1]"),
+    );
+
+    let lhs = Reference::with_component_reference(
+        "singleton_target",
+        rumoca_core::ComponentReference {
+            local: false,
+            span,
+            parts: vec![rumoca_core::ComponentRefPart {
+                ident: "singleton_target".to_string(),
+                span,
+                subs: Vec::new(),
+            }],
+            def_id: None,
+        },
+    );
+    dae.continuous
+        .equations
+        .push(dae::Equation::explicit_with_scalar_count(
+            lhs,
+            lit(0.0),
+            span,
+            "shaped singleton base lhs",
+            1,
+        ));
+
+    drop_unreferenced_continuous_unknowns(&mut dae);
+
+    assert!(
+        dae.variables
+            .algebraics
+            .contains_key(&VarName::new("singleton_target[1,1]")),
+        "a shaped singleton base lhs must keep its scalar projection"
+    );
+}
+
+#[test]
+fn test_orphan_drop_keeps_structured_fixed_singleton_lhs_owner() {
+    let mut dae = Dae::new();
+    let span = test_span();
+
+    let mut aggregate_metadata = component_var("fixed_target");
+    aggregate_metadata.dims = vec![2, 2];
+    dae.variables
+        .inputs
+        .insert(VarName::new("fixed_target"), aggregate_metadata);
+    for name in ["fixed_target[1,1]", "fixed_target[2,1]"] {
+        dae.variables
+            .algebraics
+            .insert(VarName::new(name), component_var(name));
+    }
+
+    let lhs = Reference::with_component_reference(
+        "fixed_target",
+        rumoca_core::ComponentReference {
+            local: false,
+            span,
+            parts: vec![rumoca_core::ComponentRefPart {
+                ident: "fixed_target".to_string(),
+                span,
+                subs: vec![
+                    rumoca_core::Subscript::Index { value: 1, span },
+                    rumoca_core::Subscript::Index { value: 1, span },
+                ],
+            }],
+            def_id: None,
+        },
+    );
+    dae.continuous
+        .equations
+        .push(dae::Equation::explicit_with_scalar_count(
+            lhs,
+            lit(0.0),
+            span,
+            "one exact structured lhs owner",
+            1,
+        ));
+
+    drop_unreferenced_continuous_unknowns(&mut dae);
+
+    assert!(
+        dae.variables
+            .algebraics
+            .contains_key(&VarName::new("fixed_target[1,1]")),
+        "a structured fixed lhs with scalar_count=1 must keep its exact leaf owner"
+    );
+    assert!(
+        !dae.variables
+            .algebraics
+            .contains_key(&VarName::new("fixed_target[2,1]")),
+        "a structured fixed lhs must not keep an unrelated leaf"
+    );
+}
+
+#[test]
 fn test_orphan_drop_keeps_exact_scalarized_unknown_reference() {
     let mut dae = Dae::new();
 

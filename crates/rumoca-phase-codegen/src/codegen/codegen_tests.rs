@@ -92,6 +92,7 @@ pub(super) fn solve_problem_with_two_by_two_linsolve_derivative() -> solve::Solv
             rhs_start: 4,
             n: 2,
             next_reg: 6,
+            output_indices: Vec::new(),
             metadata: Default::default(),
             span: fixture_span(),
         }],
@@ -1649,6 +1650,7 @@ fn test_fmi3_scalar_blt_projection_renders_from_solve_ir() {
     problem.solve_layout.state_scalar_count = 1;
     problem.solve_layout.algebraic_scalar_count = 1;
     problem.continuous.implicit_rhs = solve::ComputeBlock::from_scalar_program_block(implicit);
+    problem.continuous.implicit_row_targets = vec![None, Some(solve::scalar_slot_y(1))];
     problem.continuous.algebraic_projection_plan = solve::AlgebraicProjectionPlan {
         blocks: vec![solve::AlgebraicProjectionBlock {
             rows: vec![1],

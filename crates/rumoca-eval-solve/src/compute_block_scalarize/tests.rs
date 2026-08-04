@@ -144,6 +144,7 @@ fn linsolve_scalarizes_to_one_program_with_unique_components() {
             rhs_start: (n * n) as Reg,
             n,
             next_reg,
+            output_indices: Vec::new(),
             metadata: TensorNodeMetadata::default(),
             span: rumoca_core::Span::DUMMY,
         }],
@@ -167,6 +168,26 @@ fn linsolve_scalarizes_to_one_program_with_unique_components() {
         }
     }
     assert_eq!(components, n);
+}
+
+#[test]
+fn linsolve_scalarization_preserves_noncontiguous_output_indices() {
+    let block = ComputeBlock {
+        nodes: vec![ComputeNode::LinSolve {
+            setup_ops: load_p_ops(0, 6),
+            matrix_start: 0,
+            rhs_start: 4,
+            n: 2,
+            next_reg: 6,
+            output_indices: vec![0, 2],
+            metadata: TensorNodeMetadata::default(),
+            span: rumoca_core::Span::DUMMY,
+        }],
+    };
+
+    let scalar = to_scalar_program_block(&block).expect("mapped LinSolve should scalarize");
+    assert_eq!(scalar.output_indices, vec![0, 2]);
+    assert_eq!(block.len().expect("mapped output count should be valid"), 3);
 }
 
 #[test]
@@ -615,6 +636,47 @@ fn scalarize_reports_native_stride_invalid_dimension() {
             .to_string()
             .contains("native map family stride dimension 1 out of bounds for 1 dimensions"),
         "error should explain the invalid stride dimension: {error}"
+    );
+}
+
+#[test]
+fn scalarize_reports_nonfinite_const_stride_with_span() {
+    let span = rumoca_core::Span::from_offsets(
+        rumoca_core::SourceId::from_source_name("nonfinite_stride.mo"),
+        4,
+        12,
+    );
+    let block = ComputeBlock {
+        nodes: vec![ComputeNode::Map {
+            domain: test_tensor_domain(1),
+            output_map: rumoca_ir_solve::TensorOutputMap::dense_contiguous(
+                0,
+                &test_tensor_domain(1),
+            )
+            .expect("valid dense output map"),
+            base_ops: vec![
+                LinearOp::Const { dst: 0, value: 1.0 },
+                LinearOp::StoreOutput { src: 0 },
+            ],
+            load_strides: Vec::new(),
+            const_strides: vec![AffineStencilConstStride {
+                op_position: 0,
+                terms: vec![rumoca_ir_solve::AffineStencilConstStrideTerm {
+                    dimension: 0,
+                    stride: f64::NAN,
+                }],
+            }],
+            metadata: rumoca_ir_solve::TensorNodeMetadata::default(),
+            span,
+        }],
+    };
+
+    let error = to_scalar_program_block(&block)
+        .expect_err("non-finite const stride must fail scalarization metadata admission");
+    assert_eq!(error.source_span(), Some(span));
+    assert!(
+        error.to_string().contains("const stride") && error.to_string().contains("non-finite"),
+        "error should explain the non-finite const stride: {error}"
     );
 }
 

@@ -4527,9 +4527,11 @@ version = "0.9.19"
 dependencies = [
  "bincode",
  "indexmap 2.14.0",
+ "ron",
  "rumoca-core",
  "serde",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -4731,6 +4733,7 @@ name = "rumoca-sim"
 version = "0.9.19"
 dependencies = [
  "anyhow",
+ "bincode",
  "indexmap 2.14.0",
  "libc",
  "rumoca-codec",

@@ -1,17 +1,17 @@
 //! Solver-facing Solve IR.
-//!
 //! This crate contains data consumed by simulation backends after DAE-level
 //! structural/lowering phases. It must stay free of DAE evaluation and phase
 //! logic.
-//!
-//! SPEC_0021 file-size exception: Solve IR still defines scalar rows, tensor
-//! nodes, validation, and visitor contracts in one facade. split plan: move
-//! tensor contracts, validation errors, and visitors into focused modules.
+//! Focused modules own layout, linear ops, direct-initialization validation, and visitors.
 
+mod affine_map_validation;
 #[cfg(test)]
 mod compute_block_tests;
+mod direct_map_semantics;
+mod initialization_validation;
 mod layout;
 mod linear_op;
+mod linsolve_output_indices;
 pub mod visitor;
 
 use indexmap::IndexMap;
@@ -20,6 +20,18 @@ use rumoca_core::{
 };
 use serde::{Deserialize, Serialize};
 
+pub(crate) use linsolve_output_indices::{
+    linsolve_output_cursor, output_index_overflow, tensor_output_count_for_node,
+    tensor_output_map_error, validate_linsolve_output_indices,
+};
+
+pub use affine_map_validation::{AffineMapMetadataError, validate_affine_map_metadata};
+pub use initialization_validation::{
+    InitializationTargetRange, validate_compact_gpu_initialization,
+};
+use initialization_validation::{
+    initialization_stored_row_count, validate_initialization_direct_families,
+};
 pub use layout::{
     ComponentReferenceKey, ComponentReferenceKeyError, ComponentReferenceKeyErrorKind,
     ComponentReferenceKeyPart, ComponentReferenceSubscriptKey, IndexedScalarSlot, ScalarSlot,
@@ -33,8 +45,7 @@ pub use visitor::{
     LinearOpSliceKind, SolveVisitor, VisitScope, walk_compute_block, walk_compute_node,
     walk_scalar_program_block, walk_solve_artifacts, walk_solve_model, walk_solve_problem,
 };
-
-pub const SOLVE_SCHEMA_VERSION: u16 = 15;
+pub const SOLVE_SCHEMA_VERSION: u16 = 17;
 
 pub fn source_span_from_offsets(source: u64, start: usize, end: usize) -> Span {
     Span::from_offsets(SourceId(source), start, end)
@@ -615,7 +626,7 @@ pub enum ComputeNode {
         span: Span,
     },
 
-    /// Dense linear solve: A (n×n) * x = b, writes n consecutive output values.
+    /// Dense linear solve: A (n×n) * x = b.
     ///
     /// `setup_ops` evaluates to n*n + n values:
     ///   regs `matrix_start..matrix_start+n*n` = A (row-major)
@@ -627,6 +638,10 @@ pub enum ComputeNode {
         rhs_start: Reg,
         n: usize,
         next_reg: Reg,
+        /// Empty retains contiguous placement at the current ComputeBlock
+        /// cursor. A populated map preserves native output ownership.
+        #[serde(default)]
+        output_indices: Vec<usize>,
         metadata: TensorNodeMetadata,
         span: Span,
     },
@@ -743,10 +758,20 @@ impl ComputeBlock {
                         .checked_add(output_count)
                         .ok_or_else(|| output_index_overflow(context, node_index, Some(*span)))?;
                 }
-                ComputeNode::LinSolve { n, span, .. } => {
-                    output_cursor = output_cursor
-                        .checked_add(*n)
-                        .ok_or_else(|| output_index_overflow(context, node_index, Some(*span)))?;
+                ComputeNode::LinSolve {
+                    n,
+                    output_indices,
+                    span,
+                    ..
+                } => {
+                    output_cursor = linsolve_output_cursor(
+                        context,
+                        node_index,
+                        output_cursor,
+                        *n,
+                        output_indices,
+                        *span,
+                    )?;
                 }
             }
         }
@@ -805,80 +830,6 @@ impl ComputeBlock {
     }
 }
 
-fn tensor_output_count_for_node(
-    context: &'static str,
-    node_index: usize,
-    node: &ComputeNode,
-    domain: &StructuredIndexDomain,
-    output_map: &TensorOutputMap,
-) -> Result<usize, SolveProblemShapeContractError> {
-    let (dimension, span) = match node {
-        ComputeNode::Map { span, .. } => ("Map", *span),
-        ComputeNode::AffineStencil { span, .. } => ("AffineStencil", *span),
-        ComputeNode::ScalarPrograms(_)
-        | ComputeNode::MatMul { .. }
-        | ComputeNode::LinSolve { .. } => unreachable!("tensor output count requires tensor node"),
-    };
-    output_map
-        .output_count(domain)
-        .map_err(|error| tensor_output_map_error(context, node_index, dimension, error, span))
-}
-
-fn tensor_output_map_error(
-    context: &'static str,
-    node_index: usize,
-    dimension: &'static str,
-    error: TensorOutputMapError,
-    span: Span,
-) -> SolveProblemShapeContractError {
-    match error {
-        TensorOutputMapError::Dimension {
-            output_dimension,
-            domain_rank,
-        } => SolveProblemShapeContractError::TensorOutputMapDimension {
-            context: context.to_string(),
-            node_index,
-            dimension,
-            output_dimension,
-            domain_rank,
-            span,
-        },
-        TensorOutputMapError::StructuredIndexDomain { error } => {
-            SolveProblemShapeContractError::StructuredIndexDomain {
-                context: context.to_string(),
-                node_index,
-                dimension,
-                error,
-                span,
-            }
-        }
-        TensorOutputMapError::NegativeIndex { value } => {
-            SolveProblemShapeContractError::TensorOutputMapNegativeIndex {
-                context: context.to_string(),
-                node_index,
-                dimension,
-                value,
-                span,
-            }
-        }
-        TensorOutputMapError::OutputIndexOverflow => {
-            output_index_overflow(context, node_index, Some(span))
-        }
-    }
-}
-
-fn output_index_overflow(
-    context: impl Into<String>,
-    node_index: usize,
-    span: Option<Span>,
-) -> SolveProblemShapeContractError {
-    SolveProblemShapeContractError::OutputIndexOverflow {
-        context: context.into(),
-        node_index,
-        span,
-    }
-}
-
 impl ComputeNode {
     pub fn validate_shape_contract(
         &self,
@@ -925,7 +876,12 @@ impl ComputeNode {
                     });
                 }
             }
-            ComputeNode::LinSolve { n, span, .. } => {
+            ComputeNode::LinSolve {
+                n,
+                output_indices,
+                span,
+                ..
+            } => {
                 if *n == 0 {
                     return Err(SolveProblemShapeContractError::ZeroTensorDimension {
                         context: context.to_string(),
@@ -934,6 +890,7 @@ impl ComputeNode {
                         span: *span,
                     });
                 }
+                validate_linsolve_output_indices(context, node_index, *n, output_indices, *span)?;
             }
             ComputeNode::Map {
                 domain,
@@ -1198,7 +1155,7 @@ impl<'de> Deserialize<'de> for SolveProblem {
             )));
         }
 
-        Ok(Self {
+        let problem = Self {
             schema_version: wire.schema_version,
             layout: wire.layout,
             solve_layout: wire.solve_layout,
@@ -1207,7 +1164,11 @@ impl<'de> Deserialize<'de> for SolveProblem {
             discrete: wire.discrete,
             events: wire.events,
             clocks: wire.clocks,
-        })
+        };
+        problem
+            .validate_shape_contract()
+            .map_err(serde::de::Error::custom)?;
+        Ok(problem)
     }
 }
 
@@ -1267,10 +1228,14 @@ impl SolveProblem {
         self.initialization
             .update_rhs
             .validate_shape_contract("initialization.update_rhs")?;
-        validate_count(
-            "initialization.row_targets",
-            self.initialization.residual.len()?,
-            self.initialization.row_targets.len(),
+        let initialization_rows = initialization_stored_row_count(
+            &self.initialization.residual,
+            "initialization.residual rows",
+        )?;
+        validate_initialization_direct_families(
+            &self.initialization,
+            self.layout.y_scalars(),
+            initialization_rows,
         )?;
         validate_count(
             "initialization.update_targets",
@@ -1285,8 +1250,12 @@ impl SolveProblem {
         validate_projection_plan(
             "initialization.projection_plan",
             &self.initialization.projection_plan,
-            self.initialization.residual.len()?,
-            self.solve_layout.solver_scalar_count(),
+            initialization_rows,
+            if self.initialization.direct_families.is_empty() {
+                self.solve_layout.solver_scalar_count()
+            } else {
+                self.layout.y_scalars()
+            },
         )?;
         self.discrete
             .runtime_assignment_rhs
@@ -1431,6 +1400,10 @@ pub enum SolveProblemShapeContractError {
         actual: usize,
         span: Option<Span>,
     },
+    InitializationTargetCoverage {
+        reason: &'static str,
+        span: Option<Span>,
+    },
     ZeroTensorDimension {
         context: String,
         node_index: usize,
@@ -1459,6 +1432,19 @@ pub enum SolveProblemShapeContractError {
         value: isize,
         span: Span,
     },
+    LinSolveOutputIndexMismatch {
+        context: String,
+        node_index: usize,
+        components: usize,
+        output_indices: usize,
+        span: Span,
+    },
+    LinSolveDuplicateOutputIndex {
+        context: String,
+        node_index: usize,
+        output_index: usize,
+        span: Span,
+    },
     OutputIndexOverflow {
         context: String,
         node_index: usize,
@@ -1485,13 +1471,16 @@ impl SolveProblemShapeContractError {
             Self::ScalarProgramSpanMismatch { span, .. }
             | Self::ScalarProgramOutputIndexMismatch { span, .. }
             | Self::ScalarProgramCountMismatch { span, .. }
+            | Self::InitializationTargetCoverage { span, .. }
             | Self::OutputIndexOverflow { span, .. }
             | Self::SolverIndexOutOfBounds { span, .. }
             | Self::InvalidScheduledRootTiming { span, .. } => *span,
             Self::ZeroTensorDimension { span, .. }
             | Self::StructuredIndexDomain { span, .. }
             | Self::TensorOutputMapDimension { span, .. }
-            | Self::TensorOutputMapNegativeIndex { span, .. } => Some(*span),
+            | Self::TensorOutputMapNegativeIndex { span, .. }
+            | Self::LinSolveOutputIndexMismatch { span, .. }
+            | Self::LinSolveDuplicateOutputIndex { span, .. } => Some(*span),
         }
     }
 }
@@ -1533,6 +1522,61 @@ impl std::fmt::Display for SolveProblemShapeContractError {
                 actual,
                 ..
             } => write!(f, "{context} expected {expected} rows, got {actual}"),
+            Self::InitializationTargetCoverage { reason, .. } => {
+                write!(f, "initialization target coverage is invalid: {reason}")
+            }
+            Self::LinSolveOutputIndexMismatch {
+                context,
+                node_index,
+                components,
+                output_indices,
+                ..
+            } => write!(
+                f,
+                "{context} node {node_index} LinSolve has {components} components but {output_indices} output indices"
+            ),
+            Self::LinSolveDuplicateOutputIndex {
+                context,
+                node_index,
+                output_index,
+                ..
+            } => write!(
+                f,
+                "{context} node {node_index} LinSolve has duplicate output index {output_index}"
+            ),
+            error @ (Self::ZeroTensorDimension { .. }
+            | Self::StructuredIndexDomain { .. }
+            | Self::TensorOutputMapDimension { .. }
+            | Self::TensorOutputMapNegativeIndex { .. }) => error.fmt_tensor_error(f),
+            Self::OutputIndexOverflow {
+                context,
+                node_index,
+                ..
+            } => write!(
+                f,
+                "{context} node {node_index} output index arithmetic overflowed"
+            ),
+            Self::SolverIndexOutOfBounds {
+                context,
+                index,
+                upper_bound,
+                ..
+            } => write!(
+                f,
+                "{context} references solver index {index}, but upper bound is {upper_bound}"
+            ),
+            Self::InvalidScheduledRootTiming {
+                context,
+                root_index,
+                ..
+            } => write!(f, "{context} root {root_index} has invalid periodic timing"),
+        }
+    }
+}
+
+impl SolveProblemShapeContractError {
+    fn fmt_tensor_error(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
             Self::ZeroTensorDimension {
                 context,
                 node_index,
@@ -1574,28 +1618,7 @@ impl std::fmt::Display for SolveProblemShapeContractError {
                 f,
                 "{context} node {node_index} {dimension} output map produced negative output index {value}"
             ),
-            Self::OutputIndexOverflow {
-                context,
-                node_index,
-                ..
-            } => write!(
-                f,
-                "{context} node {node_index} output index arithmetic overflowed"
-            ),
-            Self::SolverIndexOutOfBounds {
-                context,
-                index,
-                upper_bound,
-                ..
-            } => write!(
-                f,
-                "{context} references solver index {index}, but upper bound is {upper_bound}"
-            ),
-            Self::InvalidScheduledRootTiming {
-                context,
-                root_index,
-                ..
-            } => write!(f, "{context} root {root_index} has invalid periodic timing"),
+            _ => unreachable!("only tensor errors are delegated to fmt_tensor_error"),
         }
     }
 }
@@ -1662,13 +1685,37 @@ pub struct ContinuousSolveArtifacts {
 pub struct InitializationSolveSystem {
     pub residual: ComputeBlock,
     pub row_targets: Vec<Option<ScalarSlot>>,
+    /// Compact, fully-proven direct initial assignments. Unlike `row_targets`,
+    /// this does not create one owned record per scalar initial row.
+    #[serde(default)]
+    pub direct_families: Vec<InitializationDirectFamily>,
+    /// Complete solver-Y coverage required by this initialization artifact.
+    #[serde(default)]
+    pub required_target_ranges: Vec<InitializationTargetRange>,
+    /// Required ranges already satisfied by declared fixed starts.
+    #[serde(default)]
+    pub fixed_target_ranges: Vec<InitializationTargetRange>,
     pub projection_indices: Vec<usize>,
+    /// Initialization projection contract. Compact direct artifacts encode one
+    /// direct-family index per block in `rows` and its target-range anchor in
+    /// `y_indices`; scalar initialization keeps the ordinary scalar-row form.
     #[serde(default)]
     pub projection_plan: AlgebraicProjectionPlan,
     #[serde(default)]
     pub update_rhs: ScalarProgramBlock,
     #[serde(default)]
     pub update_targets: Vec<ScalarSlot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InitializationDirectFamily {
+    /// Index of the sole residual `Map` owner in `initialization.residual`.
+    pub node_index: usize,
+    /// Destination Y slot for every residual element, in the same domain.
+    pub targets: TensorOutputMap,
+    /// `+1` for `target - rhs`, `-1` for `rhs - target`.
+    pub residual_sign: i8,
+    pub span: rumoca_core::Span,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1912,7 +1959,6 @@ pub struct SolveModel {
     pub visible_value_rows: ScalarProgramBlock,
     pub variable_meta: Vec<SolveVariableMeta>,
 }
-
 impl SolveModel {
     pub fn state_scalar_count(&self) -> usize {
         self.problem.solve_layout.state_scalar_count()

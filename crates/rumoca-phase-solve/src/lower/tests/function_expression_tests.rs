@@ -731,15 +731,11 @@ fn lower_expression_evaluates_captured_partial_function_in_dynamic_while() {
 #[test]
 fn unprojectable_array_output_declines_scalar_lane_fallback_and_uses_array_runtime() {
     let span = lower_test_span();
-    let mut projection_declined = rumoca_core::Function::new("Pkg.projectionDeclinedArray", span);
-    projection_declined.inputs.push(function_param("u"));
-    projection_declined
-        .outputs
-        .push(function_param_with_dims("y", &[2]));
-    projection_declined
-        .locals
-        .push(record_param("scratch", "Pkg.Record"));
-    projection_declined.body = vec![
+    let mut function = rumoca_core::Function::new("Pkg.projectionDeclinedArray", span);
+    function.inputs.push(function_param("u"));
+    function.outputs.push(function_param_with_dims("y", &[2]));
+    function.locals.push(record_param("scratch", "Pkg.Record"));
+    function.body = vec![
         rumoca_core::Statement::Assignment {
             comp: component_ref("scratch"),
             value: rumoca_core::Expression::FunctionCall {
@@ -766,8 +762,8 @@ fn unprojectable_array_output_declines_scalar_lane_fallback_and_uses_array_runti
         },
     ];
 
-    let projection_call = rumoca_core::Expression::FunctionCall {
-        name: rumoca_core::Reference::from_var_name(projection_declined.name.clone()),
+    let call = rumoca_core::Expression::FunctionCall {
+        name: rumoca_core::Reference::from_var_name(function.name.clone()),
         args: vec![source_var("u")],
         is_constructor: false,
         span,
@@ -795,10 +791,10 @@ fn unprojectable_array_output_declines_scalar_lane_fallback_and_uses_array_runti
     dae_model
         .symbols
         .functions
-        .insert(projection_declined.name.clone(), projection_declined);
+        .insert(function.name.clone(), function);
 
     let projected = crate::lower::derivative_rhs::project_array_like_scalars_with_owner(
-        &projection_call,
+        &call,
         &dae_model,
         &IndexMap::new(),
         span,
@@ -811,7 +807,7 @@ fn unprojectable_array_output_declines_scalar_lane_fallback_and_uses_array_runti
 
     dae_model.continuous.equations.push(dae::Equation {
         lhs: None,
-        rhs: sub(source_var("target"), projection_call),
+        rhs: sub(source_var("target"), call),
         span,
         origin: "unprojectable array function residual".to_string(),
         scalar_count: 2,

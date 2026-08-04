@@ -86,6 +86,7 @@ implementation.
 | `expr_contains_var` | `rumoca-ir-dae::expr_query` | Handles every `Expression` variant |
 | `expr_refers_to_var` | `rumoca-ir-dae::expr_query` | Same single-source rule. |
 | `expr_contains_der_of` | `rumoca-ir-dae::expr_query` | Same single-source rule. |
+| `validate_affine_map_metadata` | `rumoca-ir-solve` | Shared compact admission and phase/eval shape gate. |
 | Solver runtime time-event helpers (`event_right_limit_time`, scheduled/periodic time-event filtering, dynamic time-event parameter lookup) | `rumoca-solver::timeline` | Concrete solver backends call the shared runtime policy instead of copying time-grid rules. |
 | Solver runtime event-boundary helpers (`process_runtime_event_boundary`, `runtime_event_horizon`, `runtime_root_event_application_time`, `RuntimeEventBoundaryHandler`) | `rumoca-solver::runtime::event` | Concrete solver backends provide callback hooks for backend-local row application/state reset while shared Modelica event-boundary policy stays in `rumoca-solver`. |
 | Solver zero-state orchestration helpers (`run_no_state_output_schedule`, `NoStateOrchestrationBackend`, `NoStateEventStep`) | `rumoca-solver::runtime::no_state` | Concrete solver backends provide row/root/event callbacks while shared no-state output/event-loop policy stays in `rumoca-solver`. |
@@ -94,10 +95,8 @@ implementation.
 
 Required rules:
 
-- Every helper above has exactly one implementation, in the listed
-  module. All callers MUST import from that module path.
-- Do not fork helpers "for convenience." If the owner creates a forbidden
-  dependency, move the helper by spec update instead.
+- Each helper has one implementation; callers MUST import its listed owner.
+- Forbidden dependencies require a spec-backed move, not a helper fork.
 - Adding a helper to this list requires updating this spec.
 
 ### 4. Phase Typing via Newtypes
@@ -119,7 +118,9 @@ structural-parameter values are available only after instantiation.
 
 ### 5. Evaluation Decoupled from Representation
 
-Evaluation crates are aligned to IR ownership: `rumoca-eval-ast`, `rumoca-eval-flat`, and `rumoca-eval-dae`. `rumoca-eval-solve` builds on DAE evaluation primitives for solver-facing row evaluation. This keeps evaluation entry points explicit per representation and avoids cross-layer helper crates that hide where behavior lives.
+Evaluation follows IR ownership across `rumoca-eval-ast`, `rumoca-eval-flat`,
+`rumoca-eval-dae`, and solver-facing `rumoca-eval-solve`; entry points remain
+representation-specific.
 
 Phase crates MAY depend on the evaluation crate for the IR they are actively processing
 when the phase needs compile-time evaluation of that representation. For example,
@@ -237,12 +238,14 @@ compiler/session → DAE structural → solve-IR lowering → runtime contracts 
 
 | Rule | Owner | Why |
 |---|---|---|
-| Compilation/session orchestration | `rumoca-compile` | Pipeline coordination only; no runtime |
+| Compilation/session orchestration | `rumoca-compile` | Coordinates pipeline; no runtime |
 | DAE structural analysis (Pantelides, BLT, tearing, demotion) | `rumoca-phase-structural` | SPEC_0007 §Structural Transformation Scope |
-| Solver-facing prepared data + row ops | `rumoca-ir-solve` | Backend-neutral execution IR |
-| DAE → solve-IR lowering | `rumoca-phase-solve` | Lowering only, not structural mutation |
+| Solver-facing prepared data + row ops | `rumoca-ir-solve` | Backend-neutral IR and compact-initialization def-use admission |
+| DAE → solve-IR lowering | `rumoca-phase-solve` | Proves compact GPU order; no structural mutation |
+| Compact Map evaluation | `rumoca-eval-solve` | No scalar reconstruction |
+| GPU initialization settlement | `rumoca-sim` | Reuses Solve-IR admission; solver-free projection/verification |
 | Optimization/training orchestration | `rumoca-opt` | Consumes Solve/eval APIs; no Modelica semantics |
-| Textual generated artifacts and templates | `rumoca-phase-codegen` | Jinja/minijinja rendering owns generated C, Rust, CUDA C, MLIR, FMI/eFMI and FMU/eFMU packaging text |
+| Generated text/templates | `rumoca-phase-codegen` | Renders C, Rust, CUDA, MLIR, FMI/eFMI, and packaging text |
 | GALEC `.alg` text (recorded exception) | `rumoca-ir-galec` | Typed AST printing per eFMI conformance; routed via template context (SPEC_0034 GAL-009) |
 | eFMI packaging XML (`__content.xml`, manifests) | `rumoca-phase-codegen` | Rendered like FMI `modelDescription`; validators + generic checksum/container build step, not typed serializers (SPEC_0034 D3 amended) |
 | Compiled/JIT execution adapter crates | `rumoca-exec-*` | Invoke tools, load artifacts, wrap Cranelift/LLVM/CUDA/NVRTC APIs, expose ergonomic runtime calls; no compiler semantics |
@@ -264,18 +267,20 @@ Inkwell, LLVM ORC bindings, CUDA Driver APIs, or NVRTC; backend bytecode,
 native/JIT execution, and device launch policy belong in `rumoca-exec-*`, above
 the IR-lowering phase.
 
-Target-language and target-format policy belongs in manifests/templates, not
-Rust control flow. Rust MAY provide generic manifest parsing, template
-rendering, safe path handling, schema validation, and language-neutral feature
-probes over IR data. Rust MUST NOT hard-code target-language capabilities, file
-layouts, emitted language names, or backend feature tables for textual targets
+Target-language/format policy belongs in manifests/templates, not Rust control
+flow. Rust MAY provide generic parsing, rendering, safe paths, schema validation,
+and language-neutral IR probes. Rust MUST NOT hard-code target capabilities,
+layouts, emitted language names, or feature tables for textual targets
 (C, Rust, CUDA C, MLIR, FMI/eFMI, or future custom targets). A textual/codegen
-target should be addable with `target.toml` plus Jinja templates; required
-capability declarations or unsupported-feature contracts must live in that
-manifest schema and be enforced by generic validation. Unsupported manifest
-capability failures MUST report stable `unsupported-feature:<feature_id>` from
+target should be addable with `target.toml` plus Jinja; required capabilities
+and unsupported-feature contracts must live in its schema and use generic
+validation. Unsupported capability failures MUST report stable
+`unsupported-feature:<feature_id>` from
 the manifest feature ID so CI, MSL reports, and release summaries can aggregate
 gaps without knowing the target language.
+
+Textual `[[files]]` default non-empty. Format-required empty artifacts MUST set
+`allow_empty = true` per entry; render coverage MUST enforce it.
 
 JIT targets follow the same layering rule as execution adapters, not textual
 template targets. Cranelift, LLVM ORC/Inkwell, CUDA NVRTC/Driver, and browser

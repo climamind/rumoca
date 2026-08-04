@@ -622,97 +622,54 @@ fn validate_affine_row_tensor_node(
         true,
         seed_use,
     )?;
-    for stride in load_strides {
-        validate_index_stride_terms(context, node_name, domain, &stride.terms, span)?;
-        match base_ops.get(stride.op_position) {
-            Some(solve::LinearOp::LoadY { .. } | solve::LinearOp::LoadP { .. }) => {}
-            Some(other) => {
-                return Err(solve_validation_error(
-                    format!(
-                        "{context}: {node_name} stride targets non-load op {}",
-                        other.kind_name()
-                    ),
-                    span,
-                ));
-            }
-            None => {
-                return Err(solve_validation_error(
-                    format!(
-                        "{context}: {node_name} stride op_position {} is out of bounds",
-                        stride.op_position
-                    ),
-                    span,
-                ));
-            }
-        }
-    }
-    for stride in const_strides {
-        validate_const_stride_terms(context, node_name, domain, &stride.terms, span)?;
-        match base_ops.get(stride.op_position) {
-            Some(solve::LinearOp::Const { .. }) => {}
-            Some(other) => {
-                return Err(solve_validation_error(
-                    format!(
-                        "{context}: {node_name} const stride targets non-const op {}",
-                        other.kind_name()
-                    ),
-                    span,
-                ));
-            }
-            None => {
-                return Err(solve_validation_error(
-                    format!(
-                        "{context}: {node_name} const stride op_position {} is out of bounds",
-                        stride.op_position
-                    ),
-                    span,
-                ));
-            }
-        }
-    }
-    Ok(())
+    solve::validate_affine_map_metadata(domain, base_ops, load_strides, const_strides)
+        .map_err(|error| affine_metadata_validation_error(context, node_name, error, span))
 }
 
-fn validate_index_stride_terms(
+fn affine_metadata_validation_error(
     context: &str,
     node_name: &str,
-    domain: &rumoca_core::StructuredIndexDomain,
-    terms: &[solve::AffineStencilIndexStrideTerm],
+    error: solve::AffineMapMetadataError,
     span: Option<Span>,
-) -> Result<(), LowerError> {
-    for term in terms {
-        if term.dimension >= domain.binders.len() {
-            return Err(solve_validation_error(
-                format!(
-                    "{context}: {node_name} load stride dimension {} is out of bounds",
-                    term.dimension
-                ),
-                span,
-            ));
+) -> LowerError {
+    let reason = match error {
+        solve::AffineMapMetadataError::InvalidLoadStrideOp {
+            actual: Some(actual),
+            ..
+        } => format!("{context}: {node_name} stride targets non-load op {actual}"),
+        solve::AffineMapMetadataError::InvalidLoadStrideOp {
+            op_position,
+            actual: None,
+            ..
+        } => format!("{context}: {node_name} stride op_position {op_position} is out of bounds"),
+        solve::AffineMapMetadataError::InvalidConstStrideOp {
+            actual: Some(actual),
+            ..
+        } => format!("{context}: {node_name} const stride targets non-const op {actual}"),
+        solve::AffineMapMetadataError::InvalidConstStrideOp {
+            op_position,
+            actual: None,
+            ..
+        } => format!(
+            "{context}: {node_name} const stride op_position {op_position} is out of bounds"
+        ),
+        solve::AffineMapMetadataError::InvalidLoadStrideDimension { dimension, .. } => {
+            format!("{context}: {node_name} load stride dimension {dimension} is out of bounds")
         }
-    }
-    Ok(())
-}
-
-fn validate_const_stride_terms(
-    context: &str,
-    node_name: &str,
-    domain: &rumoca_core::StructuredIndexDomain,
-    terms: &[solve::AffineStencilConstStrideTerm],
-    span: Option<Span>,
-) -> Result<(), LowerError> {
-    for term in terms {
-        if term.dimension >= domain.binders.len() {
-            return Err(solve_validation_error(
-                format!(
-                    "{context}: {node_name} const stride dimension {} is out of bounds",
-                    term.dimension
-                ),
-                span,
-            ));
+        solve::AffineMapMetadataError::InvalidConstStrideDimension { dimension, .. } => {
+            format!("{context}: {node_name} const stride dimension {dimension} is out of bounds")
         }
-    }
-    Ok(())
+        solve::AffineMapMetadataError::NonFiniteConstStride {
+            op_position,
+            dimension,
+        } => {
+            format!(
+                "{context}: {node_name} const stride op_position {op_position} \
+                 dimension {dimension} is not finite"
+            )
+        }
+    };
+    solve_validation_error(reason, span)
 }
 
 fn validate_tensor_metadata(

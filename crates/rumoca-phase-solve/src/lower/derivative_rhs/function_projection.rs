@@ -222,7 +222,7 @@ fn function_call_declared_output_count(
         .map(|function| function.outputs.len())
 }
 
-fn is_direct_declared_array_output_call(
+fn is_direct_single_array_output_call(
     expr: &rumoca_core::Expression,
     dae_model: &dae::Dae,
 ) -> bool {
@@ -234,13 +234,10 @@ fn is_direct_declared_array_output_call(
     else {
         return false;
     };
-    dae_model
-        .symbols
-        .functions
-        .get(name.var_name())
-        .is_some_and(
-            |function| matches!(function.outputs.as_slice(), [output] if !output.dims.is_empty()),
-        )
+    matches!(
+        dae_model.symbols.functions.get(name.var_name()),
+        Some(function) if matches!(function.outputs.as_slice(), [output] if !output.dims.is_empty())
+    )
 }
 
 fn checked_shape_dimension(value: f64, span: rumoca_core::Span) -> Result<i64, LowerError> {
@@ -1757,6 +1754,9 @@ impl<'a> FunctionProjectionAnalysis<'a> {
     ) -> Result<rumoca_core::Expression, LowerError> {
         if let Some((name, subscripts, span)) = indexed_var_selection(value)
             && let Some(values) = scope.scalars.get(name.as_str())
+            && self
+                .expr_dims_with_owner(value, scope, depth + 1, span)?
+                .is_some_and(|dims| dims.is_empty())
         {
             let dims = scope.dims.get(name.as_str()).ok_or_else(|| {
                 LowerError::contract_violation(
@@ -3430,12 +3430,14 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 owner_span,
             );
         }
-        let outputs = self.function_call_outputs_with_projection_scope(
-            expr,
-            depth + 1,
-            owner_span,
-            Some(scope),
-        )?;
+        let (outputs, first_probe_declined) = match self
+            .function_call_outputs_with_projection_scope(expr, depth + 1, owner_span, Some(scope))
+        {
+            Ok(Some(outputs)) => (Some(outputs), false),
+            Ok(None) => (None, true),
+            Err(err) if err.is_projection_budget_exceeded() => (None, false),
+            Err(err) => return Err(err),
+        };
         if let Some(outputs) = outputs {
             let span = inherited_projection_source_span(expr.span(), owner_span);
             let ctx = projection_value_ctx(dims, flat_index, scope, depth, span);
@@ -3468,7 +3470,7 @@ impl<'a> FunctionProjectionAnalysis<'a> {
         }
         let outputs = self.function_call_outputs_with_owner(&call, depth + 1, owner_span)?;
         let Some(outputs) = outputs else {
-            if is_direct_declared_array_output_call(expr, self.dae_model) {
+            if first_probe_declined && is_direct_single_array_output_call(expr, self.dae_model) {
                 return Ok(None);
             }
             return Ok(Some(call));
