@@ -1159,12 +1159,18 @@ impl<'a> FunctionProjectionAnalysis<'a> {
             is_constructor: false,
             span: request.span,
         };
-        let outputs = self.function_call_outputs_with_projection_scope(
+        let outputs = match self.function_call_outputs_with_projection_scope(
             &call,
             request.depth + 1,
             request.span,
             Some(scope),
-        )?;
+        ) {
+            Ok(outputs) => outputs,
+            Err(err) if err.is_projection_budget_exceeded() => {
+                return self.apply_budgeted_function_call_statement(request, scope, projected);
+            }
+            Err(err) => return Err(err),
+        };
         let Some(outputs) = outputs else {
             return Err(unsupported_at(
                 format!(
@@ -1430,6 +1436,69 @@ impl<'a> FunctionProjectionAnalysis<'a> {
             span,
         };
         self.apply_assignment(function, &assignment, scope, projected, depth, span)
+    }
+
+    fn apply_budgeted_function_call_statement(
+        &self,
+        request: FunctionCallStatementProjection<'_>,
+        scope: &mut FunctionProjectionScope,
+        projected: &mut Vec<ProjectedFunctionOutput>,
+    ) -> Result<(), LowerError> {
+        let callee_name = request.comp.to_var_name();
+        let Some(callee) = self.dae_model.symbols.functions.get(&callee_name) else {
+            return Err(LowerError::MissingFunction {
+                name: callee_name.to_string(),
+            });
+        };
+        if callee.outputs.len() != request.output_targets.len() {
+            return Err(LowerError::contract_violation(
+                format!(
+                    "budgeted function call statement to `{callee_name}` has {} outputs for {} targets",
+                    callee.outputs.len(),
+                    request.output_targets.len()
+                ),
+                request.span,
+            ));
+        }
+        let instance_id = callee.instance_id.ok_or_else(|| {
+            LowerError::contract_violation(
+                "budgeted procedure projection lacks resolved function instance identity",
+                request.span,
+            )
+        })?;
+        for (target, output) in request.output_targets.iter().zip(callee.outputs.iter()) {
+            let mut reference = request.comp.clone();
+            let base_part_count = reference.parts.len();
+            reference.parts.push(rumoca_core::ComponentRefPart {
+                ident: output.name.clone(),
+                span: output.span,
+                subs: Vec::new(),
+            });
+            let selected_call = rumoca_core::Expression::FunctionCall {
+                name: rumoca_core::Reference::from_component_reference(reference)
+                    .with_resolved_function(rumoca_core::ResolvedFunctionReference {
+                        instance_id,
+                        base_part_count,
+                    }),
+                args: request.args.to_vec(),
+                is_constructor: false,
+                span: request.span,
+            };
+            let assignment = rumoca_core::Statement::Assignment {
+                comp: target.clone(),
+                value: selected_call,
+                span: request.span,
+            };
+            self.apply_assignment(
+                request.function,
+                &assignment,
+                scope,
+                projected,
+                request.depth + 1,
+                request.span,
+            )?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1885,12 +1954,13 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 depth + 1,
                 span,
                 Some(scope),
-            )? {
-                Some(outputs) if outputs.len() == 1 => {
+            ) {
+                Ok(Some(outputs)) if outputs.len() == 1 => {
                     let output = only_projected_scalar_assignment_output(outputs, span)?;
                     return Ok(output.expr.with_span(span));
                 }
-                _ => {}
+                Ok(_) | Err(LowerError::ProjectionBudgetExceeded { .. }) => {}
+                Err(err) => return Err(err),
             }
         }
         let rumoca_core::Expression::VarRef {
@@ -2855,12 +2925,16 @@ impl<'a> FunctionProjectionAnalysis<'a> {
             };
             return self.project_value_scalars(arg, dims, scope, depth + 1, owner_span);
         }
-        let outputs = self.function_call_outputs_with_projection_scope(
+        let outputs = match self.function_call_outputs_with_projection_scope(
             &substituted,
             depth + 1,
             owner_span,
             Some(scope),
-        )?;
+        ) {
+            Ok(outputs) => outputs,
+            Err(err) if err.is_projection_budget_exceeded() => return Ok(None),
+            Err(err) => return Err(err),
+        };
         let Some(outputs) = outputs else {
             return Ok(None);
         };

@@ -182,7 +182,11 @@ impl<'a> FunctionProjectionAnalysis<'a> {
         if call.span().is_none() {
             call = call.with_span(owner_span);
         }
-        let outputs = self.function_call_outputs_with_owner(&call, depth + 1, owner_span)?;
+        let outputs = match self.function_call_outputs_with_owner(&call, depth + 1, owner_span) {
+            Ok(outputs) => outputs,
+            Err(err) if err.is_projection_budget_exceeded() => return Ok(Some(call)),
+            Err(err) => return Err(err),
+        };
         let Some(outputs) = outputs else {
             if first_probe_declined && is_direct_single_array_output_call(expr, self.dae_model) {
                 return Ok(None);
