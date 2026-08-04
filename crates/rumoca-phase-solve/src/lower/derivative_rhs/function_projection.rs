@@ -238,6 +238,27 @@ fn function_call_declared_output_count(
         .map(|function| function.outputs.len())
 }
 
+fn is_direct_single_array_output_call(
+    expr: &rumoca_core::Expression,
+    dae_model: &dae::Dae,
+) -> bool {
+    let rumoca_core::Expression::FunctionCall {
+        name,
+        is_constructor: false,
+        ..
+    } = expr
+    else {
+        return false;
+    };
+    let Some((_, function)) = resolve_function_reference(&dae_model.symbols.functions, name) else {
+        return false;
+    };
+    name.resolved_function().is_some_and(|resolved| {
+        name.component_ref()
+            .is_some_and(|reference| reference.parts.len() == resolved.base_part_count)
+    }) && matches!(function.outputs.as_slice(), [output] if !output.dims.is_empty())
+}
+
 fn checked_shape_dimension(value: f64, span: rumoca_core::Span) -> Result<i64, LowerError> {
     let rounded = value.round();
     if !value.is_finite() || (rounded - value).abs() > 1e-9 {
