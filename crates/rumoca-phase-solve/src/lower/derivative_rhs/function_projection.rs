@@ -3490,14 +3490,12 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 owner_span,
             );
         }
-        let outputs = match self.function_call_outputs_with_projection_scope(
-            expr,
-            depth + 1,
-            owner_span,
-            Some(scope),
-        ) {
-            Ok(outputs) => outputs,
-            Err(err) if err.is_projection_budget_exceeded() => None,
+        let (outputs, first_probe_declined) = match self
+            .function_call_outputs_with_projection_scope(expr, depth + 1, owner_span, Some(scope))
+        {
+            Ok(Some(outputs)) => (Some(outputs), false),
+            Ok(None) => (None, true),
+            Err(err) if err.is_projection_budget_exceeded() => (None, false),
             Err(err) => return Err(err),
         };
         if let Some(outputs) = outputs {
@@ -3536,7 +3534,7 @@ impl<'a> FunctionProjectionAnalysis<'a> {
             Err(err) => return Err(err),
         };
         let Some(outputs) = outputs else {
-            if is_direct_single_array_output_call(expr, self.dae_model) {
+            if first_probe_declined && is_direct_single_array_output_call(expr, self.dae_model) {
                 return Ok(None);
             }
             return Ok(Some(call));
