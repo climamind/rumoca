@@ -3707,6 +3707,61 @@ fn over_budget_function() -> rumoca_core::Function {
     }
 }
 
+fn over_budget_array_function() -> rumoca_core::Function {
+    let mut function = rumoca_core::Function::new("My.explodeArray", test_span());
+    function.inputs.push(scalar_function_param("x"));
+    function.outputs.push(function_param_with_dims("y", &[2]));
+    function.body.push(scalar_assignment(
+        "y",
+        array(vec![local_var("x"), local_var("x")], false),
+    ));
+    for _ in 0..16 {
+        function.body.push(scalar_assignment(
+            "y",
+            binary(
+                rumoca_core::OpBinary::Add,
+                local_var("y"),
+                local_var("y"),
+                test_span(),
+            ),
+        ));
+    }
+    function
+}
+
+fn over_budget_scalar_expression() -> rumoca_core::Expression {
+    let mut expression = real(1.0);
+    for _ in 0..13 {
+        expression = binary(
+            rumoca_core::OpBinary::Add,
+            expression.clone(),
+            expression,
+            test_span(),
+        );
+    }
+    expression
+}
+
+fn budget_then_decline_array_function() -> rumoca_core::Function {
+    let mut function = rumoca_core::Function::new("My.budgetThenDeclineArray", test_span());
+    function.inputs.push(function_param_with_dims("x", &[0]));
+    function.outputs.push(function_param_with_dims("y", &[2]));
+    function
+        .locals
+        .push(function_param_with_type("scratch", "Pkg.Record"));
+    function.body.push(rumoca_core::Statement::FunctionCall {
+        comp: component_ref_target("assert"),
+        args: vec![local_var("x")],
+        outputs: Vec::new(),
+        span: test_span(),
+    });
+    function.body.push(scalar_assignment(
+        "y",
+        array(vec![local_var("scratch.a"), local_var("scratch.b")], false),
+    ));
+    function
+}
+
 #[test]
 fn over_budget_projection_is_a_typed_error_and_declines_at_the_boundary() {
     let mut dae_model = dae::Dae::default();
@@ -3737,6 +3792,73 @@ fn over_budget_projection_is_a_typed_error_and_declines_at_the_boundary() {
             .expect("budget decline must not fail the outer lowering");
         assert!(outputs.is_none());
     }
+}
+
+#[test]
+fn single_array_output_budget_exhaustion_keeps_lane_fallback_call() {
+    let function = over_budget_array_function();
+    let mut dae_model = dae::Dae::default();
+    dae_model
+        .symbols
+        .functions
+        .insert(function.name.clone(), function);
+    let structural_bindings = IndexMap::new();
+    let analysis = FunctionProjectionAnalysis::new(&dae_model, &structural_bindings);
+    let scope = FunctionProjectionScope::default();
+    let call = rumoca_core::Expression::FunctionCall {
+        name: rumoca_core::VarName::new("My.explodeArray").into(),
+        args: vec![real(2.0)],
+        is_constructor: false,
+        span: test_span(),
+    };
+
+    let projected = analysis
+        .project_function_call_value(&call, &[2], 0, &scope, 0, test_span())
+        .expect("budget exhaustion should preserve the runtime lane fallback");
+
+    assert_eq!(projected.as_ref(), Some(&call));
+}
+
+#[test]
+fn first_probe_budget_then_lane_probe_decline_keeps_fallback_call() {
+    let function = budget_then_decline_array_function();
+    let mut dae_model = dae::Dae::default();
+    dae_model
+        .symbols
+        .functions
+        .insert(function.name.clone(), function);
+    let structural_bindings = IndexMap::new();
+    let analysis = FunctionProjectionAnalysis::new(&dae_model, &structural_bindings);
+    let scope = FunctionProjectionScope::default();
+    let call = rumoca_core::Expression::FunctionCall {
+        name: rumoca_core::VarName::new("My.budgetThenDeclineArray").into(),
+        args: vec![array(
+            vec![real(2.0), over_budget_scalar_expression()],
+            false,
+        )],
+        is_constructor: false,
+        span: test_span(),
+    };
+
+    let first = analysis
+        .function_call_outputs_with_projection_scope(&call, 1, test_span(), Some(&scope))
+        .expect_err("whole-array argument should exhaust the first projection probe budget");
+    assert!(first.is_projection_budget_exceeded(), "got: {first:?}");
+
+    let lane_call = analysis
+        .project_function_call_with_lane_args(&call, &[2], 0, &scope, 0, test_span())
+        .expect("lane argument rewrite should select the small first array element");
+    assert_ne!(lane_call, call);
+    let second = analysis
+        .function_call_outputs_with_owner(&lane_call, 1, test_span())
+        .expect("lane-rewritten probe should decline without a budget error");
+    assert!(second.is_none());
+
+    let projected = analysis
+        .project_function_call_value(&call, &[2], 0, &scope, 0, test_span())
+        .expect("asymmetric budget/decline should preserve the runtime lane fallback");
+
+    assert_eq!(projected.as_ref(), Some(&lane_call));
 }
 
 #[test]

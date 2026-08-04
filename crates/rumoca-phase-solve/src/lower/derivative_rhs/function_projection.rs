@@ -222,6 +222,24 @@ fn function_call_declared_output_count(
         .map(|function| function.outputs.len())
 }
 
+fn is_direct_single_array_output_call(
+    expr: &rumoca_core::Expression,
+    dae_model: &dae::Dae,
+) -> bool {
+    let rumoca_core::Expression::FunctionCall {
+        name,
+        is_constructor: false,
+        ..
+    } = expr
+    else {
+        return false;
+    };
+    matches!(
+        dae_model.symbols.functions.get(name.var_name()),
+        Some(function) if matches!(function.outputs.as_slice(), [output] if !output.dims.is_empty())
+    )
+}
+
 fn checked_shape_dimension(value: f64, span: rumoca_core::Span) -> Result<i64, LowerError> {
     let rounded = value.round();
     if !value.is_finite() || (rounded - value).abs() > 1e-9 {
@@ -3472,14 +3490,12 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 owner_span,
             );
         }
-        let outputs = match self.function_call_outputs_with_projection_scope(
-            expr,
-            depth + 1,
-            owner_span,
-            Some(scope),
-        ) {
-            Ok(outputs) => outputs,
-            Err(err) if err.is_projection_budget_exceeded() => None,
+        let (outputs, first_probe_declined) = match self
+            .function_call_outputs_with_projection_scope(expr, depth + 1, owner_span, Some(scope))
+        {
+            Ok(Some(outputs)) => (Some(outputs), false),
+            Ok(None) => (None, true),
+            Err(err) if err.is_projection_budget_exceeded() => (None, false),
             Err(err) => return Err(err),
         };
         if let Some(outputs) = outputs {
@@ -3518,6 +3534,9 @@ impl<'a> FunctionProjectionAnalysis<'a> {
             Err(err) => return Err(err),
         };
         let Some(outputs) = outputs else {
+            if first_probe_declined && is_direct_single_array_output_call(expr, self.dae_model) {
+                return Ok(None);
+            }
             return Ok(Some(call));
         };
         if let [output] = outputs.as_slice() {
