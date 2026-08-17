@@ -149,6 +149,7 @@ jobs:
           name: architecture-review-scan
           path: target/review/review-scan.json
           if-no-files-found: ignore
+          retention-days: 7
 
       - name: Check generated Modelica parser is current
         shell: bash
@@ -165,6 +166,7 @@ jobs:
           name: crate-dag
           path: target/crate-dag/workspace-crate-dag.dot
           if-no-files-found: error
+          retention-days: 7
 
   # Reproducible build via the root crane+fenix flake. This independent check
   # uses the normal Nix substituters or a cold build; only the heavy MSL bundle
@@ -660,6 +662,7 @@ jobs:
           name: lsp-msl-benchmark-report
           path: target/lsp-msl-benchmark
           if-no-files-found: warn
+          retention-days: 7
 
   coverage-gate:
     name: Coverage Gate
@@ -999,6 +1002,7 @@ jobs:
             target/msl/results/omc_simulation_reference.json
             target/msl/results/sim_trace_comparison.json
           if-no-files-found: error
+          retention-days: 3
 
   msl-merge:
     name: MSL Quality Gate (merge + gate)
@@ -1321,6 +1325,7 @@ jobs:
             target/msl/results/msl_compatibility_report.md
             target/msl/results/msl_compatibility_report.json
           if-no-files-found: error
+          retention-days: 7
 
   modelicatest-gate:
     name: ModelicaTest Semantic Gate
@@ -1441,6 +1446,7 @@ jobs:
             target/msl/modelicatest-results/msl_results.json
             target/msl/modelicatest-results/modelica_test_catalog.md
           if-no-files-found: warn
+          retention-days: 7
 
   # ============================================================================
   # Documentation
@@ -1480,6 +1486,7 @@ jobs:
         with:
           name: documentation
           path: target/doc/
+          retention-days: 7
 
   # ============================================================================
   # VS Code Extension
@@ -1620,6 +1627,7 @@ jobs:
         with:
           name: wasm-package
           path: packages/rumoca/dist/
+          retention-days: 7
 
       - name: Upload Pages artifact
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -1821,12 +1829,14 @@ jobs:
         with:
           name: ${{ matrix.rumoca_asset }}
           path: ./target/${{ matrix.target }}/release/rumoca${{ startsWith(matrix.target, 'x86_64-pc-windows-') && '.exe' || '' }}
+          retention-days: 7
 
       - name: Upload LSP binary
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.lsp_asset }}
           path: ./target/${{ matrix.target }}/release/rumoca-lsp${{ startsWith(matrix.target, 'x86_64-pc-windows-') && '.exe' || '' }}
+          retention-days: 7
 
   build-python-wheels:
     name: Build Python (${{ matrix.name }})
@@ -1943,6 +1953,7 @@ jobs:
         with:
           name: wheels-${{ matrix.name }}
           path: dist
+          retention-days: 7
 
   build-python-sdist:
     name: Build Python sdist
@@ -1974,6 +1985,7 @@ jobs:
         with:
           name: wheels-sdist
           path: crates/rumoca-bind-python/dist
+          retention-days: 7
 
   # ============================================================================
   # Deployment (only on tags, after verification and build completion)
@@ -2155,6 +2167,7 @@ jobs:
         with:
           name: release-assets
           path: release-assets/
+          retention-days: 7
 
       - name: Publish VS Code extensions to marketplaces
         shell: bash
