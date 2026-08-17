@@ -91,10 +91,17 @@ Failure classifications:
 | Rule | Owner/Where | Brief Justification |
 |---|---|---|
 | Run the smallest focused check that proves changed behavior first | local workflow | Fast evidence before broad gates |
+| CI artifact retention MUST be explicit and policy-bound | GitHub Actions uploads | Reproducibility reviews need predictable diagnostic availability without treating CI storage as release distribution |
 | Required PR gates are selected by SPEC_0025 | PR workflow | One review source |
 | Commands not run MUST be reported with reason | final updates/PRs | Exposes residual risk |
 | Work is not done while temporary probes or symptom patches remain | all changes | Prevents cleanup debt |
 | Semantic work is done only after spec grounding, root-cause proof, and regression coverage | compiler/simulator | Fix must be defensible |
+
+GitHub Actions artifacts are short-lived CI handoffs: `msl-nix-closure-*`
+retains for 2 days, `shard-*` for 3 days, and every other CI artifact for 7
+days. Long-lived release artifacts belong in their canonical registries:
+GitHub Releases for release binaries, PyPI for Python packages, and npm for
+JavaScript packages.
 
 ## References
 

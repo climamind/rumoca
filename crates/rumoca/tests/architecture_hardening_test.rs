@@ -372,6 +372,71 @@ fn test_generated_parser_contract_is_pinned_and_documented() {
 }
 
 #[test]
+fn test_ci_upload_artifacts_have_explicit_policy_retention() {
+    let root = workspace_root();
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read CI workflow");
+    let mut artifacts = Vec::new();
+    let mut lines = ci.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        if line.trim() != "uses: actions/upload-artifact@v6" {
+            continue;
+        }
+
+        let mut name = None;
+        let mut retention_days = None;
+        while let Some(next_line) = lines.peek() {
+            let indentation = next_line
+                .chars()
+                .take_while(|character| character.is_whitespace())
+                .count();
+            if next_line.starts_with("      - ")
+                || (!next_line.trim().is_empty() && indentation <= 4)
+            {
+                break;
+            }
+            let next_line = lines.next().expect("peeked workflow line").trim();
+            if let Some(value) = next_line.strip_prefix("name: ") {
+                name = Some(value);
+            }
+            if let Some(value) = next_line.strip_prefix("retention-days: ") {
+                retention_days = Some(
+                    value
+                        .parse::<u8>()
+                        .expect("artifact retention-days must be an integer"),
+                );
+            }
+        }
+
+        artifacts.push((
+            name.expect("upload-artifact step must declare a name"),
+            retention_days,
+        ));
+    }
+
+    assert_eq!(
+        artifacts.len(),
+        14,
+        "CI must retain policy coverage for every upload-artifact step"
+    );
+
+    for (name, retention_days) in artifacts {
+        let expected_days = if name.starts_with("msl-nix-closure-") {
+            2
+        } else if name.starts_with("shard-") {
+            3
+        } else {
+            7
+        };
+        assert_eq!(
+            retention_days,
+            Some(expected_days),
+            "upload-artifact `{name}` must retain artifacts for {expected_days} days"
+        );
+    }
+}
+
+#[test]
 fn test_eval_crates_follow_ir_layer_mapping() {
     let root = workspace_root();
 
