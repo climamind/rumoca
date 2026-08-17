@@ -1616,6 +1616,7 @@ jobs:
         uses: actions/upload-pages-artifact@v3
         with:
           path: gh-pages/
+          retention-days: 1
 
   deploy-pages:
     name: Deploy Pages
