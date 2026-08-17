@@ -404,49 +404,12 @@ fn test_generated_parser_contract_is_pinned_and_documented() {
 fn test_ci_upload_artifacts_have_explicit_policy_retention() {
     let root = workspace_root();
     let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read CI workflow");
-    let mut artifacts = Vec::new();
-    let mut lines = ci.lines().peekable();
-
-    while let Some(line) = lines.next() {
-        if line.trim() != "uses: actions/upload-artifact@v6" {
-            continue;
-        }
-
-        let mut name = None;
-        let mut retention_days = None;
-        while let Some(next_line) = lines.peek() {
-            let indentation = next_line
-                .chars()
-                .take_while(|character| character.is_whitespace())
-                .count();
-            if next_line.starts_with("      - ")
-                || (!next_line.trim().is_empty() && indentation <= 4)
-            {
-                break;
-            }
-            let next_line = lines.next().expect("peeked workflow line").trim();
-            if let Some(value) = next_line.strip_prefix("name: ") {
-                name = Some(value);
-            }
-            if let Some(value) = next_line.strip_prefix("retention-days: ") {
-                retention_days = Some(
-                    value
-                        .parse::<u8>()
-                        .expect("artifact retention-days must be an integer"),
-                );
-            }
-        }
-
-        artifacts.push((
-            name.expect("upload-artifact step must declare a name"),
-            retention_days,
-        ));
-    }
+    let artifacts = ci_upload_artifacts(&ci);
 
     assert_eq!(
         artifacts.len(),
         14,
-        "CI must retain policy coverage for every upload-artifact step"
+        "CI must retain policy coverage for every standard upload-artifact step"
     );
 
     for (name, retention_days) in artifacts {
@@ -463,6 +426,95 @@ fn test_ci_upload_artifacts_have_explicit_policy_retention() {
             "upload-artifact `{name}` must retain artifacts for {expected_days} days"
         );
     }
+}
+
+#[test]
+fn test_ci_upload_artifact_scanner_accepts_inline_any_version_and_with_only() {
+    let artifacts = ci_upload_artifacts(
+        "jobs:\n  fixture:\n    steps:\n      - uses: actions/upload-artifact@v5\n        with:\n          name: inline-upload\n          retention-days: 7\n      - uses: actions/upload-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093\n        retention-days: 7\n        with:\n          name: retention-must-be-in-with\n",
+    );
+
+    assert_eq!(
+        artifacts,
+        vec![
+            ("inline-upload".to_string(), Some(7)),
+            ("retention-must-be-in-with".to_string(), None),
+        ],
+        "standard upload-artifact steps must be recognized at any version and read retention only from with"
+    );
+}
+
+fn ci_upload_artifacts(ci: &str) -> Vec<(String, Option<u8>)> {
+    let mut artifacts = Vec::new();
+    let mut lines = ci.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let Some(step_indentation) = standard_upload_artifact_step_indentation(line) else {
+            continue;
+        };
+        let mut name = None;
+        let mut retention_days = None;
+        let mut with_indentation = None;
+
+        while let Some(next_line) = lines.peek() {
+            let indentation = leading_whitespace(next_line);
+            let trimmed = next_line.trim();
+            if !trimmed.is_empty() && indentation <= step_indentation {
+                break;
+            }
+
+            let next_line = lines.next().expect("peeked workflow line");
+            if next_line.trim() == "with:" {
+                with_indentation = Some(indentation);
+                continue;
+            }
+            if with_indentation.is_none_or(|with_indentation| indentation <= with_indentation) {
+                continue;
+            }
+
+            let trimmed = next_line.trim();
+            if let Some(value) = trimmed.strip_prefix("name: ") {
+                name = Some(value.to_string());
+            }
+            if let Some(value) = trimmed.strip_prefix("retention-days: ") {
+                retention_days = Some(
+                    value
+                        .parse::<u8>()
+                        .expect("artifact retention-days must be an integer"),
+                );
+            }
+        }
+
+        artifacts.push((
+            name.expect("upload-artifact step must declare a name in with"),
+            retention_days,
+        ));
+    }
+
+    artifacts
+}
+
+fn standard_upload_artifact_step_indentation(line: &str) -> Option<usize> {
+    let indentation = leading_whitespace(line);
+    let action = line.trim_start();
+    let action_uses = action
+        .strip_prefix("- uses: ")
+        .map(|action| (action, indentation))
+        .or_else(|| {
+            action
+                .strip_prefix("uses: ")
+                .map(|action| (action, indentation.saturating_sub(2)))
+        });
+
+    action_uses.and_then(|(action, step_indentation)| {
+        action
+            .starts_with("actions/upload-artifact@")
+            .then_some(step_indentation)
+    })
+}
+
+fn leading_whitespace(line: &str) -> usize {
+    line.len() - line.trim_start().len()
 }
 
 #[test]
