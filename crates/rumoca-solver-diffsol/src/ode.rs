@@ -544,7 +544,6 @@ pub(crate) fn build_ode_problem_with_runtime_params_and_initial(
 }
 
 #[expect(
-    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "the reduced ODE builder assembles three stateful diffsol callbacks"
 )]
@@ -686,6 +685,10 @@ fn bdf_algebraic_settle(tol: f64) -> solve_eval::AlgebraicSettle {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the internal ODE builder owns independent root and runtime callback state"
+)]
 fn build_ode_problem_with_initial(
     model: &solve::SolveModel,
     opts: &SimOptions,

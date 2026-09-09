@@ -89,6 +89,11 @@ fn dae_template_context_projects_scheduled_times_and_preserves_provenance() {
         let rendered = renderer
             .render_with_name(builtin_template(target, "model.c.jinja"), "M")
             .unwrap_or_else(|err| panic!("{target} model.c should render: {err}"));
+        if target == "fmi3" {
+            assert!(rendered.contains("if (0.5 > time && (!defined || 0.5 < *next_time))"));
+            assert!(rendered.contains("*next_time = 0.5;"));
+            continue;
+        }
         let scheduled_array = rendered
             .split("static const double scheduled_events[] = {")
             .nth(1)

@@ -30,6 +30,7 @@ fn pkg_record_shape_env() -> VarEnv<f64> {
         rumoca_core::Subscript::generated_expr(Box::new(var("nX")), rumoca_core::Span::DUMMY),
     ));
     state_ctor.is_constructor = true;
+    state_ctor.def_id = Some(rumoca_core::DefId(100));
     funcs.insert("Pkg.State".to_string(), state_ctor);
 
     let mut set_state = rumoca_core::Function::new("Pkg.setState", rumoca_core::Span::DUMMY);
@@ -39,7 +40,9 @@ fn pkg_record_shape_env() -> VarEnv<f64> {
         rumoca_core::Subscript::generated_colon(rumoca_core::Span::DUMMY),
     ));
     set_state.add_output(
-        function_param("state", "State").with_type_class(rumoca_core::ClassType::Record),
+        function_param("state", "State")
+            .with_type_class(rumoca_core::ClassType::Record)
+            .with_type_def_id(rumoca_core::DefId(100)),
     );
     set_state.body = vec![rumoca_core::Statement::Assignment {
         comp: comp_ref("state"),
@@ -100,6 +103,7 @@ fn buildings_air_state_ctor() -> rumoca_core::Function {
         rumoca_core::Subscript::generated_expr(Box::new(var("nX")), rumoca_core::Span::DUMMY),
     ));
     state_ctor.is_constructor = true;
+    state_ctor.def_id = Some(rumoca_core::DefId(100));
     state_ctor
 }
 
@@ -146,7 +150,8 @@ fn buildings_air_set_state_ptx_with_x_padding() -> rumoca_core::Function {
     ));
     set_state.add_output(
         function_param("state", "ThermodynamicState")
-            .with_type_class(rumoca_core::ClassType::Record),
+            .with_type_class(rumoca_core::ClassType::Record)
+            .with_type_def_id(rumoca_core::DefId(100)),
     );
     set_state.body = vec![rumoca_core::Statement::Assignment {
         comp: comp_ref("state"),
@@ -367,6 +372,14 @@ fn test_eval_set_state_ptx_x_field_binds_shape_expr_variable() {
         span: rumoca_core::Span::DUMMY,
     }];
     funcs.insert("Buildings.Media.Air.density".to_string(), density);
+    funcs.insert(
+        "Buildings.Media.Air.ThermodynamicState".to_string(),
+        buildings_air_state_ctor(),
+    );
+    funcs.insert(
+        "Buildings.Media.Air.setState_pTX".to_string(),
+        buildings_air_set_state_ptx_with_x_padding(),
+    );
     env.functions = Arc::new(funcs);
 
     let state_x = field(
@@ -486,7 +499,8 @@ fn test_eval_user_function_binds_record_input_fields_from_constructor_argument()
             "BrushParameters",
             rumoca_core::Span::source_free_serde_default(),
         )
-        .with_type_class(rumoca_core::ClassType::Record),
+        .with_type_class(rumoca_core::ClassType::Record)
+        .with_type_def_id(rumoca_core::DefId(100)),
     );
     f.add_input(rumoca_core::FunctionParam::new(
         "i",
@@ -519,6 +533,13 @@ fn test_eval_user_function_binds_record_input_fields_from_constructor_argument()
         span: rumoca_core::Span::DUMMY,
     }];
     funcs.insert("Pkg.brushVoltageDrop".to_string(), f);
+    let mut constructor =
+        rumoca_core::Function::new("Pkg.BrushParameters", rumoca_core::Span::DUMMY);
+    constructor.is_constructor = true;
+    constructor.def_id = Some(rumoca_core::DefId(100));
+    constructor.add_input(function_param("V", "Real"));
+    constructor.add_input(function_param("ILinear", "Real"));
+    funcs.insert("Pkg.BrushParameters".to_string(), constructor);
     env.functions = Arc::new(funcs);
 
     let brush_parameters = rumoca_core::Expression::FunctionCall {
@@ -546,7 +567,8 @@ fn test_eval_user_function_binds_omitted_record_constructor_fields_from_metadata
             "BrushParameters",
             rumoca_core::Span::source_free_serde_default(),
         )
-        .with_type_class(rumoca_core::ClassType::Record),
+        .with_type_class(rumoca_core::ClassType::Record)
+        .with_type_def_id(rumoca_core::DefId(100)),
     );
     f.add_input(rumoca_core::FunctionParam::new(
         "i",
@@ -572,6 +594,7 @@ fn test_eval_user_function_binds_omitted_record_constructor_fields_from_metadata
     let mut constructor =
         rumoca_core::Function::new("Pkg.BrushParameters", rumoca_core::Span::DUMMY);
     constructor.is_constructor = true;
+    constructor.def_id = Some(rumoca_core::DefId(100));
     constructor.add_input(
         rumoca_core::FunctionParam::new("V", "Real", rumoca_core::Span::DUMMY)
             .with_default(lit(0.5)),
@@ -770,6 +793,7 @@ fn test_eval_function_record_field_array_infers_unknown_shape_from_named_arg() {
 
     let mut state = rumoca_core::Function::new("Pkg.State", rumoca_core::Span::DUMMY);
     state.is_constructor = true;
+    state.def_id = Some(rumoca_core::DefId(100));
     state.add_input(
         rumoca_core::FunctionParam::new(
             "X",
@@ -795,7 +819,8 @@ fn test_eval_function_record_field_array_infers_unknown_shape_from_named_arg() {
             "State",
             rumoca_core::Span::source_free_serde_default(),
         )
-        .with_type_class(rumoca_core::ClassType::Record),
+        .with_type_class(rumoca_core::ClassType::Record)
+        .with_type_def_id(rumoca_core::DefId(100)),
     );
     make_state.body = vec![rumoca_core::Statement::Assignment {
         comp: comp_ref("out"),

@@ -445,15 +445,6 @@ fn explicit_root_class_name(
         .map(|qualified| crate::path_utils::leaf_segment(qualified).to_string())
 }
 
-fn populate_flat_symbol_ancestry(flat: &mut flat::Model, class_index: &ast::ClassDefIndex<'_>) {
-    let mut def_ids = class_index.symbol_def_ids().collect::<Vec<_>>();
-    def_ids.sort_by_key(|def_id| def_id.index());
-    flat.symbol_ancestry = def_ids
-        .into_iter()
-        .map(|def_id| (def_id, class_index.def_ancestry(def_id)))
-        .collect();
-}
-
 fn seed_flat_functions_from_context(ctx: &Context, flat: &mut flat::Model) {
     for func in ctx.functions.values() {
         if !flat.functions.contains_key(&func.name) {

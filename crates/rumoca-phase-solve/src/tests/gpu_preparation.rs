@@ -90,7 +90,7 @@ fn gpu_initial_family_fixture_at(
         .push(dae::StructuredEquationFamily {
             domain: rumoca_core::StructuredIndexDomain { binders },
             first_equation_index: 0,
-            equation_counts: vec![1; values.len()],
+            equations_per_point: 1,
             span: spans[0],
             origin: "structured initial fixture".to_string(),
             regular: Some(rumoca_core::RegularForFamily {
@@ -672,7 +672,7 @@ fn gpu_preparation_skips_empty_structured_domain_without_a_direct_node() {
                 }],
             },
             first_equation_index: 1,
-            equation_counts: Vec::new(),
+            equations_per_point: 0,
             span,
             origin: "empty structured initializer".to_string(),
             regular: Some(rumoca_core::RegularForFamily {
@@ -773,7 +773,7 @@ fn reverse_ordered_direct_dependency_fixture(span: rumoca_core::Span) -> dae::Da
             .push(dae::StructuredEquationFamily {
                 domain: domain.clone(),
                 first_equation_index,
-                equation_counts: vec![1, 1],
+                equations_per_point: 1,
                 span,
                 origin: origin.to_string(),
                 regular: Some(rumoca_core::RegularForFamily {
@@ -827,7 +827,6 @@ fn empty_structured_initial_family(
 ) -> dae::StructuredEquationFamily {
     let mut empty = template.clone();
     empty.domain.binders[0].upper = 0;
-    empty.equation_counts.clear();
     empty.span = span;
     empty
 }

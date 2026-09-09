@@ -1337,12 +1337,7 @@ fn sync_structured_partition_templates(
         let Some(template) = family.template.as_ref() else {
             continue;
         };
-        if template.body.is_empty()
-            || !family
-                .equation_counts
-                .iter()
-                .all(|count| *count == template.body.len())
-        {
+        if template.body.is_empty() || family.equations_per_point != template.body.len() {
             continue;
         }
         sync_structured_template_family(family, template, equations, var_dims)?;

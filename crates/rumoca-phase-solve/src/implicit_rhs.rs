@@ -896,19 +896,14 @@ fn match_unowned_residuals_to_free_algebraics(
     let incidence =
         rumoca_phase_structural::Incidence::new(eq_unknowns, equation_refs, unknown_names);
     let regular =
-        rumoca_phase_structural::maximum_regular_subsystem(&incidence).map_err(|err| {
-            implicit_rhs_contract_violation(
-                format!("match fallback residual algebraic targets: {err}"),
-                span,
-            )
-        })?;
-    let blocks =
-        rumoca_phase_structural::build_blt_from_incidence(&regular.incidence).map_err(|err| {
-            implicit_rhs_contract_violation(
-                format!("match fallback residual algebraic targets: {err}"),
-                span,
-            )
-        })?;
+        rumoca_phase_structural::maximum_regular_subsystem(&incidence, &vec![None; incidence.n_eq])
+            .map_err(|err| {
+                implicit_rhs_contract_violation(
+                    format!("match fallback residual algebraic targets: {err}"),
+                    span,
+                )
+            })?;
+    let blocks = regular.blocks;
     for block in blocks {
         match block {
             rumoca_phase_structural::BltBlock::Scalar { equation, unknown } => {

@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Evaluator regressions share environment and expression fixtures.
+// split plan: move array-shape and function-scope cases into child test modules.
+
 use super::*;
 use crate::dual::Dual;
 use indexmap::IndexMap;
@@ -429,7 +432,7 @@ fn singleton_array_output_collects_dense_index_assignment() {
 
     assert_eq!(
         eval_user_function_array_output_pub::<f64>(
-            &rumoca_core::VarName::new("Pkg.singletonOutput"),
+            &rumoca_core::Reference::new("Pkg.singletonOutput"),
             &[],
             &env,
         ),
@@ -483,7 +486,7 @@ fn matrix_array_output_collects_dense_multidimensional_assignment() {
 
     assert_eq!(
         eval_user_function_array_output_pub::<f64>(
-            &rumoca_core::VarName::new("Pkg.matrixOutput"),
+            &rumoca_core::Reference::new("Pkg.matrixOutput"),
             &[],
             &env,
         ),
@@ -1261,6 +1264,7 @@ fn test_eval_index_on_flattened_env_array_with_dims() {
 fn test_eval_array_values_var_ref_colon_slice_from_env() {
     let mut env = VarEnv::<f64>::new();
     set_array_entries(&mut env, "v", &[3], &[10.0, 20.0, 30.0]);
+    Arc::make_mut(&mut env.dims).insert("v".to_string(), vec![3]);
 
     let expr = rumoca_core::Expression::VarRef {
         name: Reference::new("v"),
@@ -1278,6 +1282,7 @@ fn test_eval_array_values_var_ref_colon_slice_from_env() {
 fn test_eval_array_values_var_ref_range_slice_from_env() {
     let mut env = VarEnv::<f64>::new();
     set_array_entries(&mut env, "v", &[4], &[10.0, 20.0, 30.0, 40.0]);
+    Arc::make_mut(&mut env.dims).insert("v".to_string(), vec![4]);
 
     let expr = rumoca_core::Expression::VarRef {
         name: Reference::new("v"),
@@ -1912,6 +1917,7 @@ fn test_eval_record_constructor_input_skips_string_and_binds_array_field() {
 
     let mut state = Function::new("Pkg.State", rumoca_core::Span::DUMMY);
     state.is_constructor = true;
+    state.def_id = Some(rumoca_core::DefId(100));
     state.add_input(FunctionParam::new(
         "p",
         "Real",
@@ -1935,7 +1941,8 @@ fn test_eval_record_constructor_input_skips_string_and_binds_array_field() {
             "State",
             rumoca_core::Span::source_free_serde_default(),
         )
-        .with_type_class(rumoca_core::ClassType::Record),
+        .with_type_class(rumoca_core::ClassType::Record)
+        .with_type_def_id(rumoca_core::DefId(100)),
     );
     metric.add_output(
         FunctionParam::new("y", "Real", rumoca_core::Span::source_free_serde_default())

@@ -3488,7 +3488,13 @@ fn assignment_projection_resolves_dynamic_declared_dims() -> Result<(), LowerErr
         .push(function_param_with_dims("matrix", &[0, 0]));
 
     assert_eq!(
-        assignment_projection_dims(&function, "matrix", Some(vec![2, 2]), test_span(),)?,
+        assignment_projection_dims(
+            function.name.as_str(),
+            "matrix",
+            Some(vec![0, 0]),
+            Some(vec![2, 2]),
+            test_span()
+        )?,
         Some(vec![2, 2])
     );
     Ok(())
@@ -3593,22 +3599,10 @@ fn function_projection_binds_procedure_call_outputs() -> Result<(), LowerError> 
     .expect("procedure-style output call should project");
 
     assert!(
-        matches!(
-            outputs.as_slice(),
-            [rumoca_core::Expression::FunctionCall { args, .. }]
-                if matches!(
-                    args.as_slice(),
-                    [rumoca_core::Expression::Array { elements, .. }]
-                        if matches!(
-                            elements.as_slice(),
-                            [rumoca_core::Expression::Literal {
-                                value: Literal::Real(value),
-                                ..
-                            }] if *value == 2.0
-                        )
-                )
-        ),
-        "unexpected projected outputs: {outputs:?}"
+        matches!(outputs.as_slice(), [rumoca_core::Expression::Literal {
+            value: Literal::Real(value), ..
+        }] if *value == 2.0),
+        "procedure output must reach the nested scalar call: {outputs:?}"
     );
     Ok(())
 }
@@ -4119,46 +4113,6 @@ fn over_budget_function() -> rumoca_core::Function {
         derivatives: vec![],
         span: test_span(),
     }
-}
-
-fn expression_over_projection_budget(mut expr: rumoca_core::Expression) -> rumoca_core::Expression {
-    for _ in 0..12 {
-        expr = rumoca_core::Expression::Binary {
-            op: rumoca_core::OpBinary::Mul,
-            lhs: Box::new(expr.clone()),
-            rhs: Box::new(expr),
-            span: test_span(),
-        };
-    }
-    expr
-}
-
-fn over_budget_wrapper_call(
-    name: &str,
-    body: Vec<rumoca_core::Statement>,
-) -> (dae::Dae, rumoca_core::Expression) {
-    let explode = over_budget_function();
-    let mut wrapper = rumoca_core::Function::new(name, test_span());
-    wrapper.inputs.push(scalar_function_param("x"));
-    wrapper.outputs.push(scalar_function_param("y"));
-    wrapper.body = body;
-
-    let mut dae_model = dae::Dae::default();
-    dae_model
-        .symbols
-        .functions
-        .insert(explode.name.clone(), explode);
-    dae_model
-        .symbols
-        .functions
-        .insert(wrapper.name.clone(), wrapper);
-    let call = rumoca_core::Expression::FunctionCall {
-        name: rumoca_core::VarName::new(name).into(),
-        args: vec![real(2.0)],
-        is_constructor: false,
-        span: test_span(),
-    };
-    (dae_model, call)
 }
 
 fn over_budget_array_function() -> rumoca_core::Function {

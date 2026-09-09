@@ -1,3 +1,7 @@
+// SPEC_0021 file-size exception: dynamic array selection still combines record
+// slice projection, compile-time indexing, and runtime selection. split plan:
+// move record slice paths and runtime index lowering into separate modules.
+
 //! Dynamic array, record, and function-output selection.
 
 use super::inference::concrete_i64_dims;
@@ -67,24 +71,6 @@ fn collect_function_output_slice_indices(
         current.pop();
     }
     Ok(())
-}
-
-fn collect_full_shape_binding_keys(
-    base_name: &str,
-    shape: &[usize],
-    depth: usize,
-    current: &mut Vec<usize>,
-    keys: &mut Vec<String>,
-) {
-    if depth == shape.len() {
-        keys.push(format_subscript_binding_key(base_name, current));
-        return;
-    }
-    for index in 1..=shape[depth] {
-        current.push(index);
-        collect_full_shape_binding_keys(base_name, shape, depth + 1, current, keys);
-        current.pop();
-    }
 }
 
 struct RecordArraySliceFieldPath<'a> {
@@ -600,7 +586,7 @@ impl<'a> LowerBuilder<'a> {
                 let const_scope = self.compile_time_slice_bindings(scope);
                 self.eval_compile_time_positive_index_at(
                     expr,
-                    &const_scope,
+                    const_scope,
                     "array singleton projection subscript",
                     span,
                 )

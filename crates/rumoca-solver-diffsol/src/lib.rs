@@ -529,15 +529,13 @@ fn simulate_state_only_bdf(
         &mut params,
         &mut current_t,
     )?;
-    let current_state = current_y[..model.state_scalar_count()].to_vec();
-    let mut samples = SampleRecorder {
-        runtime: Some(runtime.as_ref()),
-        model,
-        recorded_times: &mut recorded_times,
-        data: &mut data,
-    };
     record_initial_samples(
-        &mut samples,
+        &mut SampleRecorder {
+            runtime: Some(runtime.as_ref()),
+            model,
+            recorded_times: &mut recorded_times,
+            data: &mut data,
+        },
         runtime.as_ref(),
         equilibrium_model,
         opts.atol.max(1.0e-10),
@@ -554,10 +552,9 @@ fn simulate_state_only_bdf(
         &runtime_params,
         &algebraic_warm_start,
         current_t,
-        &current_state,
+        &current_y[..model.state_scalar_count()],
         runtime,
     );
-    let accepted_solver_y = algebraic_warm_start.0.clone();
     let root_start_time = problem_input.root_start_time.clone();
     let root_start_mode = problem_input.root_start_mode.clone();
     let problem =
@@ -565,7 +562,7 @@ fn simulate_state_only_bdf(
     let state = initial_state_only_bdf_state(
         runtime,
         &problem,
-        &current_state,
+        &current_y[..model.state_scalar_count()],
         &params,
         opts,
         &algebraic_warm_start,
@@ -583,7 +580,7 @@ fn simulate_state_only_bdf(
         runtime_params: runtime_params.clone(),
         root_start_time,
         root_start_mode,
-        accepted_solver_y: Some(accepted_solver_y),
+        accepted_solver_y: Some(algebraic_warm_start.0.clone()),
         opts,
         mode: DiffsolMode::StateOnly,
     });
@@ -1008,13 +1005,6 @@ where
                 Err(error)
             }
         }
-    }
-
-    fn prefer_exact_output_steps(&self) -> bool {
-        // The shared driver already stops at runtime event boundaries. Forcing
-        // BDF to land on every output sample compresses its multistep history on
-        // dense output grids and can collapse otherwise smooth state-only runs.
-        false
     }
 
     fn project_algebraics(

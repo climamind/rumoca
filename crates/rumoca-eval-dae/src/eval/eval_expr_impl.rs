@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Expression dispatch shares evaluator scope and shape semantics.
+// split plan: extract aggregate expression handlers into child modules.
+
 use super::*;
 use rumoca_core::ExpressionVisitor;
 

@@ -9,20 +9,27 @@ impl FunctionProjectionAnalysis<'_> {
         owner_span: rumoca_core::Span,
     ) -> Result<(), LowerError> {
         for param in function.outputs.iter().chain(function.locals.iter()) {
-            self.initialize_projected_declared_param(param, scope, depth + 1, owner_span)?;
-            self.initialize_projected_record_fields(param, scope, depth + 1, owner_span)?;
+            self.initialize_projected_declared_param(
+                function,
+                param,
+                scope,
+                depth + 1,
+                owner_span,
+            )?;
+            self.initialize_projected_record_fields(function, param, scope, depth + 1, owner_span)?;
         }
         Ok(())
     }
 
     fn initialize_projected_declared_param(
         &self,
+        function: &rumoca_core::Function,
         param: &rumoca_core::FunctionParam,
         scope: &mut FunctionProjectionScope,
         depth: usize,
         owner_span: rumoca_core::Span,
     ) -> Result<(), LowerError> {
-        if self.initialize_declared_default(param, scope, depth + 1, owner_span)? {
+        if self.initialize_declared_default(function, param, scope, depth + 1, owner_span)? {
             return Ok(());
         }
         let param_span = inherited_projection_span(param.span, owner_span);
@@ -54,6 +61,7 @@ impl FunctionProjectionAnalysis<'_> {
 
     fn initialize_projected_record_fields(
         &self,
+        function: &rumoca_core::Function,
         param: &rumoca_core::FunctionParam,
         scope: &mut FunctionProjectionScope,
         depth: usize,
@@ -77,8 +85,20 @@ impl FunctionProjectionAnalysis<'_> {
         for field in &constructor.inputs {
             let mut scoped_field = field.clone();
             scoped_field.name = format!("{}.{}", param.name, field.name);
-            self.initialize_projected_declared_param(&scoped_field, scope, depth + 1, owner_span)?;
-            self.initialize_projected_record_fields(&scoped_field, scope, depth + 1, owner_span)?;
+            self.initialize_projected_declared_param(
+                function,
+                &scoped_field,
+                scope,
+                depth + 1,
+                owner_span,
+            )?;
+            self.initialize_projected_record_fields(
+                function,
+                &scoped_field,
+                scope,
+                depth + 1,
+                owner_span,
+            )?;
         }
         Ok(())
     }

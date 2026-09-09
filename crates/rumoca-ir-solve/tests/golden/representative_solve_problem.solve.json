@@ -161,6 +161,7 @@
     "algebraic_projection_plan": {
       "blocks": [
         {
+          "causal_steps": [],
           "rows": [
             1
           ],

@@ -169,6 +169,7 @@ fn equation_qualification_resolves_member_from_nearest_parent_instance_scope() {
         &qualify::ImportMap::default(),
         None,
         &ctx,
+        None,
     )
     .unwrap();
 

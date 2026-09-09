@@ -137,21 +137,24 @@ fn function_call_unselected_projected_scalars(
             owner_span,
         )?;
         for output in outputs {
-            if let Some(expr) =
+            let Some(expr) =
                 analysis.project_output_field_value(output, field, &scope, owner_span)?
+            else {
+                continue;
+            };
+            let dims = analysis
+                .expr_dims_with_owner(&expr, &scope, 0, owner_span)?
+                .unwrap_or_default();
+            if dims.is_empty() {
+                selected.push(expr);
+                continue;
+            }
+            if let Some(mut scalars) =
+                analysis.project_value_scalars(&expr, &dims, &scope, 0, owner_span)?
             {
-                let dims = analysis
-                    .expr_dims_with_owner(&expr, &scope, 0, owner_span)?
-                    .unwrap_or_default();
-                if dims.is_empty() {
-                    selected.push(expr);
-                } else if let Some(mut scalars) =
-                    analysis.project_value_scalars(&expr, &dims, &scope, 0, owner_span)?
-                {
-                    selected.append(&mut scalars);
-                } else {
-                    selected.push(expr);
-                }
+                selected.append(&mut scalars);
+            } else {
+                selected.push(expr);
             }
         }
         if !selected.is_empty() {
@@ -171,7 +174,7 @@ fn function_call_unselected_projected_scalars(
         .map(Some);
     }
     if let Some(values) =
-        projected_qualified_function_output_scalars(expr, dae_model, &analysis, owner_span)?
+        projected_qualified_function_output_scalars(expr, dae_model, analysis, owner_span)?
     {
         return Ok(Some(values));
     }

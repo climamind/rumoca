@@ -766,10 +766,10 @@ fn unprojectable_array_output_declines_scalar_lane_fallback_and_uses_array_runti
     dae_model
         .variables
         .parameters
-        .insert(rumoca_core::VarName::new("u"), scalar_var("u"));
+        .insert(rumoca_core::VarName::new("u"), source_scalar_var("u"));
     dae_model.variables.algebraics.insert(
         rumoca_core::VarName::new("target"),
-        array_var("target", &[2]),
+        source_array_var("target", &[2]),
     );
     dae_model
         .symbols

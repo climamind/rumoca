@@ -1033,7 +1033,7 @@ mod tests {
                             stride: 1,
                         }],
                     });
-                    "affine load stride does not point at LoadY or LoadP"
+                    "affine load stride does not point at LoadY, LoadP, or LoadSeed"
                 }
                 2 => {
                     const_strides[0].terms[0].dimension = 1;
@@ -1048,14 +1048,17 @@ mod tests {
 
             let error = settle_gpu_initial_conditions(&model, 0.0)
                 .expect_err("malformed affine metadata must fail shared semantic admission");
-            assert!(matches!(
-                error,
-                GpuInitializationError::Malformed {
-                    ref message,
-                    span: Some(actual),
-                    ..
-                } if message.contains(expected) && actual == owner_span
-            ));
+            assert!(
+                matches!(
+                    error,
+                    GpuInitializationError::Malformed {
+                        ref message,
+                        span: Some(actual),
+                        ..
+                    } if message.contains(expected) && actual == owner_span
+                ),
+                "case {malformed}: expected {expected}; got {error}"
+            );
         }
     }
 

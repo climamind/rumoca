@@ -30,6 +30,7 @@ fn named_arg(name: &str, value: Expression, span: Span) -> Expression {
 fn record_constructor(span: Span) -> Function {
     let mut constructor = Function::new("Pkg.Record", span);
     constructor.is_constructor = true;
+    constructor.def_id = Some(rumoca_core::DefId(8101));
     constructor.add_input(FunctionParam::new("a", "Real", span));
     constructor.add_input(FunctionParam::new("b", "Real", span));
     constructor
@@ -37,8 +38,11 @@ fn record_constructor(span: Span) -> Function {
 
 fn function_with_record_input(span: Span) -> Function {
     let mut function = Function::new("Pkg.f", span);
-    function
-        .add_input(FunctionParam::new("r", "Pkg.Record", span).with_type_class(ClassType::Record));
+    function.add_input(
+        FunctionParam::new("r", "Pkg.Record", span)
+            .with_type_class(ClassType::Record)
+            .with_type_def_id(rumoca_core::DefId(8101)),
+    );
     function.add_output(FunctionParam::new("y", "Real", span));
     function
 }

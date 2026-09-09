@@ -99,7 +99,7 @@ pub use special::{
 };
 use special::{
     copy_record_function_output_fields, eval_function_call, function_closure_from_arg,
-    resolve_user_function_reference_target,
+    resolve_user_function_reference_target, set_state_array_field_arg_index,
 };
 mod eval_expr_impl;
 use array_eval::{

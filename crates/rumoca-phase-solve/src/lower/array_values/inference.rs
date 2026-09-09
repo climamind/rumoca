@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Array shape inference shares expression and binding resolution.
+// split plan: separate binding shape inference from expression shape inference.
+
 use super::*;
 use crate::lower::function_projection::FunctionOutputProjection;
 

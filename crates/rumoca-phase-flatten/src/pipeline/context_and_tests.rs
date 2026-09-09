@@ -2,9 +2,7 @@
 // symbolic dimension reconciliation, and class-instance flatten entry wiring.
 // split plan: move dimension inference/reconciliation helpers into a dedicated
 // pipeline::dimensions module after the current redeclare/package-scope merge.
-use super::context_import_shadowing::{
-    imports_without_shadowed_aliases, qualify_expression_with_effective_imports,
-};
+use super::context_import_shadowing::qualify_expression_with_effective_imports;
 use super::enum_dimensions::{enum_type_dimension, infer_enum_range_dimensions};
 use super::*;
 
@@ -2665,10 +2663,6 @@ pub(crate) fn qualify_expression_imports_with_def_map_ctx(
         instance_name.as_deref(),
         locals,
     )
-}
-
-pub(super) fn resolved_path_has_import_alias(resolved_path: &str, alias: &str) -> bool {
-    rumoca_core::top_level_last_segment(resolved_path) == alias
 }
 
 #[cfg(test)]

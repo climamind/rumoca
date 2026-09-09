@@ -395,7 +395,7 @@ fn initialization_projection_prefers_explicit_algebraic_row_target_over_state_de
 }
 
 #[test]
-fn initialization_projection_does_not_infer_algebraic_targets_from_continuous_rows() {
+fn initialization_projection_includes_continuous_algebraic_residuals() {
     let mut dae_model = dae::Dae::default();
     dae_model
         .variables
@@ -439,8 +439,8 @@ fn initialization_projection_does_not_infer_algebraic_targets_from_continuous_ro
         .collect::<BTreeSet<_>>();
 
     assert!(
-        !projected.contains(&u_idx),
-        "continuous-derived rows without explicit targets are handled by continuous algebraic projection"
+        projected.contains(&u_idx),
+        "initialization must satisfy continuous algebraic residuals before integration"
     );
     assert!(
         projected.contains(&z_idx),

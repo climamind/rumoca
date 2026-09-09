@@ -441,8 +441,8 @@ pub(crate) fn lower_record_function_params(flat: &mut flat::Model) -> Result<(),
     // record types cannot legally be recursive, so the fixpoint is bounded by
     // the deepest record nesting in the model.
     const MAX_RECORD_NESTING_PASSES: usize = 32;
-    for _ in 0..MAX_RECORD_NESTING_PASSES {
-        if !lower_record_function_params_once(flat)? {
+    for pass in 0..MAX_RECORD_NESTING_PASSES {
+        if !lower_record_function_params_once(flat, pass == 0)? {
             return Ok(());
         }
     }
@@ -453,7 +453,10 @@ pub(crate) fn lower_record_function_params(flat: &mut flat::Model) -> Result<(),
 }
 
 /// One decomposition pass. Returns whether any record parameter was decomposed.
-fn lower_record_function_params_once(flat: &mut flat::Model) -> Result<bool, FlattenError> {
+fn lower_record_function_params_once(
+    flat: &mut flat::Model,
+    recover_existing_inputs: bool,
+) -> Result<bool, FlattenError> {
     let mut record_fields_by_function_input = HashMap::new();
     let mut record_metadata_by_exposure = HashMap::new();
     for (function_name, function) in &flat.functions {
@@ -503,6 +506,7 @@ fn lower_record_function_params_once(flat: &mut flat::Model) -> Result<bool, Fla
                 record_fields_by_function_input.get(&(func_name.clone(), idx))
             {
                 decomposed.push(DecomposedParam {
+                    original_input_count: func.inputs.len(),
                     original_index: idx,
                     param_name: input.name.clone(),
                     type_name: input.type_name.clone(),
@@ -513,6 +517,12 @@ fn lower_record_function_params_once(flat: &mut flat::Model) -> Result<bool, Fla
             }
         }
         if decomposed.is_empty() {
+            // Recover pre-flattened signatures once. Later passes already have
+            // rewritten actuals and must not infer another decomposition from
+            // the generated underscore-separated parameter names.
+            if !recover_existing_inputs {
+                continue;
+            }
             let already_decomposed =
                 infer_existing_decomposed_params(func, &record_constructor_fields);
             if !already_decomposed.is_empty() {
@@ -586,7 +596,7 @@ fn rewrite_decomposed_record_call_sites(
     for eq in &mut flat.equations {
         decompose_record_call_args_in_expr(
             &mut eq.residual,
-            &decomposition_map,
+            decomposition_map,
             None,
             &flat_variable_names,
             &constructor_input_names_by_type,
@@ -595,7 +605,7 @@ fn rewrite_decomposed_record_call_sites(
     for eq in &mut flat.initial_equations {
         decompose_record_call_args_in_expr(
             &mut eq.residual,
-            &decomposition_map,
+            decomposition_map,
             None,
             &flat_variable_names,
             &constructor_input_names_by_type,
@@ -634,7 +644,7 @@ fn rewrite_decomposed_record_call_sites(
         if let Some(ref mut binding) = var.binding {
             decompose_record_call_args_in_expr(
                 binding,
-                &decomposition_map,
+                decomposition_map,
                 None,
                 &flat_variable_names,
                 &constructor_input_names_by_type,
@@ -643,7 +653,7 @@ fn rewrite_decomposed_record_call_sites(
         if let Some(ref mut start) = var.start {
             decompose_record_call_args_in_expr(
                 start,
-                &decomposition_map,
+                decomposition_map,
                 None,
                 &flat_variable_names,
                 &constructor_input_names_by_type,
@@ -652,7 +662,7 @@ fn rewrite_decomposed_record_call_sites(
         if let Some(ref mut min) = var.min {
             decompose_record_call_args_in_expr(
                 min,
-                &decomposition_map,
+                decomposition_map,
                 None,
                 &flat_variable_names,
                 &constructor_input_names_by_type,
@@ -661,7 +671,7 @@ fn rewrite_decomposed_record_call_sites(
         if let Some(ref mut max) = var.max {
             decompose_record_call_args_in_expr(
                 max,
-                &decomposition_map,
+                decomposition_map,
                 None,
                 &flat_variable_names,
                 &constructor_input_names_by_type,
@@ -670,7 +680,7 @@ fn rewrite_decomposed_record_call_sites(
         if let Some(ref mut nominal) = var.nominal {
             decompose_record_call_args_in_expr(
                 nominal,
-                &decomposition_map,
+                decomposition_map,
                 None,
                 &flat_variable_names,
                 &constructor_input_names_by_type,
@@ -682,7 +692,7 @@ fn rewrite_decomposed_record_call_sites(
         for stmt in &mut func.body {
             decompose_record_call_args_in_stmt(
                 stmt,
-                &decomposition_map,
+                decomposition_map,
                 local_record_params,
                 &flat_variable_names,
                 &constructor_input_names_by_type,
@@ -783,6 +793,9 @@ impl ExpressionRewriter for OverexpandedFunctionCallProjector {
             .signatures
             .get(name.as_str())
             .and_then(|inputs| {
+                if rewritten_args.len() == inputs.len() {
+                    return None;
+                }
                 project_actuals_to_input_slots_with_known_vars(
                     &rewritten_args,
                     inputs,
@@ -1218,6 +1231,7 @@ fn actual_leaf_name(actual: &rumoca_core::Expression) -> Option<&str> {
 }
 
 struct DecomposedParam {
+    original_input_count: usize,
     original_index: usize,
     param_name: String,
     type_name: String,
@@ -1361,8 +1375,10 @@ impl ExpressionRewriter for RecordCallArgDecomposer<'_> {
             span,
         } = expr
         {
-            let rewritten_args = self.rewrite_expressions(args);
-            let args = self.args_for_call(name, rewritten_args);
+            // Project against this pass's input signature before rewriting
+            // nested constructors, whose record slots may themselves expand.
+            let projected_args = self.args_for_call(name, args.to_vec());
+            let args = self.rewrite_expressions(&projected_args);
             return rumoca_core::Expression::FunctionCall {
                 name: name.clone(),
                 args,
@@ -1390,8 +1406,8 @@ impl StatementRewriter for RecordCallArgDecomposer<'_> {
             rewritten_comp.to_var_name().as_str().to_string(),
             rewritten_comp.clone(),
         );
-        let rewritten_args = self.rewrite_expressions(args);
-        let args = self.args_for_call(&call_name, rewritten_args);
+        let projected_args = self.args_for_call(&call_name, args.to_vec());
+        let args = self.rewrite_expressions(&projected_args);
         rumoca_core::Statement::FunctionCall {
             comp: rewritten_comp,
             args,
@@ -1537,6 +1553,7 @@ fn infer_existing_decomposed_params(
                     param.fields = merge_record_fields(&param.fields, &projected_fields);
                 })
                 .or_insert_with(|| DecomposedParam {
+                    original_input_count: func.inputs.len(),
                     original_index: idx,
                     param_name: prefix,
                     type_name: type_name.clone(),
@@ -1727,6 +1744,14 @@ fn project_already_decomposed_call_args(
     if !decomposed.iter().any(|param| param.already_decomposed) {
         return None;
     }
+    // Existing lowered signatures may be revisited after late collection.
+    // Arguments already occupying all slots are not whole-record actuals.
+    let complete_slots = decomposed.first().is_some_and(|param| {
+        old_args.len() == param.original_input_count
+            && !decomposed
+                .iter()
+                .any(|param| named_function_arg_value(old_args, &param.param_name).is_some())
+    });
     let mut args = old_args.to_vec();
     let mut changed = false;
     for (param_idx, dp) in decomposed.iter().enumerate() {
@@ -1748,7 +1773,7 @@ fn project_already_decomposed_call_args(
             changed = true;
         }
     }
-    changed.then_some(args)
+    (changed || complete_slots).then_some(args)
 }
 
 fn project_decomposed_scalar_actuals(
@@ -2038,6 +2063,7 @@ fn named_function_arg_value<'a>(
     })
 }
 
+#[cfg(test)]
 fn named_function_arg(
     arg: &rumoca_core::Expression,
 ) -> Option<(&str, &rumoca_core::Expression, rumoca_core::Span)> {
@@ -2056,6 +2082,7 @@ fn named_function_arg(
     Some((name, value, *span))
 }
 
+#[cfg(test)]
 fn named_function_arg_marker(
     name: String,
     value: rumoca_core::Expression,
@@ -2782,8 +2809,13 @@ mod tests {
         Some(name)
     }
 
-    fn record_constructor_named(name: &str, fields: &[&str]) -> rumoca_core::Function {
+    fn record_constructor_named(
+        name: &str,
+        fields: &[&str],
+        def_id: rumoca_core::DefId,
+    ) -> rumoca_core::Function {
         let mut constructor = rumoca_core::Function::new(name, Span::DUMMY);
+        constructor.def_id = Some(def_id);
         constructor.is_constructor = true;
         for field in fields {
             constructor.add_input(rumoca_core::FunctionParam::new(*field, "Real", test_span()));
@@ -3026,7 +3058,7 @@ mod tests {
     }
 
     #[test]
-    fn record_param_lowering_projects_equal_arity_field_access_actuals_before_positional_guard() {
+    fn record_param_lowering_preserves_equal_arity_positional_field_arguments() {
         let mut flat = flat::Model::new();
         let mut function = rumoca_core::Function::new("Pkg.recordProjection", Span::DUMMY);
         for input in ["a", "b"] {
@@ -3056,7 +3088,7 @@ mod tests {
         let rumoca_core::Expression::FunctionCall { args, .. } = &flat.equations[0].residual else {
             panic!("expected function call");
         };
-        assert_eq!(args, &vec![field_a, field_b]);
+        assert_eq!(args, &vec![field_b, field_a]);
     }
 
     #[test]
@@ -3324,7 +3356,7 @@ mod tests {
     }
 
     #[test]
-    fn record_param_lowering_projects_flattened_scalar_constructor_fields_with_default_tail() {
+    fn record_param_lowering_preserves_explicit_positional_default_tail_slot() {
         let mut flat = flat::Model::new();
         flat.variables.insert(
             VarName::new("voltageSource.P"),
@@ -3367,15 +3399,16 @@ mod tests {
         let rumoca_core::Expression::FunctionCall { args, .. } = &flat.equations[0].residual else {
             panic!("expected function call");
         };
-        assert_eq!(args.len(), 2);
-        assert!(matches!(
-            &args[0],
-            rumoca_core::Expression::VarRef { name, .. } if name.as_str() == "voltageSource.P"
-        ));
-        assert!(matches!(
-            &args[1],
-            rumoca_core::Expression::VarRef { name, .. } if name.as_str() == "voltageSource.Q"
-        ));
+        // A declared default does not make an explicitly supplied positional
+        // argument disappear; projected-looking names are not an arity proof.
+        assert_eq!(
+            args,
+            &vec![
+                var_ref("voltageSource.P.re"),
+                var_ref("voltageSource.P.im"),
+                var_ref("voltageSource.Q"),
+            ]
+        );
     }
 
     #[test]
@@ -3384,6 +3417,7 @@ mod tests {
         flat.add_function(record_constructor_named(
             "Pkg.Record",
             &["phase", "h", "d", "T", "p"],
+            INNER_DEF_ID,
         ));
 
         let mut function = rumoca_core::Function::new("Pkg.pressure", Span::DUMMY);
@@ -3453,6 +3487,7 @@ mod tests {
         flat.add_function(record_constructor_named(
             "Pkg.Record",
             &["phase", "h", "d", "T", "p"],
+            INNER_DEF_ID,
         ));
 
         let mut function = rumoca_core::Function::new("Pkg.pressure", Span::DUMMY);
@@ -3529,6 +3564,7 @@ mod tests {
         flat.add_function(record_constructor_named(
             "Pkg.Record",
             &["phase", "h", "d", "T", "p"],
+            INNER_DEF_ID,
         ));
 
         let mut function = rumoca_core::Function::new("Pkg.pressure", Span::DUMMY);
@@ -3644,6 +3680,15 @@ mod tests {
             panic!("expected function call");
         };
         assert_eq!(args.len(), 2);
+        let args = args
+            .iter()
+            .zip(["r_a", "r_b"])
+            .map(|(arg, expected_slot)| {
+                let (slot, value, _) = named_function_arg(arg).expect("named field argument");
+                assert_eq!(slot, expected_slot);
+                value
+            })
+            .collect::<Vec<_>>();
         assert!(matches!(
             &args[0],
             rumoca_core::Expression::VarRef { name, .. } if name.as_str() == "rec.a"
@@ -3658,7 +3703,11 @@ mod tests {
     fn record_param_lowering_does_not_positionally_expand_mismatched_constructor() {
         let mut flat = flat::Model::new();
         flat.add_function(record_constructor());
-        flat.add_function(record_constructor_named("Pkg.OtherRecord", &["x", "y"]));
+        flat.add_function(record_constructor_named(
+            "Pkg.OtherRecord",
+            &["x", "y"],
+            INNER_DEF_ID,
+        ));
         flat.add_function(function_with_record_input());
         flat.add_equation(flat::Equation::new(
             rumoca_core::Expression::FunctionCall {
@@ -3747,11 +3796,13 @@ mod tests {
         let mut function = rumoca_core::Function::new("Pkg.combine", Span::DUMMY);
         function.add_input(
             rumoca_core::FunctionParam::new("left", "Pkg.Record", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(RECORD_DEF_ID),
         );
         function.add_input(
             rumoca_core::FunctionParam::new("right", "Pkg.Record", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(RECORD_DEF_ID),
         );
         function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span()));
         function.body.push(assignment_to(
@@ -3828,7 +3879,8 @@ mod tests {
         ));
         function.add_input(
             rumoca_core::FunctionParam::new("r", "Pkg.Record", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(RECORD_DEF_ID),
         );
         function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span()));
         flat.add_function(function);
@@ -3869,7 +3921,11 @@ mod tests {
     fn record_param_lowering_uses_mismatched_constructor_positional_field_values() {
         let mut flat = flat::Model::new();
         flat.add_function(record_constructor());
-        flat.add_function(record_constructor_named("Pkg.OtherRecord", &["x", "y"]));
+        flat.add_function(record_constructor_named(
+            "Pkg.OtherRecord",
+            &["x", "y"],
+            INNER_DEF_ID,
+        ));
 
         let mut function = rumoca_core::Function::new("Pkg.withScale", Span::DUMMY);
         function.add_input(rumoca_core::FunctionParam::new(
@@ -3879,7 +3935,8 @@ mod tests {
         ));
         function.add_input(
             rumoca_core::FunctionParam::new("r", "Pkg.Record", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(RECORD_DEF_ID),
         );
         function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span()));
         flat.add_function(function);
@@ -3949,13 +4006,17 @@ mod tests {
     #[test]
     fn record_param_lowering_projects_mismatched_constructor_fields_from_flat_namespace() {
         let mut flat = flat::Model::new();
-        flat.add_function(record_constructor_named(
+        let mut constructor = record_constructor_named(
             "Pkg.EfficiencyParameters",
             &["V_flow", "eta"],
-        ));
+            RECORD_DEF_ID,
+        );
+        constructor.def_id = Some(RECORD_DEF_ID);
+        flat.add_function(constructor);
         flat.add_function(record_constructor_named(
             "Pkg.Generic",
             &["pressure_V_flow", "pressure_dp"],
+            INNER_DEF_ID,
         ));
         flat.add_variable(
             rumoca_core::VarName::new("per.hydraulicEfficiency.V_flow"),
@@ -3969,7 +4030,8 @@ mod tests {
         let mut function = rumoca_core::Function::new("Pkg.efficiency", Span::DUMMY);
         function.add_input(
             rumoca_core::FunctionParam::new("per", "Pkg.EfficiencyParameters", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(RECORD_DEF_ID),
         );
         function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span()));
         flat.add_function(function);
@@ -3998,10 +4060,11 @@ mod tests {
         ));
 
         let flat_variable_names = flat.variables.keys().cloned().collect::<HashSet<_>>();
-        let fields = record_fields_from_constructor_metadata(
+        let (_, fields) = record_fields_from_constructor_metadata(
             &flat.functions,
             "Pkg.EfficiencyParameters",
-            None,
+            Some(RECORD_DEF_ID),
+            test_span(),
         )
         .expect("record fields");
         let probe_actuals = [
@@ -4025,6 +4088,15 @@ mod tests {
             panic!("expected function call");
         };
         assert_eq!(args.len(), 2);
+        let args = args
+            .iter()
+            .zip(["per_V_flow", "per_eta"])
+            .map(|(arg, expected_slot)| {
+                let (slot, value, _) = named_function_arg(arg).expect("named field argument");
+                assert_eq!(slot, expected_slot);
+                value
+            })
+            .collect::<Vec<_>>();
         assert!(matches!(
             &args[0],
             rumoca_core::Expression::VarRef { name, .. }
@@ -4040,10 +4112,15 @@ mod tests {
     #[test]
     fn record_param_lowering_does_not_synthesize_missing_fields_from_partial_prefix() {
         let mut flat = flat::Model::new();
-        flat.add_function(record_constructor_named("Medium.State", &["p", "T", "X"]));
+        flat.add_function(record_constructor_named(
+            "Medium.State",
+            &["p", "T", "X"],
+            RECORD_DEF_ID,
+        ));
         flat.add_function(record_constructor_named(
             "Medium.setState_phX",
             &["p", "h", "X"],
+            INNER_DEF_ID,
         ));
         flat.add_variable(
             rumoca_core::VarName::new("port_a.p"),
@@ -4061,7 +4138,8 @@ mod tests {
         let mut density = rumoca_core::Function::new("Medium.density", Span::DUMMY);
         density.add_input(
             rumoca_core::FunctionParam::new("state", "Medium.State", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(RECORD_DEF_ID),
         );
         density.add_output(rumoca_core::FunctionParam::new("d", "Real", test_span()));
         flat.add_function(density);
@@ -4114,16 +4192,19 @@ mod tests {
         flat.add_function(record_constructor_named(
             "Modelica.Media.Interfaces.PartialSimpleMedium.ThermodynamicState",
             &["p", "T"],
+            INNER_DEF_ID,
         ));
         flat.add_function(record_constructor_named(
             "Buildings.Media.Air.ThermodynamicState",
             &["p", "T", "X"],
+            RECORD_DEF_ID,
         ));
 
         let mut function = rumoca_core::Function::new("Buildings.Media.Air.h", Span::DUMMY);
         function.add_input(
             rumoca_core::FunctionParam::new("state", "ThermodynamicState", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(RECORD_DEF_ID),
         );
         function.add_output(rumoca_core::FunctionParam::new("h", "Real", test_span()));
         function.body.push(assignment_to(
@@ -4172,17 +4253,20 @@ mod tests {
         flat.add_function(record_constructor_named(
             "Modelica.Media.Interfaces.PartialSimpleMedium.ThermodynamicState",
             &["p", "T"],
+            INNER_DEF_ID,
         ));
         flat.add_function(record_constructor_named(
             "Buildings.Media.Air.ThermodynamicState",
             &["p", "T", "X"],
+            RECORD_DEF_ID,
         ));
 
         let mut function =
             rumoca_core::Function::new("Buildings.Media.Water.temperature", Span::DUMMY);
         function.add_input(
             rumoca_core::FunctionParam::new("state", "ThermodynamicState", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(INNER_DEF_ID),
         );
         function.add_output(rumoca_core::FunctionParam::new("T", "Real", test_span()));
         function.body.push(assignment_to(
@@ -4215,10 +4299,12 @@ mod tests {
         flat.add_function(record_constructor_named(
             "Pkg.EfficiencyParameters",
             &["V_flow", "eta"],
+            RECORD_DEF_ID,
         ));
         flat.add_function(record_constructor_named(
             "Pkg.Generic",
             &["pressure_V_flow", "pressure_dp"],
+            INNER_DEF_ID,
         ));
         flat.add_variable(
             rumoca_core::VarName::new("per.pum[1].hydraulicEfficiency.V_flow"),
@@ -4232,7 +4318,8 @@ mod tests {
         let mut function = rumoca_core::Function::new("Pkg.efficiency", Span::DUMMY);
         function.add_input(
             rumoca_core::FunctionParam::new("per", "Pkg.EfficiencyParameters", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(RECORD_DEF_ID),
         );
         function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span()));
         flat.add_function(function);
@@ -4278,6 +4365,15 @@ mod tests {
             panic!("expected function call");
         };
         assert_eq!(args.len(), 2);
+        let args = args
+            .iter()
+            .zip(["per_V_flow", "per_eta"])
+            .map(|(arg, expected_slot)| {
+                let (slot, value, _) = named_function_arg(arg).expect("named field argument");
+                assert_eq!(slot, expected_slot);
+                value
+            })
+            .collect::<Vec<_>>();
         assert!(matches!(
             &args[0],
             rumoca_core::Expression::VarRef { name, .. }
@@ -4319,6 +4415,7 @@ mod tests {
         flat.add_function(record_constructor_named(
             "Pkg.EfficiencyParameters",
             &["V_flow", "eta"],
+            RECORD_DEF_ID,
         ));
         flat.add_function(record_constructor_named(
             "Pkg.Generic",
@@ -4328,12 +4425,14 @@ mod tests {
                 "hydraulicEfficiency_V_flow",
                 "hydraulicEfficiency_eta",
             ],
+            INNER_DEF_ID,
         ));
 
         let mut function = rumoca_core::Function::new("Pkg.efficiency", Span::DUMMY);
         function.add_input(
             rumoca_core::FunctionParam::new("per", "Pkg.EfficiencyParameters", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(RECORD_DEF_ID),
         );
         function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span()));
         flat.add_function(function);
@@ -4503,7 +4602,8 @@ mod tests {
         let mut function = rumoca_core::Function::new("Pkg.sizeField", Span::DUMMY);
         function.add_input(
             rumoca_core::FunctionParam::new("r", "Pkg.Record", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(RECORD_DEF_ID),
         );
         function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span()));
         function.locals.push(rumoca_core::FunctionParam {
@@ -4707,6 +4807,7 @@ mod tests {
             test_span(),
         )];
         let decomposed = vec![DecomposedParam {
+            original_input_count: 1,
             original_index: 0,
             param_name: "Kelvin".to_string(),
             type_name: "Modelica.Units.SI.Temperature".to_string(),
@@ -4736,7 +4837,8 @@ mod tests {
         let mut function = rumoca_core::Function::new("Pkg.f", Span::DUMMY);
         function.add_input(
             rumoca_core::FunctionParam::new("state", "Pkg.State", test_span())
-                .with_type_class(ClassType::Record),
+                .with_type_class(ClassType::Record)
+                .with_type_def_id(RECORD_DEF_ID),
         );
         function.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span()));
         function

@@ -29,10 +29,12 @@ fn projection_honors_nonidentity_scalar_output_mapping() {
                 algebraic_projection_plan: solve::AlgebraicProjectionPlan {
                     blocks: vec![
                         solve::AlgebraicProjectionBlock {
+                            causal_steps: Vec::new(),
                             rows: vec![1],
                             y_indices: vec![1],
                         },
                         solve::AlgebraicProjectionBlock {
+                            causal_steps: Vec::new(),
                             rows: vec![0],
                             y_indices: vec![0],
                         },

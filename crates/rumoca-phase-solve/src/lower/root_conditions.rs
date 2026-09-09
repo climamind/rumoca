@@ -27,7 +27,9 @@ fn root_lower_builder<'a>(runtime: &'a RootRuntime<'a>) -> LowerBuilder<'a> {
             discrete_valued_names: Some(&runtime.dae_model.variables.discrete_valued),
             variable_starts: Some(runtime.variable_starts),
             dae_variables: Some(&runtime.dae_model.variables),
-            indexed_bindings: Some(&runtime.indexed_bindings),
+            indexed_bindings: Some(super::IndexedBindingSource::Borrowed(
+                &runtime.indexed_bindings,
+            )),
             is_initial_mode: false,
         },
     )

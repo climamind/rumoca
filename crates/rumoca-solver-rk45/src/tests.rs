@@ -128,6 +128,7 @@ fn rk45_refreshes_algebraic_solve_ir_layout() {
         vec![Some(solve::scalar_slot_y(0)), Some(solve::scalar_slot_y(1))];
     model.problem.continuous.algebraic_projection_plan = solve::AlgebraicProjectionPlan {
         blocks: vec![solve::AlgebraicProjectionBlock {
+            causal_steps: Vec::new(),
             rows: vec![1],
             y_indices: vec![1],
         }],

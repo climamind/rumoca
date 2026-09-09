@@ -967,6 +967,7 @@ end P;
         .expect("phase compilation should succeed");
     let result = match phase_result {
         PhaseResult::Success(result) => result,
+        PhaseResult::Failed { phase, error, .. } => panic!("phase {phase:?} failed: {error}"),
         other => panic!(
             "expected successful phase result, got {:?}",
             std::mem::discriminant(&other)
@@ -1049,6 +1050,7 @@ end P;
         .expect("phase compilation should succeed");
     let result = match phase_result {
         PhaseResult::Success(result) => result,
+        PhaseResult::Failed { phase, error, .. } => panic!("phase {phase:?} failed: {error}"),
         other => panic!(
             "expected successful phase result, got {:?}",
             std::mem::discriminant(&other)
@@ -1075,9 +1077,20 @@ end P;
         .expect("flat equation should contain rewritten P.f call");
     let actual_names = call_args
         .iter()
-        .map(|arg| match arg {
-            rumoca_core::Expression::VarRef { name, .. } => name.as_str().to_string(),
-            other => format!("{other:?}"),
+        .zip(["r_a", "r_b"])
+        .map(|(arg, expected_slot)| {
+            let rumoca_core::Expression::FunctionCall { name, args, .. } = arg else {
+                panic!("expected named decomposed argument");
+            };
+            assert_eq!(
+                name.as_str(),
+                format!("__rumoca_named_arg__.{expected_slot}")
+            );
+            assert_eq!(args.len(), 1);
+            match &args[0] {
+                rumoca_core::Expression::VarRef { name, .. } => name.as_str().to_string(),
+                other => format!("{other:?}"),
+            }
         })
         .collect::<Vec<_>>();
     assert_eq!(actual_names, vec!["rec.a", "rec.b"]);

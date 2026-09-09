@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Quality-gate regressions share baseline and provenance fixtures.
+// split plan: group baseline-context and metric-ratchet cases in child test modules.
+
 use super::*;
 use serde_json::Value;
 use serde_json::json;

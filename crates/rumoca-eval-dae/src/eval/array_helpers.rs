@@ -339,6 +339,35 @@ fn eval_function_call_field_array_values<T: SimFloat>(
     eval_user_function_output_array_path_pub(name.var_name(), args, output_path.as_str(), env)
 }
 
+fn eval_referenced_array_field_values<T: SimFloat>(
+    base_name: &str,
+    field: &str,
+    env: &VarEnv<T>,
+) -> Result<Vec<T>, EvalError> {
+    let base_values = array_values_from_env_name_generic(base_name, env)?.ok_or_else(|| {
+        EvalError::MissingBinding {
+            name: base_name.to_string(),
+        }
+    })?;
+    let mut values = Vec::with_capacity(base_values.len());
+    let indexed_field_keys =
+        cached_indexed_field_keys(&env.runtime, base_name, field, base_values.len());
+    let field_indexed_keys =
+        cached_field_indexed_keys(&env.runtime, base_name, field, base_values.len());
+    for (idx, base_value) in base_values.into_iter().enumerate() {
+        if let Some(value) = env.vars.get(indexed_field_keys[idx].as_str()).copied() {
+            values.push(value);
+            continue;
+        }
+        if let Some(value) = env.vars.get(field_indexed_keys[idx].as_str()).copied() {
+            values.push(value);
+            continue;
+        }
+        values.push(base_value);
+    }
+    Ok(values)
+}
+
 pub(super) fn try_eval_field_access_array_values<T: SimFloat>(
     base: &Expression,
     field: &str,
@@ -402,30 +431,7 @@ pub(super) fn try_eval_field_access_array_values<T: SimFloat>(
                 .iter()
                 .all(|sub| matches!(sub, Subscript::Colon { .. })) =>
         {
-            let base_name = name.as_str();
-            let base_values =
-                array_values_from_env_name_generic(base_name, env)?.ok_or_else(|| {
-                    EvalError::MissingBinding {
-                        name: base_name.to_string(),
-                    }
-                })?;
-            let mut values = Vec::with_capacity(base_values.len());
-            let indexed_field_keys =
-                cached_indexed_field_keys(&env.runtime, base_name, field, base_values.len());
-            let field_indexed_keys =
-                cached_field_indexed_keys(&env.runtime, base_name, field, base_values.len());
-            for (idx, base_value) in base_values.into_iter().enumerate() {
-                if let Some(value) = env.vars.get(indexed_field_keys[idx].as_str()).copied() {
-                    values.push(value);
-                    continue;
-                }
-                if let Some(value) = env.vars.get(field_indexed_keys[idx].as_str()).copied() {
-                    values.push(value);
-                    continue;
-                }
-                values.push(base_value);
-            }
-            Ok(values)
+            eval_referenced_array_field_values(name.as_str(), field, env)
         }
         Expression::Array { elements, .. } | Expression::Tuple { elements, .. } => {
             let mut values = Vec::new();

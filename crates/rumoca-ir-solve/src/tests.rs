@@ -362,7 +362,7 @@ fn compact_initialization_json_rejects_non_target_load_stride_targeting_const() 
     assert!(
         error
             .to_string()
-            .contains("affine load stride does not point at LoadY or LoadP"),
+            .contains("affine load stride does not point at LoadY, LoadP, or LoadSeed"),
         "{error}"
     );
 }
@@ -377,7 +377,7 @@ fn compact_initialization_bincode_rejects_non_target_load_stride_targeting_const
     assert!(
         error
             .to_string()
-            .contains("affine load stride does not point at LoadY or LoadP"),
+            .contains("affine load stride does not point at LoadY, LoadP, or LoadSeed"),
         "{error}"
     );
 }
@@ -1029,6 +1029,7 @@ fn representative_continuous_system() -> ContinuousSolveSystem {
             blocks: vec![AlgebraicProjectionBlock {
                 rows: vec![1],
                 y_indices: vec![1],
+                causal_steps: Vec::new(),
             }],
         },
         residual: ComputeBlock::from_scalar_program_block(ScalarProgramBlock::with_source_span(

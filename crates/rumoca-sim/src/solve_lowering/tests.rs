@@ -340,6 +340,9 @@ fn simulation_state_selection_prefers_physical_coordinates_for_conservation_stat
         origin: "fixed start initialization for mass".to_string(),
         ..eq(sub(var("mass"), real(1.0)))
     });
+    dae.initialization
+        .equation_provenance
+        .push(dae::InitializationEquationProvenance::FixedStart);
     let lowered = structurally_lower_dae_for_simulation(&dae, &SimOptions::default())
         .expect("preferred physical coordinates should structurally lower");
 
@@ -976,19 +979,35 @@ fn quaternion_constraint_dae() -> dae::Dae {
             )
         },
     );
+    let mut state_ref = component_ref("Q");
+    state_ref.def_id = Some(rumoca_core::DefId::new(4105));
+    model
+        .variables
+        .states
+        .get_mut(&VarName::new("Q"))
+        .expect("Q state")
+        .component_ref = Some(state_ref.clone());
+    let state_value = |subscripts| Expression::VarRef {
+        name: rumoca_core::Reference::from_component_reference(state_ref.clone()),
+        subscripts,
+        span: fixture_span(),
+    };
     model.symbols.functions.insert(
         VarName::new("orientationConstraint"),
         orientation_constraint_function(),
     );
     for idx in 1..=3 {
-        model
-            .continuous
-            .equations
-            .push(eq(sub(der(var_idx("Q", idx)), time())));
+        model.continuous.equations.push(eq(sub(
+            der(state_value(vec![Subscript::generated_index(
+                idx,
+                fixture_span(),
+            )])),
+            time(),
+        )));
     }
     model.continuous.equations.push(eq(sub(
         array(vec![int(0)]),
-        call("orientationConstraint", vec![var("Q")]),
+        call("orientationConstraint", vec![state_value(Vec::new())]),
     )));
     model
 }
@@ -1000,7 +1019,17 @@ fn orientation_constraint_function() -> rumoca_core::Function {
     function
         .inputs
         .push(rumoca_core::FunctionParam::new("Q", "Orientation", span));
+    function.inputs[0].def_id = Some(rumoca_core::DefId::new(4106));
+    function.inputs[0].dims = vec![4];
+    let mut input_ref = component_ref("Q");
+    input_ref.def_id = function.inputs[0].def_id;
+    let input_value = Expression::VarRef {
+        name: rumoca_core::Reference::from_component_reference(input_ref),
+        subscripts: Vec::new(),
+        span,
+    };
     let mut output = rumoca_core::FunctionParam::new("residue", "Real", span);
+    output.def_id = Some(rumoca_core::DefId::new(4107));
     output.dims = vec![1];
     function.outputs.push(output);
     function.body.push(rumoca_core::Statement::Assignment {
@@ -1012,9 +1041,9 @@ fn orientation_constraint_function() -> rumoca_core::Function {
                 span,
                 subs: Vec::new(),
             }],
-            def_id: None,
+            def_id: Some(rumoca_core::DefId::new(4107)),
         },
-        value: array(vec![sub(mul(var("Q"), var("Q")), int(1))]),
+        value: array(vec![sub(mul(input_value.clone(), input_value), int(1))]),
         span,
     });
     function
@@ -1283,6 +1312,9 @@ fn lower_dae_for_simulation_preserves_matrix_derivative_state_slots() {
         .equations
         .push(eq(sub(der(var("R")), mul(var("R"), var("skew")))));
 
+    for equation in &mut dae.continuous.equations {
+        equation.scalar_count = 9;
+    }
     let structurally_lowered = structurally_lower_dae_for_simulation(&dae, &SimOptions::default())
         .expect("matrix derivative state should structurally lower");
     assert!(

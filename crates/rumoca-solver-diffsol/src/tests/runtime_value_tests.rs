@@ -584,10 +584,7 @@ fn project_algebraics_rejects_nonzero_state_targeted_consistency_residuals() {
     // State initialization belongs to the initialization problem and fixed
     // starts, not to the algebraic projector used at event boundaries. The
     // projector therefore reports the inconsistent row without moving state.
-    assert!(
-        err.to_string()
-            .contains("algebraic projection plan omits implicit residual row 1")
-    );
+    assert!(err.to_string().contains("max residual row=1"));
     assert_eq!(y[0], 0.0);
     assert_eq!(y[1], 0.0);
 }
@@ -659,20 +656,18 @@ fn settle_algebraics_uses_full_ode_projection_semantics() {
     };
     model.initial_y = vec![0.0, 0.0, 0.0];
 
+    model.problem.solve_layout.solver_maps.names = vec!["x".into(), "a".into(), "b".into()];
     let runtime = SolveRuntime::new(&model).expect("runtime should prepare the incomplete plan");
     let ode_model = OdeModel::new(&model).expect("ODE model should prepare full residual rows");
     let mut y = model.initial_y.clone();
     let mut p = model.parameters.clone();
 
-    let err = settle_algebraics_and_relation_memory(
+    let error = settle_algebraics_and_relation_memory(
         &runtime, &ode_model, &mut y, &mut p, 0.0, 1, 1.0e-12,
     )
-    .expect_err("settling must not bypass the OdeModel semantic projector");
-
-    assert!(
-        err.to_string()
-            .contains("algebraic projection plan omits implicit residual row 2")
-    );
+    .expect_err("settling must reject unsatisfied residuals outside the plan");
+    assert!(error.to_string().contains("max residual row=2"), "{error}");
+    assert_eq!(y, vec![0.0, 0.0, 0.0]);
 }
 
 #[test]

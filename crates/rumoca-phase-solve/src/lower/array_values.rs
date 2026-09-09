@@ -1303,20 +1303,35 @@ impl<'a> LowerBuilder<'a> {
     }
 
     fn selected_output_function_call_is_scalar(&self, name: &rumoca_core::Reference) -> bool {
-        rumoca_core::find_map_top_level_splits_rev(name.as_str(), |base_name, suffix| {
-            let function = self.functions.get(&rumoca_core::VarName::new(base_name))?;
-            let projection_suffix =
-                crate::projection_suffix::parse_output_projection_suffix(suffix)?;
-            let output = function
-                .outputs
-                .iter()
-                .find(|output| output.name == projection_suffix.output_name)?;
-            if output.dims.is_empty() || output.dims.len() == projection_suffix.indices.len() {
-                return Some(());
-            }
-            None
-        })
-        .is_some()
+        let Some((_, function)) =
+            crate::projection_suffix::resolve_function_reference(self.functions, name)
+        else {
+            return false;
+        };
+        let Some(projection) = crate::projection_suffix::output_projection_suffix(function, name)
+        else {
+            return false;
+        };
+        let Some(output) = function
+            .outputs
+            .iter()
+            .find(|output| output.name == projection.output_name)
+        else {
+            return false;
+        };
+        let output = if projection.output_fields.is_empty() {
+            output
+        } else {
+            let Some(field) = crate::projection_suffix::record_output_field_param(
+                self.functions,
+                output,
+                &projection.output_fields,
+            ) else {
+                return false;
+            };
+            field
+        };
+        output.dims.len() == projection.indices.len()
     }
 
     fn lower_binary_array_like_values(
@@ -2366,6 +2381,17 @@ impl<'a> LowerBuilder<'a> {
             })?;
             return Ok(vec![value]);
         }
+        self.lower_index_binding_selection(base, subscripts, owner_span, scope, call_depth)
+    }
+
+    fn lower_index_binding_selection(
+        &mut self,
+        base: &rumoca_core::Expression,
+        subscripts: &[rumoca_core::Subscript],
+        owner_span: Option<rumoca_core::Span>,
+        scope: &Scope,
+        call_depth: usize,
+    ) -> Result<Vec<Reg>, LowerError> {
         if let Some(values) = self.lower_array_like_dynamic_selection_values(
             base, subscripts, owner_span, scope, call_depth,
         )? {

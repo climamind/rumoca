@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Substitution regressions share alias and structured-family fixtures.
+// split plan: separate scalar alias and structured-family regressions.
+
 use super::*;
 
 #[test]
@@ -1418,13 +1421,14 @@ fn test_eliminate_trivial_rejects_record_shell_alias_without_metadata() {
         scalar_count: 1,
     });
 
+    let result = eliminate_trivial(&mut dae);
     assert!(
         matches!(
-            eliminate_trivial(&mut dae),
+            result,
             Err(StructuralError::ContractViolation { ref reason, .. })
                 if reason.contains("missing DAE variable metadata for `a.R`")
         ),
-        "record shells require resolved producer metadata"
+        "record shells require resolved producer metadata: {result:?}"
     );
 }
 

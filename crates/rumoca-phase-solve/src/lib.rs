@@ -737,24 +737,16 @@ fn lower_initialization_system(
     let residual_rows = lower_initial_residual(dae_model, layout)
         .map_err(|err| lower_problem_context(err, "lower initial residual rows"))?;
     let projection_indices = initial_projection_indices_for_layout(dae_model, solve_layout)?;
-    let continuous_equation_count = dae_model.continuous.equations.len();
-    let implicit_initial_projection_rows = residual_equations
-        .iter()
-        .enumerate()
-        .filter_map(|(row_idx, (equation_idx, _))| {
-            (*equation_idx >= continuous_equation_count).then_some(row_idx)
-        })
-        .collect::<BTreeSet<_>>();
     let projection_plan = lower_projection_plan(
         &residual_rows,
         &row_targets,
         &projection_indices,
         0..residual_rows.len(),
         ProjectionPlanPolicy {
-            include_explicit_row_targets: false,
+            include_explicit_row_targets: true,
             require_complete_algebraic_coverage: false,
         },
-        Some(&implicit_initial_projection_rows),
+        None,
         dae_model_span(dae_model)?,
     )?;
 

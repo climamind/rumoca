@@ -88,12 +88,13 @@ fn indexed_modifier_resolution_rejects_unsupported_selections() {
         make_int_expr(2),
         make_comp_ref_expr(&["i"]),
     ] {
-        assert_eq!(select_array_value(&array, &[subscript(invalid)]), None);
+        assert_eq!(
+            literal_integer_subscripts(&[subscript(invalid)])
+                .and_then(|indices| index_array_value(&array, &indices)),
+            None
+        );
     }
-    assert_eq!(
-        select_array_value(&make_int_expr(1), &[subscript(make_int_expr(1))]),
-        None
-    );
+    assert_eq!(index_array_value(&make_int_expr(1), &[1]), None);
 }
 
 fn make_name(name: &str) -> ast::Name {

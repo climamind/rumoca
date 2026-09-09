@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::{any::Any, collections::BTreeSet, fmt::Display, sync::Mutex};
 
 use diffsol::{

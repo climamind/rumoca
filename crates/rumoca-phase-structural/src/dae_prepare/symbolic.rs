@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Symbolic differentiation shares the derivative context and simplifier.
+// split plan: separate function-call differentiation from expression simplification.
+
 use super::*;
 use rumoca_core::{ExpressionRewriter, Span};
 use std::cell::RefCell;
@@ -814,17 +817,7 @@ impl<'a> SymbolicDerivativeContext<'a> {
             .find(|annotation| annotation.order == 1)?;
         let derivative_name =
             self.resolve_derivative_function_name(&annotation.derivative_function)?;
-        let (named, positional) = split_named_and_positional_args(args)?;
-        let mut positional_idx = 0usize;
-        let mut actuals = Vec::with_capacity(function.inputs.len());
-        for input in &function.inputs {
-            let actual = named.get(input.name.as_str()).cloned().or_else(|| {
-                let actual = positional.get(positional_idx).cloned();
-                positional_idx += usize::from(actual.is_some());
-                actual
-            });
-            actuals.push(actual.or_else(|| input.default.clone())?);
-        }
+        let actuals = crate::function_arguments::bind_function_arguments(&function.inputs, args)?;
 
         let mut derivative_args = actuals.clone();
         for (input, actual) in function.inputs.iter().zip(actuals.iter()) {
@@ -1002,7 +995,21 @@ impl<'a> SymbolicDerivativeContext<'a> {
                 {
                     return self.differentiate(&projected, active_functions);
                 }
-                None
+                match base.as_ref() {
+                    Expression::FunctionCall {
+                        name,
+                        args,
+                        is_constructor,
+                        ..
+                    } => self.differentiate_function_output(
+                        name,
+                        args,
+                        *is_constructor,
+                        Some(field),
+                        active_functions,
+                    ),
+                    _ => None,
+                }
             }
             Expression::FunctionCall {
                 name,
@@ -1010,21 +1017,6 @@ impl<'a> SymbolicDerivativeContext<'a> {
                 is_constructor,
                 ..
             } => self.differentiate_function_call(name, args, *is_constructor, active_functions),
-            Expression::FieldAccess { base, field, .. } => match base.as_ref() {
-                Expression::FunctionCall {
-                    name,
-                    args,
-                    is_constructor,
-                    ..
-                } => self.differentiate_function_output(
-                    name,
-                    args,
-                    *is_constructor,
-                    Some(field),
-                    active_functions,
-                ),
-                _ => None,
-            },
             // d/dt(der(X)) — a higher-order derivative (successive `Der` blocks,
             // or a relative acceleration `a = der(der(phi))`). `der(X)` is X's
             // first time-derivative; differentiate that expression to climb one
@@ -1248,7 +1240,9 @@ fn differentiate_trigonometric_builtin(
         )),
         _ => None,
     }
+}
 
+impl SymbolicDerivativeContext<'_> {
     fn canonical_field_access_var_name(&self, base: &Expression, field: &str) -> Option<VarName> {
         field_access_candidate_var_names(base, field)
             .into_iter()
@@ -1300,26 +1294,29 @@ fn differentiate_trigonometric_builtin(
                 args,
                 is_constructor,
                 ..
-            } if *is_constructor => self.project_constructor_field(name.var_name(), args, field),
+            } if *is_constructor => self.project_constructor_field(name, args, field),
             Expression::FunctionCall {
                 name,
                 args,
                 is_constructor,
                 ..
             } => {
-                if *is_constructor
-                    || active_functions
-                        .iter()
-                        .any(|active| active == name.var_name())
-                {
+                let (instance_id, function, output_selector) =
+                    resolve_function_call(self.dae, name)?;
+                if *is_constructor || active_functions.contains(&instance_id) {
                     return None;
                 }
-                let function = self.dae.symbols.functions.get(name.var_name())?;
                 if !function.pure || function.external.is_some() || function.outputs.len() != 1 {
                     return None;
                 }
-                active_functions.push(name.var_name().clone());
-                let output_expr = function_output_expression(function, args);
+                active_functions.push(instance_id);
+                let output_expr = function_output_expression(
+                    function,
+                    args,
+                    output_selector.as_ref(),
+                    None,
+                    self.dae,
+                );
                 let projected = output_expr.and_then(|output_expr| {
                     self.project_field_expression(&output_expr, field, active_functions)
                 });
@@ -1332,19 +1329,21 @@ fn differentiate_trigonometric_builtin(
 
     fn project_constructor_field(
         &self,
-        constructor_name: &VarName,
+        constructor_name: &rumoca_core::Reference,
         args: &[Expression],
         field: &str,
     ) -> Option<Expression> {
-        let constructor = self.dae.symbols.functions.get(constructor_name)?;
-        if !constructor.is_constructor {
+        let (_, constructor, output_selector) = resolve_function_call(self.dae, constructor_name)?;
+        if !constructor.is_constructor || output_selector.is_some() {
             return None;
         }
+        let bindings =
+            crate::function_arguments::bind_function_arguments(&constructor.inputs, args)?;
         constructor
             .inputs
             .iter()
-            .position(|input| input.name.as_str() == field)
-            .and_then(|idx| args.get(idx).cloned())
+            .zip(bindings)
+            .find_map(|(input, value)| (input.name == field).then_some(value))
     }
 }
 
@@ -2034,30 +2033,14 @@ pub(super) fn project_flat_index_with_span(
                 span,
             })
         }
-        Expression::Binary { op, lhs, rhs, .. }
-            if matches!(op, OpBinary::Mul | OpBinary::Div)
-                && (expression_is_scalar(lhs, dae) || expression_is_scalar(rhs, dae)) =>
-        {
-            let span = projection_span(expr, fallback_span)?;
-            Some(Expression::Binary {
-                op: op.clone(),
-                lhs: Box::new(if expression_is_scalar(lhs, dae) {
-                    lhs.as_ref().clone()
-                } else {
-                    project_flat_index_with_span(lhs, dims, flat_index, Some(span), dae)?
-                }),
-                rhs: Box::new(if expression_is_scalar(rhs, dae) {
-                    rhs.as_ref().clone()
-                } else {
-                    project_flat_index_with_span(rhs, dims, flat_index, Some(span), dae)?
-                }),
-                span,
-            })
-        }
         Expression::Binary {
             op: OpBinary::Mul | OpBinary::Div,
+            lhs,
+            rhs,
             ..
-        } => project_indexed_expression(expr, dims, flat_index, fallback_span),
+        } if !expression_is_scalar(lhs, dae) && !expression_is_scalar(rhs, dae) => {
+            project_indexed_expression(expr, dims, flat_index, fallback_span)
+        }
         Expression::Binary { op, lhs, rhs, .. } => {
             let span = projection_span(expr, fallback_span)?;
             Some(Expression::Binary {

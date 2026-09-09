@@ -1,3 +1,7 @@
+// SPEC_0021 file-size exception: function-call lowering still handles builtin,
+// record, random, and projection calls together. split plan: move builtin
+// families and projection-specific lowering into focused modules.
+
 //! Function-call lowering and scoped function evaluation.
 
 use super::function_projection::FunctionOutputProjection;
@@ -1033,6 +1037,11 @@ impl<'a> LowerBuilder<'a> {
         let mut const_scope = self.local_const_bindings.clone();
         let mut const_bindings = IndexMap::new();
         let mut positional_idx = 0usize;
+        let explicit_positional_slots = positional_args.len()
+            >= inputs
+                .iter()
+                .filter(|input| !named_args.contains_key(input.name.as_str()))
+                .count();
 
         for (input_idx, input) in inputs.iter().enumerate() {
             if used_inputs.is_some_and(|used_inputs| !used_inputs.contains(&input.name)) {
@@ -1070,12 +1079,17 @@ impl<'a> LowerBuilder<'a> {
                             flattened_input_has_prefix(&next.name, prefix)
                                 && used_inputs.is_some_and(|used| used.contains(&next.name))
                         });
-                    if !later_flattened_sibling_is_used
+                    if explicit_positional_slots
+                        || !later_flattened_sibling_is_used
                         || positional_args
                             .get(positional_idx)
                             .is_some_and(|arg| is_flattened_record_field_actual(arg, field))
                     {
-                        positional_idx += usize::from(positional_idx < positional_args.len());
+                        next_positional_function_input_arg(
+                            input,
+                            &positional_args,
+                            &mut positional_idx,
+                        );
                     }
                     continue;
                 }

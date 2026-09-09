@@ -295,7 +295,22 @@ fn eval_builtin_size<T: SimFloat>(
         .ok_or(EvalError::UnsupportedExpression {
             kind: "size dimension",
         })?;
-    let dims = try_infer_runtime_expr_dims(array_arg, env)?;
+    // size() queries declaration metadata without requiring element values:
+    // outputs may be unassigned and String arrays have no numeric bindings.
+    let declared_dims = match array_arg {
+        rumoca_core::Expression::VarRef {
+            name, subscripts, ..
+        } if subscripts.is_empty() => env
+            .dims
+            .get(name.as_str())
+            .filter(|dims| dims.iter().all(|dim| *dim >= 0)),
+        _ => None,
+    };
+    let dims = if let Some(dims) = declared_dims {
+        dims.iter().map(|dim| *dim as usize).collect()
+    } else {
+        try_infer_runtime_expr_dims(array_arg, env)?
+    };
     let value = dims
         .get(dim_index)
         .ok_or(EvalError::UnsupportedExpression {

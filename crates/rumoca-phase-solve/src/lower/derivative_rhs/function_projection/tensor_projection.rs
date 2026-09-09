@@ -456,16 +456,16 @@ impl<'a> FunctionProjectionAnalysis<'a> {
     }
 }
 
-fn split_flattened_projection_input_name(name: &str) -> Option<(&str, &str)> {
+pub(super) fn split_flattened_projection_input_name(name: &str) -> Option<(&str, &str)> {
     let (prefix, field) = name.split_once('_')?;
     (!prefix.is_empty() && !field.is_empty()).then_some((prefix, field))
 }
 
-fn flattened_projection_input_has_prefix(name: &str, prefix: &str) -> bool {
+pub(super) fn flattened_projection_input_has_prefix(name: &str, prefix: &str) -> bool {
     split_flattened_projection_input_name(name).is_some_and(|(candidate, _)| candidate == prefix)
 }
 
-fn flattened_projection_group_has_prefix(
+pub(super) fn flattened_projection_group_has_prefix(
     inputs: &[rumoca_core::FunctionParam],
     prefix: &str,
 ) -> bool {
@@ -477,7 +477,7 @@ fn flattened_projection_group_has_prefix(
         >= 2
 }
 
-fn flattened_projection_input_is_group_start(
+pub(super) fn flattened_projection_input_is_group_start(
     inputs: &[rumoca_core::FunctionParam],
     input_idx: usize,
     prefix: &str,
@@ -488,7 +488,7 @@ fn flattened_projection_input_is_group_start(
         .any(|input| flattened_projection_input_has_prefix(&input.name, prefix))
 }
 
-fn only_projected_scalar_assignment_output(
+pub(super) fn only_projected_scalar_assignment_output(
     mut outputs: Vec<ProjectedFunctionOutput>,
     span: rumoca_core::Span,
 ) -> Result<ProjectedFunctionOutput, LowerError> {
@@ -498,4 +498,54 @@ fn only_projected_scalar_assignment_output(
             span,
         )
     })
+}
+
+fn result_axis_subscript(
+    result_indices: &[usize],
+    result_axis: &mut usize,
+    span: rumoca_core::Span,
+) -> Result<rumoca_core::Subscript, LowerError> {
+    let coordinate = result_axis_coordinate(result_indices, result_axis, span)?;
+    checked_generated_subscript_from_usize(
+        coordinate,
+        span,
+        "projected selected expression subscript",
+    )
+}
+
+fn result_axis_coordinate(
+    result_indices: &[usize],
+    result_axis: &mut usize,
+    span: rumoca_core::Span,
+) -> Result<usize, LowerError> {
+    let coordinate = result_indices.get(*result_axis).copied().ok_or_else(|| {
+        LowerError::contract_violation(
+            "projected selected expression is missing a result dimension",
+            span,
+        )
+    })?;
+    *result_axis = result_axis.checked_add(1).ok_or_else(|| {
+        LowerError::contract_violation(
+            "projected selected expression dimension index overflows host range",
+            span,
+        )
+    })?;
+    Ok(coordinate)
+}
+
+fn validate_projected_subscript_coordinate(
+    coordinate: usize,
+    dimension: i64,
+    span: rumoca_core::Span,
+) -> Result<(), LowerError> {
+    if i64::try_from(coordinate)
+        .ok()
+        .is_some_and(|index| index <= dimension)
+    {
+        return Ok(());
+    }
+    Err(LowerError::contract_violation(
+        "projected array subscript coordinate exceeds its dimension",
+        span,
+    ))
 }

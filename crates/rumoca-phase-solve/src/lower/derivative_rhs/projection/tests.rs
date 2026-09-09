@@ -170,7 +170,7 @@ fn derivative_slice_rejects_non_singleton_extra_subscript() {
 
     assert_eq!(
         err.reason(),
-        "array derivative slice has more subscripts than dimensions"
+        "array derivative slice rank 2 exceeds base rank 1 for dimensions [3]"
     );
 }
 
@@ -232,7 +232,7 @@ fn binding_keys_consume_singleton_subscript_on_scalarized_variable() -> Result<(
             variable
         });
     let keys = binding_keys_for_subscripted_name(
-        "y[2]",
+        &rumoca_core::Reference::new("y[2]"),
         &[rumoca_core::Subscript::index(1, span)],
         &dae_model,
         &IndexMap::new(),
@@ -265,7 +265,7 @@ fn binding_keys_consume_singleton_subscript_after_vector_scalar_selection() -> R
             variable
         });
     let keys = binding_keys_for_subscripted_name(
-        "y",
+        &rumoca_core::Reference::new("y"),
         &[
             rumoca_core::Subscript::index(2, span),
             rumoca_core::Subscript::index(1, span),

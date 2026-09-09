@@ -397,8 +397,13 @@ fn shift_structured_families_after_equation_removal(
     removed_sorted: &[usize],
 ) {
     families.retain_mut(|family| {
-        let total: usize = family.equation_counts.iter().sum();
-        let block_end = family.first_equation_index + total;
+        let Some(block_end) = family
+            .scalar_view_row_count()
+            .ok()
+            .and_then(|total| family.first_equation_index.checked_add(total))
+        else {
+            return false;
+        };
         if removed_sorted
             .iter()
             .any(|&idx| idx >= family.first_equation_index && idx < block_end)

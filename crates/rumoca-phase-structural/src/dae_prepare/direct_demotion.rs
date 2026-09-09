@@ -1070,7 +1070,7 @@ fn structured_scalar_slot_state_component(
         return None;
     }
     let family = dae.continuous.structured_equations.get(slot.family_index)?;
-    if family.equation_counts.len() != state_size || slot.iteration_index >= state_size {
+    if family.point_count().ok()? != state_size || slot.iteration_index >= state_size {
         return None;
     }
     Some((state_name, slot.iteration_index))
@@ -1115,7 +1115,6 @@ pub fn demote_direct_assigned_states_with_boundary_substitutions(
     dae: &mut Dae,
     boundary_substitutions: &[crate::eliminate::Substitution],
 ) -> Result<usize, StructuralError> {
-    let max_rounds = dae.variables.states.len().clamp(1, 8);
     let mut total_demoted = 0usize;
     let mut round_index = 0usize;
 

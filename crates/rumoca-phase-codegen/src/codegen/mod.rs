@@ -1467,7 +1467,7 @@ fn add_solve_template_helpers(env: &mut Environment<'static>) {
         "fmi3_scalar_projection_schedule",
         fmi3_scalar_projection_schedule_function,
     );
-    render_solve::register_target_assignment_functions(&mut env);
+    render_solve::register_target_assignment_functions(env);
     env.add_function("render_solve_row_rust", render_solve_row_rust_function);
     env.add_function("render_solve_block_c", render_solve_block_c_function);
     env.add_function("render_solve_block_rust", render_solve_block_rust_function);

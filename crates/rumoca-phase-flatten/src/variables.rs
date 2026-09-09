@@ -808,6 +808,7 @@ mod tests {
         let class_index = ast::ClassDefIndex::from_tree(&tree);
         let flat = create_flat_variable(
             &instance,
+            instance.type_id,
             &tree,
             &class_index,
             &imports,
@@ -857,6 +858,7 @@ mod tests {
         let class_index = ast::ClassDefIndex::from_tree(&tree);
         let flat = create_flat_variable(
             &instance,
+            instance.type_id,
             &tree,
             &class_index,
             &imports,
@@ -896,6 +898,7 @@ mod tests {
         let class_index = ast::ClassDefIndex::from_tree(&tree);
         let flat = create_flat_variable(
             &instance,
+            instance.type_id,
             &tree,
             &class_index,
             &imports,
@@ -930,6 +933,7 @@ mod tests {
         let class_index = ast::ClassDefIndex::from_tree(&tree);
         let flat = create_flat_variable(
             &instance,
+            instance.type_id,
             &tree,
             &class_index,
             &imports,

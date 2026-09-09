@@ -1,5 +1,5 @@
 use super::*;
-use crate::static_eval::{eval_static_bool, eval_static_number, structural_scalar_bindings};
+use crate::static_eval::{eval_static_bool, structural_scalar_bindings};
 
 fn state_has_any_equation_reference(dae: &Dae, state_name: &VarName) -> bool {
     dae.continuous
@@ -622,9 +622,11 @@ fn index_reduce_missing_state_derivatives_once_in_place(
 
         for idx in candidate_indices {
             let seed_exprs = vec![dae.continuous.equations[idx].rhs.clone()];
+            let independent_definitions =
+                independent_constraint_definitions(&defining_expr_index, idx);
             let der_map = build_relaxed_derivative_map_for_exprs_with_index(
                 dae,
-                &defining_expr_index,
+                &independent_definitions,
                 &seed_exprs,
                 None,
             )?;
@@ -648,22 +650,7 @@ fn index_reduce_missing_state_derivatives_once_in_place(
             {
                 continue;
             }
-            // The differentiated equation preserves the constraint only after t=0.
-            // Retain the original equation to initialize on the same solution manifold.
-            dae.initialization
-                .equations
-                .push(dae.continuous.equations[idx].clone());
-            let old_origin = dae.continuous.equations[idx].origin.clone();
-            dae.continuous.equations[idx].rhs = new_rhs;
-            dae.continuous.equations[idx].origin = if old_origin.is_empty() {
-                format!("index_reduction:d_dt_for_{}", state_name.as_str())
-            } else {
-                format!(
-                    "{}|index_reduction:d_dt_for_{}",
-                    old_origin,
-                    state_name.as_str()
-                )
-            };
+            retain_initial_constraint_and_replace_derivative(dae, idx, state_name, new_rhs);
             used_eq.insert(idx);
             changed += 1;
             break;
@@ -671,6 +658,46 @@ fn index_reduce_missing_state_derivatives_once_in_place(
     }
 
     Ok(changed)
+}
+
+fn retain_initial_constraint_and_replace_derivative(
+    dae: &mut Dae,
+    idx: usize,
+    state_name: &VarName,
+    new_rhs: Expression,
+) {
+    // The differentiated equation preserves the constraint only after t=0.
+    // Retain the original equation to initialize on the same solution manifold.
+    dae.initialization
+        .equations
+        .push(dae.continuous.equations[idx].clone());
+    dae.initialization
+        .equation_provenance
+        .push(dae::InitializationEquationProvenance::User);
+    let old_origin = dae.continuous.equations[idx].origin.clone();
+    dae.continuous.equations[idx].rhs = new_rhs;
+    dae.continuous.equations[idx].origin = if old_origin.is_empty() {
+        format!("index_reduction:d_dt_for_{}", state_name.as_str())
+    } else {
+        format!(
+            "{}|index_reduction:d_dt_for_{}",
+            old_origin,
+            state_name.as_str()
+        )
+    };
+}
+
+/// Exclude the candidate constraint so its own definition cannot make its
+/// derivative identically zero and hide the state constraint it encodes.
+fn independent_constraint_definitions(
+    index: &DefiningExprIndex,
+    equation_index: usize,
+) -> DefiningExprIndex {
+    let mut independent = index.clone();
+    for candidates in independent.values_mut() {
+        candidates.retain(|candidate| candidate.equation_index != equation_index);
+    }
+    independent
 }
 
 fn expr_dependency_closure_reaches_state(

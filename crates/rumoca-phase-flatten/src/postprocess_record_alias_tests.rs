@@ -234,7 +234,9 @@ fn def_id_canonicalization_uses_symbol_ancestry_for_inherited_attribute_refs() {
                 ..flat::Variable::empty_with_span(test_span())
             },
         );
-        model.symbol_ancestry.insert(instance_def, vec![source_def]);
+        model
+            .symbol_ancestry
+            .insert(instance_def, vec![source_def].into());
     }
     model.add_variable(
         rumoca_core::VarName::new("val.m_flow"),
@@ -288,7 +290,7 @@ fn def_id_canonicalization_resolves_inherited_bare_binding_to_owner_sibling() {
     );
     model
         .symbol_ancestry
-        .insert(sibling_instance_def, vec![source_def]);
+        .insert(sibling_instance_def, vec![source_def].into());
     model.add_variable(
         rumoca_core::VarName::new("material.B_r"),
         flat::Variable {
@@ -343,7 +345,9 @@ fn def_id_canonicalization_does_not_guess_deeper_unrelated_inherited_ref() {
                 ..flat::Variable::empty_with_span(test_span())
             },
         );
-        model.symbol_ancestry.insert(instance_def, vec![source_def]);
+        model
+            .symbol_ancestry
+            .insert(instance_def, vec![source_def].into());
     }
     model.add_variable(
         rumoca_core::VarName::new("system.consumer.alias.value"),
@@ -392,7 +396,9 @@ fn def_id_canonicalization_does_not_guess_tied_shared_ancestor_ref() {
                 ..flat::Variable::empty_with_span(test_span())
             },
         );
-        model.symbol_ancestry.insert(instance_def, vec![source_def]);
+        model
+            .symbol_ancestry
+            .insert(instance_def, vec![source_def].into());
     }
     model.add_variable(
         rumoca_core::VarName::new("system.consumer.value"),
@@ -441,7 +447,9 @@ fn def_id_canonicalization_does_not_guess_zero_shared_ancestor_ref() {
             ..flat::Variable::empty_with_span(test_span())
         },
     );
-    model.symbol_ancestry.insert(instance_def, vec![source_def]);
+    model
+        .symbol_ancestry
+        .insert(instance_def, vec![source_def].into());
     model.add_variable(
         rumoca_core::VarName::new("system.consumer.value"),
         flat::Variable {
@@ -496,7 +504,9 @@ fn def_id_canonicalization_then_record_alias_uses_explicit_instance_ownership() 
                 ..flat::Variable::empty_with_span(test_span())
             },
         );
-        model.symbol_ancestry.insert(instance_def, vec![source_def]);
+        model
+            .symbol_ancestry
+            .insert(instance_def, vec![source_def].into());
     }
     model.add_variable(
         rumoca_core::VarName::new("system.configuration.value"),
@@ -553,7 +563,9 @@ fn def_id_canonicalization_prefers_owner_instance_before_enclosing_fallback() {
                 ..flat::Variable::empty_with_span(test_span())
             },
         );
-        model.symbol_ancestry.insert(def_id, vec![source_def]);
+        model
+            .symbol_ancestry
+            .insert(def_id, vec![source_def].into());
     }
     model.equations.push(flat::Equation {
         residual: rumoca_core::Expression::VarRef {
@@ -596,7 +608,9 @@ fn def_id_canonicalization_prefers_known_structured_path_over_rendered_name() {
             ..flat::Variable::empty_with_span(test_span())
         },
     );
-    model.symbol_ancestry.insert(instance_def, vec![source_def]);
+    model
+        .symbol_ancestry
+        .insert(instance_def, vec![source_def].into());
     model.equations.push(flat::Equation {
         residual: rumoca_core::Expression::VarRef {
             name: rumoca_core::Reference::with_component_reference(

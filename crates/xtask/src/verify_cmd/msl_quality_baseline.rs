@@ -240,9 +240,7 @@ fn download_msl_quality_baseline_asset(root: &Path) -> Result<Option<PathBuf>> {
     }
 
     serde_json::from_slice::<serde_json::Value>(&data).with_context(|| {
-        format!(
-            "downloaded promoted MSL quality baseline from {MSL_QUALITY_BASELINE_ASSET_URL} is not valid JSON"
-        )
+        format!("downloaded promoted MSL quality baseline from {asset_url} is not valid JSON")
     })?;
 
     if let Some(parent) = output_path.parent() {

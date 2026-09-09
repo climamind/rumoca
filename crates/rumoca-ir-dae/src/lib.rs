@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: DAE wire types and their serialization contract remain together.
+// split plan: extract serialization regression tests into a child module.
+
 //! Hybrid DAE representation for the Rumoca compiler (MLS Appendix B).
 //!
 //! This crate defines the canonical DAE form per MLS Appendix B (B.1):
@@ -1532,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dae_yaml_roundtrip_preserves_schema_v8_wire() {
+    fn test_dae_yaml_roundtrip_preserves_current_schema_wire() {
         let mut expected = Dae::default();
         expected
             .events
@@ -1543,7 +1546,8 @@ mod tests {
             });
 
         let yaml = serde_yaml::to_string(&expected).expect("DAE should serialize as YAML");
-        let actual: Dae = serde_yaml::from_str(&yaml).expect("schema-v8 YAML should deserialize");
+        let actual: Dae =
+            serde_yaml::from_str(&yaml).expect("current-schema YAML should deserialize");
 
         assert_eq!(actual.schema_version, DAE_SCHEMA_VERSION);
         assert_eq!(
@@ -1553,15 +1557,21 @@ mod tests {
     }
 
     #[test]
-    fn test_dae_yaml_rejects_v7_current_shape_by_schema_version() {
+    fn test_dae_yaml_rejects_previous_version_current_shape_by_schema_version() {
         let yaml = serde_yaml::to_string(&Dae::default()).expect("DAE should serialize as YAML");
-        let stale_v7 = yaml.replacen("schema_version: 8", "schema_version: 7", 1);
+        let previous_version = DAE_SCHEMA_VERSION - 1;
+        let stale = yaml.replacen(
+            &format!("schema_version: {DAE_SCHEMA_VERSION}"),
+            &format!("schema_version: {previous_version}"),
+            1,
+        );
+        assert_ne!(stale, yaml, "the fixture must carry a stale schema version");
 
-        let error = serde_yaml::from_str::<Dae>(&stale_v7)
+        let error = serde_yaml::from_str::<Dae>(&stale)
             .expect_err("the previous DAE schema version must be rejected");
         assert!(
             error.to_string().contains(&format!(
-                "unsupported DAE schema_version 7; expected {DAE_SCHEMA_VERSION}"
+                "unsupported DAE schema_version {previous_version}; expected {DAE_SCHEMA_VERSION}"
             )),
             "version rejection must identify the stale and required versions: {error}"
         );
@@ -1571,7 +1581,11 @@ mod tests {
     fn test_dae_yaml_rejects_real_v7_numeric_event_wire() {
         let yaml = serde_yaml::to_string(&Dae::default()).expect("DAE should serialize as YAML");
         let stale_v7 = yaml
-            .replacen("schema_version: 8", "schema_version: 7", 1)
+            .replacen(
+                &format!("schema_version: {DAE_SCHEMA_VERSION}"),
+                "schema_version: 7",
+                1,
+            )
             .replacen(
                 "scheduled_time_events: []",
                 "scheduled_time_events:\n- 1.0",
@@ -1583,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dae_ron_roundtrip_preserves_schema_v8_wire() {
+    fn test_dae_ron_roundtrip_preserves_current_schema_wire() {
         let mut expected = Dae::default();
         expected
             .events
@@ -1594,7 +1608,7 @@ mod tests {
             });
 
         let ron = ron::to_string(&expected).expect("DAE should serialize as RON");
-        let actual: Dae = ron::from_str(&ron).expect("schema-v8 RON should deserialize");
+        let actual: Dae = ron::from_str(&ron).expect("current-schema RON should deserialize");
 
         assert_eq!(actual.schema_version, DAE_SCHEMA_VERSION);
         assert_eq!(
@@ -1604,16 +1618,22 @@ mod tests {
     }
 
     #[test]
-    fn test_dae_ron_rejects_v7_current_shape_by_schema_version() {
+    fn test_dae_ron_rejects_previous_version_current_shape_by_schema_version() {
         let ron = ron::to_string(&Dae::default()).expect("DAE should serialize as RON");
-        let stale_v7 = ron.replacen("schema_version:8", "schema_version:7", 1);
+        let previous_version = DAE_SCHEMA_VERSION - 1;
+        let stale = ron.replacen(
+            &format!("schema_version:{DAE_SCHEMA_VERSION}"),
+            &format!("schema_version:{previous_version}"),
+            1,
+        );
+        assert_ne!(stale, ron, "the fixture must carry a stale schema version");
 
-        let error = ron::from_str::<Dae>(&stale_v7)
+        let error = ron::from_str::<Dae>(&stale)
             .expect_err("the previous DAE schema version must be rejected");
         assert!(
-            error
-                .to_string()
-                .contains("unsupported DAE schema_version 7; expected 8"),
+            error.to_string().contains(&format!(
+                "unsupported DAE schema_version {previous_version}; expected {DAE_SCHEMA_VERSION}"
+            )),
             "version rejection must identify the stale and required versions: {error}"
         );
     }
@@ -1622,7 +1642,11 @@ mod tests {
     fn test_dae_ron_rejects_real_v7_numeric_event_wire() {
         let ron = ron::to_string(&Dae::default()).expect("DAE should serialize as RON");
         let stale_v7 = ron
-            .replacen("schema_version:8", "schema_version:7", 1)
+            .replacen(
+                &format!("schema_version:{DAE_SCHEMA_VERSION}"),
+                "schema_version:7",
+                1,
+            )
             .replacen("scheduled_time_events:[]", "scheduled_time_events:[1.0]", 1);
 
         ron::from_str::<Dae>(&stale_v7)

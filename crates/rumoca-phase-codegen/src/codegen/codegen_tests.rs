@@ -1670,6 +1670,7 @@ fn test_fmi3_scalar_blt_projection_renders_from_solve_ir() {
     problem.continuous.implicit_row_targets = vec![None, Some(solve::scalar_slot_y(1))];
     problem.continuous.algebraic_projection_plan = solve::AlgebraicProjectionPlan {
         blocks: vec![solve::AlgebraicProjectionBlock {
+            causal_steps: Vec::new(),
             rows: vec![1],
             y_indices: vec![1],
         }],

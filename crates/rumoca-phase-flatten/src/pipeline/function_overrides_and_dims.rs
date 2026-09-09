@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Function override and dimension resolution share the same scope context.
+// split plan: separate override lookup from dimension finalization.
+
 use super::*;
 use crate::path_utils::{enclosing_scope, leaf_segment};
 use crate::source_spans::required_location_span;

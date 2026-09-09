@@ -685,6 +685,19 @@ impl FunctionScopeSubstituter<'_> {
     ) -> Option<rumoca_core::Expression> {
         let values = self.scope.scalars.get(name.as_str())?;
         let dims = self.scope.dims.get(name.as_str())?;
+        if subscripts.len() == dims.len()
+            && subscripts
+                .iter()
+                .all(|subscript| matches!(subscript, rumoca_core::Subscript::Colon { .. }))
+        {
+            let error = (0..values.len()).find_map(|index| {
+                assigned_projected_scalar_value(name.as_str(), dims, values, index, span).err()
+            });
+            if let Some(error) = error {
+                self.error = Some(error);
+                return None;
+            }
+        }
         let indices = match self.static_subscript_indices(subscripts, span) {
             Ok(Some(indices)) => indices,
             Ok(None) => return None,

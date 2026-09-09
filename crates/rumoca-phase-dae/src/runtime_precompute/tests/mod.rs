@@ -8,9 +8,9 @@ use super::*;
 
 mod clock_alias_resolution_tests;
 mod clock_alias_tests;
+mod clock_phase_tests;
 mod clock_schedule_tests;
 mod condition_memory_resize;
-mod clock_phase_tests;
 mod dynamic_clock_tests;
 
 fn populate_conditions(dae_model: &mut dae::Dae) {

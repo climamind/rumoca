@@ -67,9 +67,9 @@ use scalar_shape::expression_is_scalar_after_subscripts;
 pub use solve_for_unknown::try_solve_for_unknown;
 use solve_for_unknown::{expr_contains_unknown_in_dae, try_solve_for_unknown_in_dae};
 use substitution_application::{
-    apply_substitutions_in_order, apply_substitutions_to_dae_partitions,
-    apply_substitutions_to_remaining_once, canonicalize_exact_indexing_in_continuous_equations,
-    equation_analysis_expr, simplify_arithmetic_identities,
+    apply_substitutions_to_dae_partitions, apply_substitutions_to_remaining_once,
+    canonicalize_exact_indexing_in_continuous_equations, equation_analysis_expr,
+    simplify_arithmetic_identities,
 };
 use substitution_target::{
     expr_contains_derivative_substitution_target, expr_contains_substitution_target_in_scope,
@@ -283,7 +283,7 @@ fn regular_blt_blocks_for_fully_matched_rows(
     };
     if unmatched_unknowns.is_empty() && n_matched == n_unknowns && n_unknowns < n_equations {
         let incidence = crate::incidence::build_incidence(dae);
-        let regular = maximum_regular_subsystem(&incidence)?;
+        let regular = maximum_regular_subsystem(&incidence, &[])?;
         if regular.dropped_unknowns.is_empty()
             && regular.dropped_equations.iter().all(|equation| {
                 dropped_equation_is_evaluation_assignment_row(dae, &incidence, equation)
@@ -302,7 +302,7 @@ fn regular_blt_blocks_for_fully_matched_rows(
         }
     }
     let incidence = crate::incidence::build_incidence(dae);
-    let regular = maximum_regular_subsystem(&incidence)?;
+    let regular = maximum_regular_subsystem(&incidence, &[])?;
     if !regular.dropped_equations.is_empty() || regular.dropped_unknowns.is_empty() {
         return Ok(None);
     }

@@ -136,7 +136,7 @@ impl DefIdVarRefIndex {
             if let Some(def_id) = var.component_ref.as_ref().and_then(|comp| comp.def_id) {
                 push_indexed_candidate(&mut by_def_id, def_id, indexed.clone());
                 if let Some(ancestry) = flat.symbol_ancestry.get(&def_id) {
-                    for ancestor_def_id in ancestry {
+                    for ancestor_def_id in ancestry.iter() {
                         push_indexed_candidate(&mut by_def_id, *ancestor_def_id, indexed.clone());
                     }
                 }

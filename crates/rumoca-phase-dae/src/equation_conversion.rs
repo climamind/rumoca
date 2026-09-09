@@ -846,7 +846,7 @@ fn rhs_field_expression(
     index: usize,
     flat: &flat::Model,
     equation_span: rumoca_core::Span,
-) -> rumoca_core::Expression {
+) -> Result<rumoca_core::Expression, ToDaeError> {
     if let rumoca_core::Expression::FunctionCall {
         name,
         args,
@@ -859,13 +859,13 @@ fn rhs_field_expression(
             .is_some_and(|function| *is_constructor || function.is_constructor)
         && let Some(arg) = constructor_field_arg(args, field, index)
     {
-        return arg;
+        return Ok(arg);
     }
 
     if let Some(projected) =
-        project_complex_field_expression(rhs, field.name(), flat, equation_span)
+        project_complex_field_expression(rhs, field.name(), flat, equation_span)?
     {
-        return projected;
+        return Ok(projected);
     }
 
     let span = match rhs.span() {
@@ -888,13 +888,13 @@ fn rhs_field_expression(
                 span,
             };
         }
-        return selected;
+        return Ok(selected);
     }
-    rumoca_core::Expression::FieldAccess {
+    Ok(rumoca_core::Expression::FieldAccess {
         base: Box::new(selected),
         field: field.name.clone(),
         span,
-    }
+    })
 }
 
 fn project_complex_field_expression(
@@ -902,27 +902,29 @@ fn project_complex_field_expression(
     field: &str,
     flat: &flat::Model,
     context_span: rumoca_core::Span,
-) -> Option<rumoca_core::Expression> {
-    let (re, im) = complex_parts(expr, flat, context_span)?;
-    match field {
+) -> Result<Option<rumoca_core::Expression>, ToDaeError> {
+    let Some((re, im)) = complex_parts(expr, flat, context_span)? else {
+        return Ok(None);
+    };
+    Ok(match field {
         "re" => Some(re),
         "im" => Some(im),
         _ => None,
-    }
+    })
 }
 
 fn complex_parts(
     expr: &rumoca_core::Expression,
     flat: &flat::Model,
     context_span: rumoca_core::Span,
-) -> Option<(rumoca_core::Expression, rumoca_core::Expression)> {
-    match expr {
+) -> Result<Option<(rumoca_core::Expression, rumoca_core::Expression)>, ToDaeError> {
+    Ok(match expr {
         rumoca_core::Expression::FunctionCall {
             name,
             args,
             is_constructor,
             ..
-        } => complex_function_call_parts(name, args, *is_constructor, flat, expr, context_span),
+        } => complex_function_call_parts(name, args, *is_constructor, flat, expr, context_span)?,
         rumoca_core::Expression::VarRef {
             name,
             subscripts,
@@ -930,16 +932,16 @@ fn complex_parts(
         } => complex_var_ref_parts(expr, name, subscripts, *span, flat),
         rumoca_core::Expression::Literal { span, .. } => Some((expr.clone(), zero_literal(*span))),
         rumoca_core::Expression::Unary { op, rhs, span } => {
-            complex_unary_parts(op, rhs, *span, flat)
+            complex_unary_parts(op, rhs, *span, flat)?
         }
         rumoca_core::Expression::Binary { op, lhs, rhs, span } => {
-            complex_binary_parts(op, lhs, rhs, *span, flat)
+            complex_binary_parts(op, lhs, rhs, *span, flat)?
         }
         rumoca_core::Expression::FieldAccess { span, .. } => {
             Some((expr.clone(), zero_literal(*span)))
         }
         _ => None,
-    }
+    })
 }
 
 fn complex_function_call_parts(
@@ -949,20 +951,29 @@ fn complex_function_call_parts(
     flat: &flat::Model,
     expr: &rumoca_core::Expression,
     context_span: rumoca_core::Span,
-) -> Option<(rumoca_core::Expression, rumoca_core::Expression)> {
-    if !flat
-        .functions
-        .get(name.var_name())
-        .is_some_and(|function| is_constructor || function.is_constructor)
-    {
-        return None;
+) -> Result<Option<(rumoca_core::Expression, rumoca_core::Expression)>, ToDaeError> {
+    let Some(resolved) = name.resolved_function() else {
+        return Ok(None);
+    };
+    let function =
+        rumoca_core::resolve_function_instance(flat.functions.values(), resolved.instance_id)
+            .map_err(|error| {
+                ToDaeError::runtime_contract_violation_at(
+                    error.to_string(),
+                    expr_or_context_span(expr, context_span),
+                )
+            })?;
+    if !(is_constructor || function.is_constructor) {
+        return Ok(None);
     }
-    let fields = record_field_specs_for_call(name, is_constructor, flat)?;
+    let Some(fields) = record_field_specs_for_call(name, is_constructor, flat)? else {
+        return Ok(None);
+    };
     let re = constructor_arg_by_field_name(args, &fields, "re")
         .unwrap_or_else(|| zero_literal(expr_or_context_span(expr, context_span)));
     let im = constructor_arg_by_field_name(args, &fields, "im")
         .unwrap_or_else(|| zero_literal(expr_or_context_span(expr, context_span)));
-    Some((re, im))
+    Ok(Some((re, im)))
 }
 
 fn complex_var_ref_parts(
@@ -989,15 +1000,17 @@ fn complex_unary_parts(
     rhs: &rumoca_core::Expression,
     span: rumoca_core::Span,
     flat: &flat::Model,
-) -> Option<(rumoca_core::Expression, rumoca_core::Expression)> {
-    let (re, im) = complex_parts(rhs, flat, span)?;
-    match op {
+) -> Result<Option<(rumoca_core::Expression, rumoca_core::Expression)>, ToDaeError> {
+    let Some((re, im)) = complex_parts(rhs, flat, span)? else {
+        return Ok(None);
+    };
+    Ok(match op {
         rumoca_core::OpUnary::Plus | rumoca_core::OpUnary::DotPlus => Some((re, im)),
         rumoca_core::OpUnary::Minus | rumoca_core::OpUnary::DotMinus => {
             Some((unary_minus(re, span), unary_minus(im, span)))
         }
         _ => None,
-    }
+    })
 }
 
 fn complex_binary_parts(
@@ -1006,10 +1019,14 @@ fn complex_binary_parts(
     rhs: &rumoca_core::Expression,
     span: rumoca_core::Span,
     flat: &flat::Model,
-) -> Option<(rumoca_core::Expression, rumoca_core::Expression)> {
-    let lhs_parts = complex_parts(lhs, flat, span)?;
-    let rhs_parts = complex_parts(rhs, flat, span)?;
-    match op {
+) -> Result<Option<(rumoca_core::Expression, rumoca_core::Expression)>, ToDaeError> {
+    let Some(lhs_parts) = complex_parts(lhs, flat, span)? else {
+        return Ok(None);
+    };
+    let Some(rhs_parts) = complex_parts(rhs, flat, span)? else {
+        return Ok(None);
+    };
+    Ok(match op {
         rumoca_core::OpBinary::Add | rumoca_core::OpBinary::AddElem => Some(complex_add_sub_parts(
             op.clone(),
             lhs_parts,
@@ -1029,7 +1046,7 @@ fn complex_binary_parts(
             Some(complex_quotient_parts(lhs_parts, rhs_parts, span))
         }
         _ => None,
-    }
+    })
 }
 
 fn complex_add_sub_parts(
@@ -1913,10 +1930,10 @@ pub(crate) fn expand_record_field_equation(
         let selection_subscripts =
             indexed_record_field_selection_subscripts(&lhs_name, &field_vars);
         let scalar_count = selected_field_scalar_count(&field_vars, selection_subscripts, flat);
-        let rhs_field = record_reference_field_rhs(rhs, field, &field_vars, flat, eq.span)?
-            .unwrap_or_else(|| {
-                rhs_field_expression(rhs, &lhs_name, field, &field_vars, index, flat, eq.span)
-            });
+        let rhs_field = match record_reference_field_rhs(rhs, field, &field_vars, flat, eq.span)? {
+            Some(rhs_field) => rhs_field,
+            None => rhs_field_expression(rhs, &lhs_name, field, &field_vars, index, flat, eq.span)?,
+        };
         equations.push(flat::Equation::new_array(
             field_residual(
                 field_lhs_expression(&field_vars, selection_subscripts, eq.span),

@@ -5,8 +5,7 @@ ACCEPTED
 
 ## Summary
 
-Rumoca transforms Modelica through AST → Flat → DAE → Solve IRs. Each
-stage owns contract.
+Rumoca transforms Modelica through AST → Flat → DAE → Solve, with stage-owned contracts.
 
 ## The Four IR Stages
 
@@ -306,16 +305,13 @@ Rumoca performs these DAE-to-DAE transformations before Solve.
 - Full dummy-derivative method (Mattsson-Söderlind). The current
   Pantelides-style approach may add dummy derivatives in restricted forms,
   but a general dummy-derivative pass is not implemented.
-- Higher-order symbolic simplification beyond what serves index reduction
-  and alias elimination.
-- Symbolic linearization for control-design output (codegen-level concern,
-  not pipeline-level).
+- Higher-order symbolic simplification beyond index reduction and alias elimination.
+- Control-design symbolic linearization (owned by codegen).
 
 **Placement requirement:**
 
 All DAE structural lowering/transformation MUST live in
-`rumoca-phase-structural` per SPEC_0029 §12. A structural lowering pass's IR
-output is another finalized DAE. Separate structural analysis products may
+`rumoca-phase-structural` per SPEC_0029 §12. Structural lowering outputs a finalized DAE. Separate structural analysis products may
 accompany that DAE, but they are not stored as backend convenience fields on
 `ir-dae::Dae`. `rumoca-phase-solve` only lowers a finalized DAE to Solve-IR; it
 does not mutate DAE mathematical structure.

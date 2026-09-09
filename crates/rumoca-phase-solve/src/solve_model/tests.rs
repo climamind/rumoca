@@ -1642,7 +1642,7 @@ fn lower_supports_visible_observation_with_array_literal_size_range() {
         rumoca_core::Function {
             name: rumoca_core::VarName::new("My.badSizeRange"),
             def_id: None,
-            instance_id: None,
+            instance_id: Some(rumoca_core::FunctionInstanceId::new(1)),
             inputs: vec![],
             outputs: vec![rumoca_core::FunctionParam::new(
                 "out",
@@ -1697,7 +1697,18 @@ fn lower_supports_visible_observation_with_array_literal_size_range() {
     ));
     let visible = vec![VisibleExpression {
         name: "bad_size_observation".to_string(),
-        expr: call_expr("My.badSizeRange", vec![]),
+        expr: {
+            let mut expr = call_expr("My.badSizeRange", vec![]);
+            if let rumoca_core::Expression::FunctionCall { name, .. } = &mut expr {
+                *name =
+                    name.clone()
+                        .with_resolved_function(rumoca_core::ResolvedFunctionReference {
+                            instance_id: rumoca_core::FunctionInstanceId::new(1),
+                            base_part_count: 2,
+                        });
+            }
+            expr
+        },
     }];
 
     let prepared = lower_dae_to_solve_model_owned_with_visible_expressions(dae_model, visible)
@@ -1722,7 +1733,7 @@ fn lower_skips_visible_observation_with_unbound_function_input() {
         rumoca_core::Function {
             name: rumoca_core::VarName::new("My.needsInput"),
             def_id: None,
-            instance_id: None,
+            instance_id: Some(rumoca_core::FunctionInstanceId::new(1)),
             inputs: vec![rumoca_core::FunctionParam::new(
                 "u",
                 "Real",
@@ -1753,7 +1764,18 @@ fn lower_skips_visible_observation_with_unbound_function_input() {
     ));
     let visible = vec![VisibleExpression {
         name: "missing_function_arg".to_string(),
-        expr: call_expr("My.needsInput", vec![]),
+        expr: {
+            let mut expr = call_expr("My.needsInput", vec![]);
+            if let rumoca_core::Expression::FunctionCall { name, .. } = &mut expr {
+                *name =
+                    name.clone()
+                        .with_resolved_function(rumoca_core::ResolvedFunctionReference {
+                            instance_id: rumoca_core::FunctionInstanceId::new(1),
+                            base_part_count: 2,
+                        });
+            }
+            expr
+        },
     }];
 
     let prepared = lower_dae_to_solve_model_owned_with_visible_expressions(dae_model, visible)

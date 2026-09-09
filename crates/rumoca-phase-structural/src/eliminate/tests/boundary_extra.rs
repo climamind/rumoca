@@ -279,7 +279,8 @@ fn test_orphan_drop_does_not_keep_scalarized_unknown_by_base_alias_only() {
         scalar_count: 1,
     });
 
-    drop_unreferenced_continuous_unknowns(&mut dae);
+    drop_unreferenced_continuous_unknowns(&mut dae)
+        .expect("continuous unknown pruning should succeed");
 
     assert!(
         !dae.variables
@@ -307,7 +308,8 @@ fn test_orphan_drop_keeps_exact_scalarized_lhs_owner() {
             1,
         ));
 
-    drop_unreferenced_continuous_unknowns(&mut dae);
+    drop_unreferenced_continuous_unknowns(&mut dae)
+        .expect("continuous unknown pruning should succeed");
 
     let sorted = crate::sort_dae(&dae)
         .expect("the retained explicit scalarized lhs must remain structurally matchable");
@@ -372,7 +374,8 @@ fn test_orphan_drop_keeps_exact_scalarized_slice_lhs_owners() {
             3,
         ));
 
-    drop_unreferenced_continuous_unknowns(&mut dae);
+    drop_unreferenced_continuous_unknowns(&mut dae)
+        .expect("continuous unknown pruning should succeed");
 
     for row in 1..=3 {
         let name = VarName::new(format!("leg_force_w[{row},1]"));
@@ -390,7 +393,8 @@ fn test_orphan_drop_keeps_exact_scalarized_slice_lhs_owners() {
     );
     let mut mismatched = dae.clone();
     mismatched.continuous.equations[0].scalar_count = 2;
-    drop_unreferenced_continuous_unknowns(&mut mismatched);
+    drop_unreferenced_continuous_unknowns(&mut mismatched)
+        .expect("continuous unknown pruning should succeed");
     assert!(
         mismatched.variables.algebraics.is_empty(),
         "a slice whose DAE shape disagrees with scalar_count must fail closed"
@@ -456,7 +460,8 @@ fn test_orphan_drop_rejects_structured_lhs_with_cached_scalar_spelling() {
             1,
         ));
 
-    drop_unreferenced_continuous_unknowns(&mut dae);
+    drop_unreferenced_continuous_unknowns(&mut dae)
+        .expect("continuous unknown pruning should succeed");
 
     assert!(
         dae.variables.algebraics.is_empty(),
@@ -544,7 +549,8 @@ fn test_orphan_drop_rejects_unproven_structured_lhs_projections() {
                 scalar_count,
             ));
 
-        drop_unreferenced_continuous_unknowns(&mut dae);
+        drop_unreferenced_continuous_unknowns(&mut dae)
+            .expect("continuous unknown pruning should succeed");
         assert!(
             dae.variables.algebraics.is_empty(),
             "{case} must not retain its scalar leaf `{scalar_leaf}`"
@@ -590,7 +596,8 @@ fn test_orphan_drop_keeps_shaped_singleton_base_lhs_owner() {
             1,
         ));
 
-    drop_unreferenced_continuous_unknowns(&mut dae);
+    drop_unreferenced_continuous_unknowns(&mut dae)
+        .expect("continuous unknown pruning should succeed");
 
     assert!(
         dae.variables
@@ -642,7 +649,8 @@ fn test_orphan_drop_keeps_structured_fixed_singleton_lhs_owner() {
             1,
         ));
 
-    drop_unreferenced_continuous_unknowns(&mut dae);
+    drop_unreferenced_continuous_unknowns(&mut dae)
+        .expect("continuous unknown pruning should succeed");
 
     assert!(
         dae.variables
@@ -674,7 +682,8 @@ fn test_orphan_drop_keeps_exact_scalarized_unknown_reference() {
         scalar_count: 1,
     });
 
-    drop_unreferenced_continuous_unknowns(&mut dae);
+    drop_unreferenced_continuous_unknowns(&mut dae)
+        .expect("continuous unknown pruning should succeed");
 
     assert!(
         dae.variables

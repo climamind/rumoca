@@ -1051,7 +1051,6 @@ mod tests {
         pinned_times: Vec<f64>,
         stop_times: Vec<f64>,
         reset_count: usize,
-        exact_output_steps: bool,
     }
 
     impl TrajectoryGenerationBackend {
@@ -1064,7 +1063,6 @@ mod tests {
                 pinned_times: Vec::new(),
                 stop_times: Vec::new(),
                 reset_count: 0,
-                exact_output_steps: false,
             }
         }
     }
@@ -1167,10 +1165,6 @@ mod tests {
             Ok(())
         }
 
-        fn prefer_exact_output_steps(&self) -> bool {
-            self.exact_output_steps
-        }
-
         fn project_algebraics(
             &self,
             _y: &mut [f64],
@@ -1228,7 +1222,6 @@ mod tests {
         model: &solve::SolveModel,
         times: &[f64],
         steps: impl IntoIterator<Item = TrajectoryStep>,
-        exact_output_steps: bool,
     ) -> (
         Result<(), SimDriverError>,
         TrajectoryGenerationBackend,
@@ -1249,7 +1242,6 @@ mod tests {
         let mut recorded_times = Vec::new();
         let mut current_t = 0.0;
         let mut backend = TrajectoryGenerationBackend::new(steps);
-        backend.exact_output_steps = exact_output_steps;
 
         let result = simulate_state_targets(
             model,
@@ -1284,7 +1276,6 @@ mod tests {
                 TrajectoryStep::Stop { solver_t: left_t },
                 TrajectoryStep::Internal { solver_t: 1.0 },
             ],
-            false,
         );
 
         result.expect("scheduled reset must replace the prior trajectory at its left limit");
@@ -1315,7 +1306,6 @@ mod tests {
                 TrajectoryStep::Stop { solver_t: left_t },
                 TrajectoryStep::Internal { solver_t: 1.0 },
             ],
-            false,
         );
 
         result.expect("root reset before a scheduled event must not retain a stale stop");
@@ -1342,7 +1332,6 @@ mod tests {
                 },
                 TrajectoryStep::Internal { solver_t: 1.0 },
             ],
-            false,
         );
 
         result.expect("ordinary dense output must preserve the deferred root");
@@ -1370,7 +1359,6 @@ mod tests {
                 },
                 TrajectoryStep::Internal { solver_t: 1.0 },
             ],
-            false,
         );
 
         result.expect("deferred root should retain relation override metadata");
@@ -1379,28 +1367,24 @@ mod tests {
 
     #[test]
     fn free_and_clamped_root_paths_apply_relation_override_indices() {
-        for exact_output_steps in [false, true] {
+        for scheduled_stop in [false, true] {
             let mut model = relation_root_model(Some(solve::scalar_slot_p(0)));
             model.parameters = vec![0.0];
-            let followup = if exact_output_steps {
-                TrajectoryStep::Stop { solver_t: 1.0 }
-            } else {
-                TrajectoryStep::Internal { solver_t: 1.0 }
-            };
+            let mut steps = vec![TrajectoryStep::Root {
+                solver_t: 0.5,
+                t_root: 0.5,
+                root_indices: vec![0],
+            }];
+            if scheduled_stop {
+                model.problem.events.scheduled_time_events.push(0.75);
+                steps.push(TrajectoryStep::Stop {
+                    solver_t: event_left_limit_time(0.75),
+                });
+            }
+            steps.push(TrajectoryStep::Internal { solver_t: 1.0 });
 
-            let (result, _backend, _recorded_times, _current_t, params) = run_trajectory_driver(
-                &model,
-                &[1.0],
-                [
-                    TrajectoryStep::Root {
-                        solver_t: 0.5,
-                        t_root: 0.5,
-                        root_indices: vec![0],
-                    },
-                    followup,
-                ],
-                exact_output_steps,
-            );
+            let (result, _backend, _recorded_times, _current_t, params) =
+                run_trajectory_driver(&model, &[1.0], steps);
 
             result.expect("root path should apply relation override metadata");
             assert_eq!(params, vec![1.0]);
@@ -1473,10 +1457,6 @@ mod tests {
         ) -> Result<(), SimDriverError> {
             self.time = t;
             Ok(())
-        }
-
-        fn prefer_exact_output_steps(&self) -> bool {
-            false
         }
 
         fn project_algebraics(

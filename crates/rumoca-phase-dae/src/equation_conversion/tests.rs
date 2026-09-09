@@ -266,6 +266,7 @@ fn record_reference_equation_fixture() -> (flat::Model, flat::Equation) {
 
 fn add_complex_constructor(flat_model: &mut flat::Model) {
     let mut constructor = rumoca_core::Function::new("Complex", fixture_span());
+    constructor.instance_id = Some(rumoca_core::FunctionInstanceId::new(1));
     constructor.is_constructor = true;
     constructor.add_input(
         rumoca_core::FunctionParam::new("re", "Real", fixture_span())
@@ -732,7 +733,13 @@ fn test_record_field_equation_projects_complex_expression_fields() {
     );
 
     let complex_bias = rumoca_core::Expression::FunctionCall {
-        name: rumoca_core::VarName::new("Complex").into(),
+        name: rumoca_core::Reference::from_component_reference(
+            rumoca_core::ComponentReference::from_flat_segments("Complex", fixture_span(), None),
+        )
+        .with_resolved_function(rumoca_core::ResolvedFunctionReference {
+            instance_id: rumoca_core::FunctionInstanceId::new(1),
+            base_part_count: 1,
+        }),
         args: vec![integer_literal(1), integer_literal(2)],
         is_constructor: true,
         span: fixture_span(),

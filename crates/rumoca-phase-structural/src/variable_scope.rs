@@ -78,12 +78,7 @@ impl<'a> DaeVariableScope<'a> {
         if let Some(dims) = self.indexed_descendant_aggregate_dims(name.var_name()) {
             return Ok(DaeVariableShape::Dimensions(dims));
         }
-        if name.as_str() == "time"
-            || self.has_descendant_reference(name)
-            || name
-                .component_ref()
-                .is_some_and(|component_ref| component_ref.parts.len() > 1)
-        {
+        if name.as_str() == "time" || self.has_descendant_reference(name) {
             return Ok(DaeVariableShape::StructuredAggregate);
         }
         Err(missing_dae_variable_metadata(name.var_name(), name.span()))
@@ -664,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn hierarchical_structured_reference_without_leaf_metadata_is_aggregate() {
+    fn hierarchical_reference_without_producer_metadata_is_rejected() {
         let span = test_span();
         let reference = Reference::from_component_reference(component_ref_with_span(
             vec![
@@ -678,12 +673,12 @@ mod tests {
         let dae_model = dae::Dae::default();
         let scope = DaeVariableScope::new(&dae_model);
 
-        assert_eq!(
-            scope
-                .shape_for_reference(&reference)
-                .expect("hierarchical source reference should retain aggregate shape"),
-            DaeVariableShape::StructuredAggregate
-        );
+        assert!(matches!(
+            scope.shape_for_reference(&reference),
+            Err(StructuralError::ContractViolation { reason, span: actual })
+                if reason.contains("missing DAE variable metadata for `machine.plug.pin.i`")
+                    && actual == span
+        ));
     }
 
     #[test]

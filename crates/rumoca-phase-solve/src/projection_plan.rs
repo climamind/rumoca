@@ -813,25 +813,3 @@ pub(super) fn lower_algebraic_loop_projection_block(
         causal_steps: Vec::new(),
     })
 }
-
-pub(super) fn loop_projection_target_set(
-    unknowns: &[UnknownId],
-    row_targets: &[Option<solve::ScalarSlot>],
-    rows: &[usize],
-    projection_incidence: &ProjectionIncidence,
-) -> BTreeSet<usize> {
-    let mut y_indices = BTreeSet::new();
-    for unknown in unknowns {
-        if let Some(index) = projection_y_index(unknown, projection_incidence) {
-            y_indices.insert(index);
-        }
-    }
-    for row in rows {
-        if let Some(solve::ScalarSlot::Y { index, .. }) = row_targets.get(*row).copied().flatten()
-            && projection_incidence.unknown_y_indices.contains(&index)
-        {
-            y_indices.insert(index);
-        }
-    }
-    y_indices
-}

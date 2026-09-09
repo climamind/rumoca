@@ -42,6 +42,7 @@ pub(super) fn projection_coupled_state_model(k: f64) -> solve::SolveModel {
         vec![Some(solve::scalar_slot_y(0)), Some(solve::scalar_slot_y(1))];
     model.problem.continuous.algebraic_projection_plan = solve::AlgebraicProjectionPlan {
         blocks: vec![solve::AlgebraicProjectionBlock {
+            causal_steps: Vec::new(),
             rows: vec![1],
             y_indices: vec![1],
         }],
@@ -209,6 +210,7 @@ fn parameter_projection_model() -> solve::SolveModel {
         vec![Some(solve::scalar_slot_y(0)), Some(solve::scalar_slot_y(1))];
     model.problem.continuous.algebraic_projection_plan = solve::AlgebraicProjectionPlan {
         blocks: vec![solve::AlgebraicProjectionBlock {
+            causal_steps: Vec::new(),
             rows: vec![1],
             y_indices: vec![1],
         }],
@@ -293,6 +295,7 @@ pub(super) fn linear_algebraic_loop_state_model() -> solve::SolveModel {
     // Mutual dependence (row 1 -> a reads b, row 2 -> b reads a) => iterative refresh.
     model.problem.continuous.algebraic_projection_plan = solve::AlgebraicProjectionPlan {
         blocks: vec![solve::AlgebraicProjectionBlock {
+            causal_steps: Vec::new(),
             rows: vec![1, 2],
             y_indices: vec![1, 2],
         }],

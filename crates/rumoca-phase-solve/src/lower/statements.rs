@@ -1,3 +1,7 @@
+// SPEC_0021 file-size exception: statement lowering still owns function body,
+// loop, branch, and assignment lowering together. split plan: split loop/body
+// lowering and assignment projection into dedicated modules.
+
 //! Statement lowering and control-flow scope coordination.
 
 use indexmap::{IndexMap, IndexSet};

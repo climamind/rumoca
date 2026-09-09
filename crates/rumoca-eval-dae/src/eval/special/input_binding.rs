@@ -201,6 +201,35 @@ fn bind_declared_record_constructor_fields<T: SimFloat>(
         let Some(value_expr) = value_expr else {
             continue;
         };
+        if crate::eval::eval_expr_impl::function_param_is_string(field) {
+            crate::eval::eval_expr_impl::bind_string_function_input_shape_for_validation(
+                &mut constructor_env,
+                field,
+                value_expr,
+                caller_env,
+            )?;
+            continue;
+        }
+        if !field.dims.is_empty() || !field.shape_expr.is_empty() {
+            let source_env = constructor_env.clone();
+            bind_evaluated_array_input(&mut constructor_env, field, value_expr, &source_env)?;
+            let dims = constructor_env
+                .dims
+                .get(&field.name)
+                .cloned()
+                .ok_or_else(|| EvalError::MissingBinding {
+                    name: format!("{} dimensions", field.name),
+                })?;
+            let values = array_values_from_env_name_generic(&field.name, &constructor_env)?
+                .ok_or_else(|| EvalError::MissingBinding {
+                    name: field.name.clone(),
+                })?;
+            let path = format!("{}.{}", param.name, field.name);
+            set_array_entries(local_env, &path, &dims, &values);
+            std::sync::Arc::make_mut(&mut local_env.dims).insert(path, dims);
+            copied = true;
+            continue;
+        }
         let value = eval_expr::<T>(value_expr, &constructor_env)?;
         constructor_env.set(&field.name, value);
         local_env.set(&format!("{}.{}", param.name, field.name), value);

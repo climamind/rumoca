@@ -348,4 +348,3 @@ fn algebraic_output_root_model(implicit_row: Vec<solve::LinearOp>) -> solve::Sol
     set_complete_test_projection_plan(&mut model);
     model
 }
-

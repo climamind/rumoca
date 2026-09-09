@@ -207,9 +207,13 @@ fn collect_constructor_result_field_shapes(
         if output.type_class != Some(rumoca_core::ClassType::Record) {
             continue;
         }
+        let Some(type_def_id) = output.type_def_id else {
+            continue;
+        };
         let Some(fields) = crate::dae_lowering::record_constructor_fields_from_metadata(
             flat.functions.iter(),
             &output.type_name,
+            type_def_id,
         ) else {
             continue;
         };

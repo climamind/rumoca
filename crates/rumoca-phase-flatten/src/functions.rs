@@ -239,18 +239,21 @@ fn is_callable_class_type(class_type: &rumoca_core::ClassType) -> bool {
     )
 }
 
-pub(crate) fn record_type_fields(
-    class_index: &ast::ClassDefIndex<'_>,
-    class_def: &ast::ClassDef,
+pub(crate) fn record_type_fields<'tree>(
+    class_index: &ast::ClassDefIndex<'tree>,
+    class_def: &'tree ast::ClassDef,
     qualified_name: &str,
     tree: &ast::ClassTree,
 ) -> Result<Vec<flat::RecordField>, FlattenError> {
+    let mut member_cache = qualify::MemberDefIdCache::default();
     let constructor = convert_constructor_signature(
+        tree,
         class_index,
         class_def,
         qualified_name,
         &tree.source_map,
         &tree.def_map,
+        &mut member_cache,
     )?;
     constructor
         .inputs

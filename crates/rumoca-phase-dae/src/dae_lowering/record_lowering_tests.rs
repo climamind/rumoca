@@ -413,6 +413,7 @@ fn dae_record_param_lowering_keeps_external_object_inputs_opaque() {
 
     let mut external_constructor = rumoca_core::Function::new("Pkg.ExternalTable", span);
     external_constructor.is_constructor = true;
+    external_constructor.def_id = Some(RECORD_DEF_ID);
     external_constructor.add_input(rumoca_core::FunctionParam::new("table", "Real", span));
     external_constructor.add_input(rumoca_core::FunctionParam::new("fileName", "String", span));
     dae.symbols
@@ -422,7 +423,8 @@ fn dae_record_param_lowering_keeps_external_object_inputs_opaque() {
     let mut record_typed_user = rumoca_core::Function::new("Pkg.recordUser", span);
     record_typed_user.add_input(
         rumoca_core::FunctionParam::new("recordish", "Pkg.ExternalTable", span)
-            .with_type_class(ClassType::Record),
+            .with_type_class(ClassType::Record)
+            .with_type_def_id(RECORD_DEF_ID),
     );
     record_typed_user.add_output(rumoca_core::FunctionParam::new("y", "Real", span));
     dae.symbols
@@ -488,6 +490,15 @@ fn dae_record_param_lowering_keeps_external_object_inputs_opaque() {
 #[test]
 fn dae_record_param_lowering_infers_fields_from_already_lowered_body() {
     let mut dae = Dae::default();
+    let mut constructor = rumoca_core::Function::new("Pkg.Record", test_span(1));
+    constructor.is_constructor = true;
+    constructor.def_id = Some(RECORD_DEF_ID);
+    constructor.add_input(rumoca_core::FunctionParam::new("T", "Real", test_span(1)));
+    constructor
+        .add_input(rumoca_core::FunctionParam::new("X", "Real", test_span(1)).with_dims(vec![1]));
+    dae.symbols
+        .functions
+        .insert(VarName::new("Pkg.Record"), constructor);
     let mut function = function_with_record_input();
     function.body.push(assignment_to(
         "y",
@@ -593,6 +604,7 @@ fn dae_record_param_lowering_merges_metadata_and_body_inferred_fields() {
     let mut dae = Dae::default();
     let mut constructor = rumoca_core::Function::new("Pkg.Record", test_span(1));
     constructor.is_constructor = true;
+    constructor.def_id = Some(RECORD_DEF_ID);
     constructor.add_input(rumoca_core::FunctionParam::new("p", "Real", test_span(1)));
     constructor.add_input(rumoca_core::FunctionParam::new("T", "Real", test_span(1)));
     dae.symbols
@@ -633,6 +645,7 @@ fn dae_record_param_lowering_propagates_nested_callee_field_requirements() {
     let mut dae = Dae::default();
     let mut constructor = rumoca_core::Function::new("Pkg.Record", test_span(1));
     constructor.is_constructor = true;
+    constructor.def_id = Some(RECORD_DEF_ID);
     constructor.add_input(rumoca_core::FunctionParam::new("p", "Real", test_span(1)));
     constructor.add_input(rumoca_core::FunctionParam::new("T", "Real", test_span(1)));
     dae.symbols
@@ -642,7 +655,8 @@ fn dae_record_param_lowering_propagates_nested_callee_field_requirements() {
     let mut callee = rumoca_core::Function::new("Pkg.g", test_span(1));
     callee.add_input(
         rumoca_core::FunctionParam::new("state", "Pkg.Record", test_span(1))
-            .with_type_class(ClassType::Record),
+            .with_type_class(ClassType::Record)
+            .with_type_def_id(RECORD_DEF_ID),
     );
     callee.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span(1)));
     callee
@@ -653,7 +667,8 @@ fn dae_record_param_lowering_propagates_nested_callee_field_requirements() {
     let mut caller = rumoca_core::Function::new("Pkg.f", test_span(1));
     caller.add_input(
         rumoca_core::FunctionParam::new("state", "Pkg.Record", test_span(1))
-            .with_type_class(ClassType::Record),
+            .with_type_class(ClassType::Record)
+            .with_type_def_id(RECORD_DEF_ID),
     );
     caller.add_output(rumoca_core::FunctionParam::new("y", "Real", test_span(1)));
     caller.body.push(assignment_to(

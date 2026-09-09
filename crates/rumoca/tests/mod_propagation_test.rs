@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Modifier propagation regressions share source compilation helpers.
+// split plan: group array, record, and scope regressions in child test modules.
+
 //! Test modification propagation through nested components.
 //!
 //! This tests the pattern used in DFFREG: dFFR(n=n) should get n=2 when outer has n=2.

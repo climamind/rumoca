@@ -66,12 +66,7 @@ pub(super) fn lower_gpu_initialization_system(
                 family.span,
             ));
         };
-        let Some(body_count) = family.common_iteration_equation_count() else {
-            return Err(gpu_initial_unsupported(
-                "GPU initial projection requires a nonempty uniform structured initial family",
-                family.span,
-            ));
-        };
+        let body_count = family.equations_per_point;
         if body_count == 0 || template.body.len() != body_count {
             return Err(gpu_initial_unsupported(
                 "GPU initial projection requires one uniform template body per family cell",
@@ -167,7 +162,9 @@ fn required_user_initial_rows(dae_model: &dae::Dae) -> Result<usize, LowerError>
 fn first_uncovered_user_initial_span(dae_model: &dae::Dae) -> Option<rumoca_core::Span> {
     let mut covered = vec![false; dae_model.initialization.equations.len()];
     for family in &dae_model.initialization.structured_equations {
-        let equation_len = family.equation_counts.iter().copied().sum::<usize>();
+        let Ok(equation_len) = family.scalar_view_row_count() else {
+            return Some(family.span);
+        };
         let end = family
             .first_equation_index
             .saturating_add(equation_len)

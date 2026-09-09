@@ -1085,11 +1085,28 @@ mod tests {
         }
     }
 
+    fn fixture_function(name: &str, id: u32, span: Span) -> Function {
+        let mut function = Function::new(name, span);
+        function.instance_id = Some(rumoca_core::FunctionInstanceId::new(id));
+        function
+    }
+
+    fn fixture_reference(name: &str, base: &str, id: u32, span: Span) -> rumoca_core::Reference {
+        let component = rumoca_core::component_reference_from_flat_name(&VarName::new(name), span)
+            .expect("structured fixture reference");
+        rumoca_core::Reference::from_component_reference(component).with_resolved_function(
+            rumoca_core::ResolvedFunctionReference {
+                instance_id: rumoca_core::FunctionInstanceId::new(id),
+                base_part_count: VarName::new(base).segments().len(),
+            },
+        )
+    }
+
     #[test]
     fn solve_input_validation_allows_record_constructor_without_body() {
         let span = fixture_span();
         let mut dae = dae::Dae::default();
-        let mut constructor = Function::new("Pkg.Generic", span);
+        let mut constructor = fixture_function("Pkg.Generic", 1, span);
         constructor.is_constructor = true;
         constructor.add_input(FunctionParam::new("eta", "Real", span));
         dae.symbols
@@ -1100,7 +1117,7 @@ mod tests {
                 op: OpBinary::Sub,
                 lhs: Box::new(real(0.0, span)),
                 rhs: Box::new(Expression::FunctionCall {
-                    name: VarName::new("Pkg.Generic").into(),
+                    name: fixture_reference("Pkg.Generic", "Pkg.Generic", 1, span),
                     args: vec![real(0.8, span)],
                     is_constructor: true,
                     span,
@@ -1119,7 +1136,7 @@ mod tests {
     fn solve_input_validation_allows_record_constructor_output_projection_without_body() {
         let span = fixture_span();
         let mut dae = dae::Dae::default();
-        let mut constructor = Function::new("Pkg.RecordCtor", span);
+        let mut constructor = fixture_function("Pkg.RecordCtor", 1, span);
         constructor.is_constructor = true;
         constructor.add_input(FunctionParam::new("re", "Real", span));
         constructor.add_input(FunctionParam::new("im", "Real", span).with_default(real(0.0, span)));
@@ -1132,7 +1149,7 @@ mod tests {
             .insert(VarName::new("Pkg.RecordCtor"), constructor);
         dae.continuous.equations.push(dae::Equation::residual(
             Expression::FunctionCall {
-                name: VarName::new("Pkg.RecordCtor.result.im").into(),
+                name: fixture_reference("Pkg.RecordCtor.result.im", "Pkg.RecordCtor", 1, span),
                 args: vec![real(2.0, span)],
                 is_constructor: false,
                 span,
@@ -1149,7 +1166,7 @@ mod tests {
     fn solve_input_validation_rejects_unfilled_record_constructor_projection_input() {
         let span = fixture_span();
         let mut dae = dae::Dae::default();
-        let mut constructor = Function::new("Pkg.RecordCtor", span);
+        let mut constructor = fixture_function("Pkg.RecordCtor", 1, span);
         constructor.is_constructor = true;
         constructor.add_input(FunctionParam::new("required", "Real", span));
         constructor.add_output(
@@ -1161,7 +1178,12 @@ mod tests {
             .insert(VarName::new("Pkg.RecordCtor"), constructor);
         dae.continuous.equations.push(dae::Equation::residual(
             Expression::FunctionCall {
-                name: VarName::new("Pkg.RecordCtor.result.required").into(),
+                name: fixture_reference(
+                    "Pkg.RecordCtor.result.required",
+                    "Pkg.RecordCtor",
+                    1,
+                    span,
+                ),
                 args: vec![],
                 is_constructor: false,
                 span,
@@ -1183,11 +1205,11 @@ mod tests {
     fn solve_input_validation_checks_record_constructor_projection_defaults() {
         let span = fixture_span();
         let mut dae = dae::Dae::default();
-        let mut constructor = Function::new("Pkg.RecordCtor", span);
+        let mut constructor = fixture_function("Pkg.RecordCtor", 1, span);
         constructor.is_constructor = true;
         constructor.add_input(FunctionParam::new("value", "Real", span).with_default(
             Expression::FunctionCall {
-                name: VarName::new("Pkg.missingBody").into(),
+                name: fixture_reference("Pkg.missingBody", "Pkg.missingBody", 2, span),
                 args: vec![],
                 is_constructor: false,
                 span,
@@ -1202,11 +1224,11 @@ mod tests {
             .insert(VarName::new("Pkg.RecordCtor"), constructor);
         dae.symbols.functions.insert(
             VarName::new("Pkg.missingBody"),
-            Function::new("Pkg.missingBody", span),
+            fixture_function("Pkg.missingBody", 2, span),
         );
         dae.continuous.equations.push(dae::Equation::residual(
             Expression::FunctionCall {
-                name: VarName::new("Pkg.RecordCtor.result.value").into(),
+                name: fixture_reference("Pkg.RecordCtor.result.value", "Pkg.RecordCtor", 1, span),
                 args: vec![],
                 is_constructor: false,
                 span,
@@ -1228,7 +1250,7 @@ mod tests {
     fn solve_input_validation_still_checks_constructor_arguments() {
         let span = fixture_span();
         let mut dae = dae::Dae::default();
-        let mut constructor = Function::new("Pkg.Generic", span);
+        let mut constructor = fixture_function("Pkg.Generic", 1, span);
         constructor.is_constructor = true;
         constructor.add_input(FunctionParam::new("eta", "Real", span));
         dae.symbols
@@ -1236,9 +1258,9 @@ mod tests {
             .insert(VarName::new("Pkg.Generic"), constructor);
         dae.continuous.equations.push(dae::Equation::residual(
             Expression::FunctionCall {
-                name: VarName::new("Pkg.Generic").into(),
+                name: fixture_reference("Pkg.Generic", "Pkg.Generic", 1, span),
                 args: vec![Expression::FunctionCall {
-                    name: VarName::new("Pkg.missingBody").into(),
+                    name: fixture_reference("Pkg.missingBody", "Pkg.missingBody", 2, span),
                     args: vec![],
                     is_constructor: false,
                     span,
@@ -1251,7 +1273,7 @@ mod tests {
         ));
         dae.symbols.functions.insert(
             VarName::new("Pkg.missingBody"),
-            Function::new("Pkg.missingBody", span),
+            fixture_function("Pkg.missingBody", 2, span),
         );
 
         let err = validate_solve_input_appendix_b_invariants(&dae)
@@ -1268,8 +1290,9 @@ mod tests {
     fn solve_input_validation_allows_supported_energyplus_external_call() {
         let span = fixture_span();
         let mut dae = dae::Dae::default();
-        let mut initialize = Function::new(
+        let mut initialize = fixture_function(
             "Buildings.ThermalZones.EnergyPlus_9_6_0.BaseClasses.initialize",
+            1,
             span,
         );
         initialize.external = Some(ExternalFunction::default());
@@ -1286,10 +1309,12 @@ mod tests {
                 op: OpBinary::Sub,
                 lhs: Box::new(real(1.0, span)),
                 rhs: Box::new(Expression::FunctionCall {
-                    name: VarName::new(
+                    name: fixture_reference(
                         "Buildings.ThermalZones.EnergyPlus_9_6_0.BaseClasses.initialize",
-                    )
-                    .into(),
+                        "Buildings.ThermalZones.EnergyPlus_9_6_0.BaseClasses.initialize",
+                        1,
+                        span,
+                    ),
                     args: vec![real(1.0, span)],
                     is_constructor: false,
                     span,
@@ -1308,7 +1333,7 @@ mod tests {
     fn solve_input_validation_rejects_unknown_external_call() {
         let span = fixture_span();
         let mut dae = dae::Dae::default();
-        let mut external = Function::new("Pkg.external", span);
+        let mut external = fixture_function("Pkg.external", 1, span);
         external.external = Some(ExternalFunction::default());
         external.outputs.push(FunctionParam::new("y", "Real", span));
         dae.symbols
@@ -1316,7 +1341,7 @@ mod tests {
             .insert(VarName::new("Pkg.external"), external);
         dae.initialization.equations.push(dae::Equation::residual(
             Expression::FunctionCall {
-                name: VarName::new("Pkg.external").into(),
+                name: fixture_reference("Pkg.external", "Pkg.external", 1, span),
                 args: vec![],
                 is_constructor: false,
                 span,

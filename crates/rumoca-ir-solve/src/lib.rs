@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Solve wire types share schema-version and layout contracts.
+// split plan: separate partition types into focused modules with unchanged reexports.
+
 //! Solver-facing Solve IR.
 //! This crate contains data consumed by simulation backends after DAE-level
 //! structural/lowering phases. It must stay free of DAE evaluation and phase
@@ -1225,41 +1228,7 @@ impl SolveProblem {
                 .output_count("continuous.implicit_rhs")?,
             self.continuous.implicit_row_targets.len(),
         )?;
-        self.initialization
-            .residual
-            .validate_shape_contract("initialization.residual")?;
-        self.initialization
-            .update_rhs
-            .validate_shape_contract("initialization.update_rhs")?;
-        let initialization_rows = initialization_stored_row_count(
-            &self.initialization.residual,
-            "initialization.residual rows",
-        )?;
-        validate_initialization_direct_families(
-            &self.initialization,
-            self.layout.y_scalars(),
-            initialization_rows,
-        )?;
-        validate_count(
-            "initialization.update_targets",
-            self.initialization.update_rhs.len(),
-            self.initialization.update_targets.len(),
-        )?;
-        validate_indices(
-            "initialization.projection_indices",
-            &self.initialization.projection_indices,
-            self.solve_layout.solver_scalar_count(),
-        )?;
-        validate_projection_plan(
-            "initialization.projection_plan",
-            &self.initialization.projection_plan,
-            initialization_rows,
-            if self.initialization.direct_families.is_empty() {
-                self.solve_layout.solver_scalar_count()
-            } else {
-                self.layout.y_scalars()
-            },
-        )?;
+        self.validate_initialization_shape_contract()?;
         self.discrete
             .runtime_assignment_rhs
             .validate_shape_contract("discrete.runtime_assignment_rhs")?;
@@ -1302,6 +1271,44 @@ impl SolveProblem {
             "events.action_conditions",
             self.events.actions.len(),
             self.events.action_conditions.len(),
+        )?;
+        Ok(())
+    }
+    fn validate_initialization_shape_contract(&self) -> Result<(), SolveProblemShapeContractError> {
+        self.initialization
+            .residual
+            .validate_shape_contract("initialization.residual")?;
+        self.initialization
+            .update_rhs
+            .validate_shape_contract("initialization.update_rhs")?;
+        let initialization_rows = initialization_stored_row_count(
+            &self.initialization.residual,
+            "initialization.residual rows",
+        )?;
+        validate_initialization_direct_families(
+            &self.initialization,
+            self.layout.y_scalars(),
+            initialization_rows,
+        )?;
+        validate_count(
+            "initialization.update_targets",
+            self.initialization.update_rhs.len(),
+            self.initialization.update_targets.len(),
+        )?;
+        validate_indices(
+            "initialization.projection_indices",
+            &self.initialization.projection_indices,
+            self.solve_layout.solver_scalar_count(),
+        )?;
+        validate_projection_plan(
+            "initialization.projection_plan",
+            &self.initialization.projection_plan,
+            initialization_rows,
+            if self.initialization.direct_families.is_empty() {
+                self.solve_layout.solver_scalar_count()
+            } else {
+                self.layout.y_scalars()
+            },
         )?;
         Ok(())
     }
@@ -1658,6 +1665,14 @@ impl AlgebraicProjectionPlan {
 pub struct AlgebraicProjectionBlock {
     pub rows: Vec<usize>,
     pub y_indices: Vec<usize>,
+    #[serde(default)]
+    pub causal_steps: Vec<AlgebraicProjectionStep>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AlgebraicProjectionStep {
+    pub row: usize,
+    pub y_index: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

@@ -1207,6 +1207,7 @@ mod moved_inline_tests {
             &mut ctx,
             &binding_expr,
             None,
+            false,
             &nested_record,
             &targeted_keys,
         )
@@ -1259,6 +1260,7 @@ mod moved_inline_tests {
             &mut ctx,
             &binding_expr,
             None,
+            false,
             &nested_record,
             &targeted_keys,
         )
@@ -1302,6 +1304,7 @@ mod moved_inline_tests {
             &mut ctx,
             &binding_expr,
             None,
+            false,
             &nested_record,
             &targeted_keys,
         )
@@ -1379,6 +1382,7 @@ mod moved_inline_tests {
             &mut ctx,
             &binding_expr,
             None,
+            false,
             &nested_record,
             &IndexMap::default(),
         )
@@ -1426,6 +1430,7 @@ mod moved_inline_tests {
             &mut ctx,
             &binding_expr,
             None,
+            false,
             &nested_record,
             &IndexMap::default(),
         )
@@ -1503,6 +1508,7 @@ mod moved_inline_tests {
             &mut ctx,
             &binding_expr,
             Some(ast::QualifiedName::from_ident("Pkg")),
+            false,
             &inner_record,
             &IndexMap::default(),
         )
@@ -1619,6 +1625,7 @@ mod moved_inline_tests {
             &mut ctx,
             &binding_expr,
             Some(ast::QualifiedName::from_ident("Medium")),
+            false,
             &state_record,
             &IndexMap::default(),
         )
@@ -1660,6 +1667,7 @@ mod moved_inline_tests {
             &mut ctx,
             &binding_expr,
             None,
+            false,
             &nested_block,
             &targeted_keys,
         )

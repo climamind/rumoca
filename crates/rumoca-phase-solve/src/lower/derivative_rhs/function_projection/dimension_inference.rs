@@ -7,39 +7,8 @@ use crate::projection_suffix::{
 
 enum SelectorDimEffect {
     RemoveAxis,
-    KeepAxis(i64),
+    KeepAxis,
     Unknown,
-}
-
-fn expression_contains_component_reference(
-    expr: &rumoca_core::Expression,
-    reference: &rumoca_core::Reference,
-) -> bool {
-    let Some(component_ref) = reference.component_ref() else {
-        return false;
-    };
-    struct ComponentReferenceFinder<'a> {
-        component_ref: &'a rumoca_core::ComponentReference,
-        found: bool,
-    }
-
-    impl rumoca_core::ExpressionVisitor for ComponentReferenceFinder<'_> {
-        fn visit_var_ref(
-            &mut self,
-            name: &rumoca_core::Reference,
-            subscripts: &[rumoca_core::Subscript],
-        ) {
-            self.found |= name.component_ref() == Some(self.component_ref);
-            self.walk_var_ref(name, subscripts);
-        }
-    }
-
-    let mut finder = ComponentReferenceFinder {
-        component_ref,
-        found: false,
-    };
-    rumoca_core::ExpressionVisitor::visit_expression(&mut finder, expr);
-    finder.found
 }
 
 fn merge_vectorized_scalar_actual_dims(
@@ -253,6 +222,9 @@ impl<'a> FunctionProjectionAnalysis<'a> {
         depth: usize,
         span: rumoca_core::Span,
     ) -> Result<Option<Vec<i64>>, LowerError> {
+        if matches!(function, rumoca_core::BuiltinFunction::Size) {
+            return self.size_builtin_dims(args, scope, depth, span);
+        }
         if let Some(dims) = self.linear_algebra_builtin_dims(function, args, scope, depth, span)? {
             return Ok(Some(dims));
         }
@@ -275,6 +247,34 @@ impl<'a> FunctionProjectionAnalysis<'a> {
             return self.elementwise_builtin_dims(args, scope, depth, span);
         }
         Ok(None)
+    }
+
+    fn size_builtin_dims(
+        &self,
+        args: &[rumoca_core::Expression],
+        scope: &FunctionProjectionScope,
+        depth: usize,
+        span: rumoca_core::Span,
+    ) -> Result<Option<Vec<i64>>, LowerError> {
+        if args.len() > 1 {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(array) = args.first() else {
+            return Ok(None);
+        };
+        let Some(array_dims) = self.expr_dims_with_owner(array, scope, depth + 1, span)? else {
+            return Ok(None);
+        };
+        copy_projection_dims(
+            &[checked_usize_to_i64(
+                array_dims.len(),
+                "size() result length",
+                span,
+            )?],
+            "size() result dimension count",
+            span,
+        )
+        .map(Some)
     }
 
     fn array_constructor_dims(
@@ -348,66 +348,6 @@ impl<'a> FunctionProjectionAnalysis<'a> {
         }
     }
 
-    fn unsubscripted_var_ref_dims(
-        &self,
-        name: &rumoca_core::Reference,
-        scope: &FunctionProjectionScope,
-        depth: usize,
-        span: rumoca_core::Span,
-    ) -> Result<Option<Vec<i64>>, LowerError> {
-        if let Some(dims) = scope.dims.get(name.as_str()) {
-            return Ok(Some(copy_projection_dims(
-                dims,
-                "projected scope dimension count",
-                span,
-            )?));
-        }
-        if let Some(values) = scope.scalars.get(name.as_str()) {
-            return Ok(Some(match values.len() {
-                0 | 1 => Vec::new(),
-                len => copy_projection_dims(
-                    &[checked_usize_to_i64(
-                        len,
-                        "projected scalar value count",
-                        span,
-                    )?],
-                    "projected scalar dimension count",
-                    span,
-                )?,
-            }));
-        }
-        if let Some(expr) = scope.full.get(name.as_str())
-            && !is_same_plain_var_ref(expr, name.as_str())
-        {
-            if expression_contains_component_reference(expr, name)
-                && let Some(variable) = self.dae_variable_by_reference(name)
-            {
-                return variable_dims_i64(variable, span).map(Some);
-            }
-            return self.expr_dims_with_owner(expr, scope, depth + 1, span);
-        }
-        variable_by_name(self.dae_model, name.as_str())
-            .map(|variable| variable_dims_i64(variable, span))
-            .transpose()
-    }
-
-    fn subscripted_var_ref_dims(
-        &self,
-        name: &rumoca_core::Reference,
-        subscripts: &[rumoca_core::Subscript],
-        scope: &FunctionProjectionScope,
-        depth: usize,
-        span: rumoca_core::Span,
-    ) -> Result<Option<Vec<i64>>, LowerError> {
-        let Some(base_dims) = self.unsubscripted_var_ref_dims(name, scope, depth + 1, span)? else {
-            return Ok(None);
-        };
-        if base_dims.is_empty() {
-            return Ok(None);
-        }
-        self.subscripted_dims(&base_dims, subscripts, scope, depth, span)
-    }
-
     fn subscripted_dims(
         &self,
         base_dims: &[i64],
@@ -422,9 +362,9 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 span,
             ));
         }
-        for (dim, subscript) in base_dims.iter().copied().zip(subscripts) {
+        for subscript in subscripts {
             if matches!(
-                self.selector_dim_effect(dim, subscript, scope, depth, span)?,
+                self.selector_dim_effect(subscript, scope, depth, span)?,
                 SelectorDimEffect::Unknown
             ) {
                 return Ok(None);
@@ -436,14 +376,13 @@ impl<'a> FunctionProjectionAnalysis<'a> {
 
     fn selector_dim_effect(
         &self,
-        dim: i64,
         subscript: &rumoca_core::Subscript,
         scope: &FunctionProjectionScope,
         depth: usize,
         span: rumoca_core::Span,
     ) -> Result<SelectorDimEffect, LowerError> {
         match subscript {
-            rumoca_core::Subscript::Colon { .. } => Ok(SelectorDimEffect::KeepAxis(dim)),
+            rumoca_core::Subscript::Colon { .. } => Ok(SelectorDimEffect::KeepAxis),
             rumoca_core::Subscript::Index { .. } => Ok(SelectorDimEffect::RemoveAxis),
             rumoca_core::Subscript::Expr { expr, .. } => {
                 if let rumoca_core::Expression::Range {
@@ -452,7 +391,7 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 {
                     return Ok(self
                         .range_subscript_dim_count(start, step.as_deref(), end, scope, span)?
-                        .map_or(SelectorDimEffect::Unknown, SelectorDimEffect::KeepAxis));
+                        .map_or(SelectorDimEffect::Unknown, |_| SelectorDimEffect::KeepAxis));
                 }
                 Ok(
                     match self.expr_dims_with_owner(expr, scope, depth + 1, span)? {
@@ -659,95 +598,6 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 projection_subscript_result_dimension(&dims, span)
             }
         }
-    }
-
-    fn if_expression_dims(
-        &self,
-        branches: &[(rumoca_core::Expression, rumoca_core::Expression)],
-        else_branch: &rumoca_core::Expression,
-        scope: &FunctionProjectionScope,
-        depth: usize,
-        span: rumoca_core::Span,
-    ) -> Result<Option<Vec<i64>>, LowerError> {
-        let Some(dims) = self.expr_dims_with_owner(else_branch, scope, depth + 1, span)? else {
-            return Ok(None);
-        };
-        for (_, value) in branches {
-            let Some(branch_dims) = self.expr_dims_with_owner(value, scope, depth + 1, span)?
-            else {
-                return Ok(None);
-            };
-            if branch_dims != dims {
-                return Ok(None);
-            }
-        }
-        Ok(Some(dims))
-    }
-
-    fn argument_dims(
-        &self,
-        args: &[rumoca_core::Expression],
-        index: usize,
-        scope: &FunctionProjectionScope,
-        depth: usize,
-        span: rumoca_core::Span,
-    ) -> Result<Option<Vec<i64>>, LowerError> {
-        let Some(arg) = args.get(index) else {
-            return Ok(None);
-        };
-        self.expr_dims_with_owner(arg, scope, depth + 1, span)
-    }
-
-    fn size_builtin_dims(
-        &self,
-        args: &[rumoca_core::Expression],
-        scope: &FunctionProjectionScope,
-        depth: usize,
-        span: rumoca_core::Span,
-    ) -> Result<Option<Vec<i64>>, LowerError> {
-        if args.len() > 1 {
-            return Ok(Some(Vec::new()));
-        }
-        let Some(array) = args.first() else {
-            return Ok(None);
-        };
-        let Some(array_dims) = self.expr_dims_with_owner(array, scope, depth + 1, span)? else {
-            return Ok(None);
-        };
-        copy_projection_dims(
-            &[checked_usize_to_i64(
-                array_dims.len(),
-                "size() result length",
-                span,
-            )?],
-            "size() result dimension count",
-            span,
-        )
-        .map(Some)
-    }
-
-    fn dimension_argument_builtin_dims(
-        &self,
-        args: &[rumoca_core::Expression],
-        scope: &FunctionProjectionScope,
-        span: rumoca_core::Span,
-    ) -> Result<Option<Vec<i64>>, LowerError> {
-        if args.is_empty() {
-            return Ok(None);
-        }
-        let mut dims =
-            projection_vec_with_capacity(args.len(), "array constructor dimension count", span)?;
-        for arg in args {
-            let dim = self.compile_time_int(arg, scope, span)?;
-            if dim < 0 {
-                return Err(LowerError::contract_violation(
-                    format!("array constructor dimension must be non-negative, got {dim}"),
-                    span,
-                ));
-            }
-            dims.push(dim);
-        }
-        Ok(Some(dims))
     }
 
     fn diagonal_builtin_dims(
@@ -1193,31 +1043,6 @@ impl<'a> FunctionProjectionAnalysis<'a> {
             .and_then(|var| var.component_ref.clone())
     }
 
-    fn dae_variable_by_reference(
-        &self,
-        reference: &rumoca_core::Reference,
-    ) -> Option<&dae::Variable> {
-        let def_id = reference.component_ref()?.def_id?;
-        self.dae_model
-            .variables
-            .states
-            .values()
-            .chain(self.dae_model.variables.algebraics.values())
-            .chain(self.dae_model.variables.outputs.values())
-            .chain(self.dae_model.variables.parameters.values())
-            .chain(self.dae_model.variables.inputs.values())
-            .chain(self.dae_model.variables.discrete_reals.values())
-            .chain(self.dae_model.variables.discrete_valued.values())
-            .chain(self.dae_model.variables.constants.values())
-            .find(|variable| {
-                variable
-                    .component_ref
-                    .as_ref()
-                    .and_then(|component_ref| component_ref.def_id)
-                    == Some(def_id)
-            })
-    }
-
     pub(super) fn compile_time_if_selection<'expr>(
         &self,
         branches: &'expr [(rumoca_core::Expression, rumoca_core::Expression)],
@@ -1366,10 +1191,11 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                     else {
                         return Ok(None);
                     };
-                    let Some(output) = outputs.get(selected_index) else {
+                    let Some(output) = take_selected_projected_output(outputs, &selected_index)
+                    else {
                         return Ok(None);
                     };
-                    return self.compile_time_scalar_in_scope(&output.expr, scope);
+                    return self.compile_time_scalar_in_scope(&output, scope);
                 }
                 if let Some(value) = self.compile_time_modelica_math_call(name, args, scope)? {
                     return Ok(Some(value));
@@ -1404,10 +1230,23 @@ impl<'a> FunctionProjectionAnalysis<'a> {
                 else {
                     return Ok(None);
                 };
+                if let rumoca_core::Expression::Range { start, step, .. } = base.as_ref() {
+                    let Some(start) = self.compile_time_scalar_in_scope(start, scope)? else {
+                        return Ok(None);
+                    };
+                    let step = match step {
+                        Some(step) => self.compile_time_scalar_in_scope(step, scope)?,
+                        None => Some(1.0),
+                    };
+                    return Ok(step.map(|step| start + flat_index as f64 * step));
+                }
                 let Some(value) = self.project_value(base, &dims, flat_index, scope, 0, *span)?
                 else {
                     return Ok(None);
                 };
+                if value == *expr {
+                    return Ok(None);
+                }
                 self.compile_time_scalar_in_scope(&value, scope)
             }
             rumoca_core::Expression::If {
@@ -1641,37 +1480,6 @@ fn collect_scope_projected_expr_dims(
         _ => {}
     }
     Ok(())
-}
-
-fn projection_builtin_preserves_first_arg(function: rumoca_core::BuiltinFunction) -> bool {
-    matches!(
-        function,
-        rumoca_core::BuiltinFunction::Der
-            | rumoca_core::BuiltinFunction::Pre
-            | rumoca_core::BuiltinFunction::Abs
-            | rumoca_core::BuiltinFunction::Sign
-            | rumoca_core::BuiltinFunction::Sqrt
-            | rumoca_core::BuiltinFunction::Floor
-            | rumoca_core::BuiltinFunction::Ceil
-            | rumoca_core::BuiltinFunction::Integer
-            | rumoca_core::BuiltinFunction::Sin
-            | rumoca_core::BuiltinFunction::Cos
-            | rumoca_core::BuiltinFunction::Tan
-            | rumoca_core::BuiltinFunction::Asin
-            | rumoca_core::BuiltinFunction::Acos
-            | rumoca_core::BuiltinFunction::Atan
-            | rumoca_core::BuiltinFunction::Sinh
-            | rumoca_core::BuiltinFunction::Cosh
-            | rumoca_core::BuiltinFunction::Tanh
-            | rumoca_core::BuiltinFunction::Exp
-            | rumoca_core::BuiltinFunction::Log
-            | rumoca_core::BuiltinFunction::Log10
-            | rumoca_core::BuiltinFunction::Sample
-            | rumoca_core::BuiltinFunction::NoEvent
-            | rumoca_core::BuiltinFunction::Homotopy
-            | rumoca_core::BuiltinFunction::SemiLinear
-            | rumoca_core::BuiltinFunction::Delay
-    )
 }
 
 fn validate_scalar_projection_subscript(

@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Statement evaluation shares function-scope and assignment state.
+// split plan: separate assignment projection from control-flow evaluation.
+
 //! Generic statement evaluator for algorithm sections.
 //!
 //! Evaluates algorithm statements to update the variable environment.
@@ -694,7 +697,7 @@ fn apply_materialized_function_outputs<T: SimFloat>(
             continue;
         }
         let target_key = component_ref_to_string(target, env)?;
-        if values.len() == 1 {
+        if values.len() == 1 && env.dims.get(target_key.as_str()).is_none_or(Vec::is_empty) {
             env.set(&target_key, values[0]);
             continue;
         }

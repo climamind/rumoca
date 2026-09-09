@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Function flattening regressions share resolved-tree fixtures.
+// split plan: group constructor and inherited-function fixtures in child test modules.
+
 use super::*;
 use std::sync::Arc;
 

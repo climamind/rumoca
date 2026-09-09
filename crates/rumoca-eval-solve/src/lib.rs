@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Solve opcode evaluation shares register and runtime-state contracts.
+// split plan: move opcode groups into focused evaluator modules.
+
 //! Solve-IR row evaluation.
 
 use std::{

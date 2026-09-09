@@ -1,3 +1,8 @@
+// SPEC_0021 file-size exception: DAE preparation still coordinates alias
+// demotion, dummy-state reduction, and structural preprocessing in one module.
+// split plan: move direct state demotion and constrained dummy state reduction
+// into focused submodules with imports at the top of each file.
+
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet, hash_map::Entry};
 
@@ -582,60 +587,6 @@ fn defining_expr_candidates<'a>(
         .flat_map(|candidates| candidates.iter().map(|candidate| &candidate.expr))
 }
 
-fn build_relaxed_derivative_map_for_exprs(
-    dae: &Dae,
-    seed_exprs: &[Expression],
-) -> Result<HashMap<String, Expression>, StructuralError> {
-    let defining_expr_index = collect_residual_defining_expr_index(dae);
-    build_relaxed_derivative_map_for_exprs_with_index(dae, &defining_expr_index, seed_exprs)
-}
-
-fn build_relaxed_derivative_map_for_exprs_with_index(
-    dae: &Dae,
-    defining_expr_index: &DefiningExprIndex,
-    seed_exprs: &[Expression],
-) -> Result<HashMap<String, Expression>, StructuralError> {
-    let mut map = build_der_value_map(dae);
-    let candidate_names =
-        collect_seeded_relaxation_candidates(dae, defining_expr_index, seed_exprs);
-    relax_algebraic_derivative_map_to_fixed_point(
-        dae,
-        defining_expr_index,
-        &mut map,
-        &candidate_names,
-        false,
-    );
-    Ok(map)
-}
-
-fn collect_seeded_relaxation_candidates(
-    dae: &Dae,
-    defining_expr_index: &DefiningExprIndex,
-    seed_exprs: &[Expression],
-) -> IndexSet<VarName> {
-    let mut candidates = IndexSet::new();
-    let mut stack: Vec<VarName> = seed_exprs
-        .iter()
-        .flat_map(|expr| collect_rhs_var_refs(expr).into_iter())
-        .collect();
-
-    while let Some(name) = stack.pop() {
-        if !(dae.variables.algebraics.contains_key(&name)
-            || dae.variables.outputs.contains_key(&name))
-        {
-            continue;
-        }
-        if !candidates.insert(name.clone()) {
-            continue;
-        }
-        for defining_expr in defining_expr_candidates(defining_expr_index, &name) {
-            stack.extend(collect_rhs_var_refs(defining_expr));
-        }
-    }
-
-    candidates
-}
-
 fn collect_all_relaxation_candidates(dae: &Dae) -> IndexSet<VarName> {
     dae.variables
         .algebraics
@@ -773,142 +724,6 @@ fn is_symbolic_derivative_of_var(expr: &Expression, name: &VarName) -> bool {
             ..
         } if ref_name.var_name() == name && subscripts.is_empty()
     )
-}
-
-/// Iteratively resolve time derivatives for algebraic variables.
-///
-/// Starting from known state derivatives (from `build_der_value_map`), this
-/// function iteratively resolves derivatives for algebraic variables by:
-/// 1. Finding the algebraic equation that defines each variable: `z = expr`
-/// 2. Differentiating `expr` using the chain rule with known derivatives
-/// 3. Adding the resolved derivative to the map and repeating
-///
-/// This avoids promoting algebraic variables to states, which would create
-/// redundant degrees of freedom and conflicting ODE/algebraic constraints.
-pub fn compute_full_derivative_map(dae: &Dae) -> HashMap<String, Expression> {
-    let mut der_map = build_der_value_map(dae);
-    let defining_expr_index = collect_residual_defining_expr_index(dae);
-
-    // Iteratively resolve algebraic variable derivatives
-    // Each pass may resolve new variables that enable further resolution
-    let max_iters = 20; // prevent infinite loops
-    for _ in 0..max_iters {
-        let mut new_entries = Vec::new();
-
-        // Outputs are causal algebraics defined by their own block equations, so
-        // their time derivatives are differentiable just like algebraics. They
-        // must be resolved too: a `Modelica.Blocks.Continuous.Der` chain reads
-        // `der(output)` (e.g. `der1.y = der(der1.u)` with `der1.u = Bessel.y`),
-        // which only expands once `der(Bessel.y)` is in the map.
-        for alg_name in dae
-            .variables
-            .algebraics
-            .keys()
-            .chain(dae.variables.outputs.keys())
-        {
-            if der_map.contains_key(alg_name.as_str()) {
-                continue; // Already resolved
-            }
-            let derivative = defining_expr_candidates(&defining_expr_index, alg_name)
-                .find_map(|expr| symbolic_time_derivative(expr, dae, &der_map));
-            if let Some(d) = derivative {
-                new_entries.push((alg_name.as_str().to_string(), d));
-            }
-        }
-
-        if new_entries.is_empty() {
-            break; // Fixed point reached
-        }
-
-        for (name, deriv) in new_entries {
-            der_map.insert(name, deriv);
-        }
-    }
-
-    der_map
-}
-
-/// Expand all `der()` calls in the DAE equations using chain-rule derivatives.
-///
-/// This pass:
-/// 1. Builds a full derivative map (states + resolved algebraics)
-/// 2. Substitutes `der(algebraic_var)` with its chain-rule derivative
-/// 3. Expands compound `der(non-VarRef)` using the chain rule
-///
-/// After this pass, only `der(state)` calls remain (needed for mass matrix).
-/// All `der(algebraic)` and `der(compound)` calls are replaced with algebraic
-/// expressions. This prevents spurious state promotion.
-pub fn expand_compound_derivatives(dae: &mut Dae) {
-    if !needs_compound_derivative_expansion(dae) {
-        return;
-    }
-
-    let der_map = compute_full_derivative_map(dae);
-    if der_map.is_empty() {
-        return;
-    }
-
-    // Build set of state names — we keep der(state) intact
-    let state_names: HashSet<String> = dae
-        .variables
-        .states
-        .keys()
-        .map(|n| n.as_str().to_string())
-        .collect();
-
-    let expanded: Vec<Expression> = dae
-        .continuous
-        .equations
-        .iter()
-        .map(|eq| expand_der_in_expr_full(&eq.rhs, dae, &der_map, &state_names))
-        .collect();
-    for (eq, new_rhs) in dae.continuous.equations.iter_mut().zip(expanded) {
-        eq.rhs = new_rhs;
-    }
-}
-
-fn needs_compound_derivative_expansion(dae: &Dae) -> bool {
-    let state_names: Vec<VarName> = dae.variables.states.keys().cloned().collect();
-    let matcher = DerivativeNameMatcher::from_var_names(&state_names);
-    dae.continuous
-        .equations
-        .iter()
-        .any(|eq| expr_contains_expandable_derivative(&eq.rhs, &matcher))
-}
-
-fn expr_contains_expandable_derivative(expr: &Expression, matcher: &DerivativeNameMatcher) -> bool {
-    let mut checker = ExpandableDerivativeChecker {
-        matcher,
-        found: false,
-    };
-    checker.visit_expression(expr);
-    checker.found
-}
-
-struct ExpandableDerivativeChecker<'a> {
-    matcher: &'a DerivativeNameMatcher,
-    found: bool,
-}
-
-impl ExpressionVisitor for ExpandableDerivativeChecker<'_> {
-    fn visit_expression(&mut self, expr: &Expression) {
-        if !self.found {
-            self.walk_expression(expr);
-        }
-    }
-
-    fn visit_builtin_call(&mut self, function: &BuiltinFunction, args: &[Expression]) {
-        if *function == BuiltinFunction::Der {
-            self.found = match args.first() {
-                Some(arg) => !self.matcher.expression_refers_to_match(arg),
-                None => true,
-            };
-            return;
-        }
-        for arg in args {
-            self.visit_expression(arg);
-        }
-    }
 }
 
 /// Recursively collect names of algebraic variables that appear inside `der()`.
@@ -1176,7 +991,14 @@ fn symbolic_der_var_ref(name: &VarName, span: Span) -> Expression {
 
 fn symbolic_der_var_ref_for_variable(variable: &Variable) -> Result<Expression, StructuralError> {
     let span = required_variable_span(variable, "symbolic derivative reference")?;
-    Ok(symbolic_der_var_ref(&variable.name, span))
+    let mut derivative = symbolic_der_var_ref(&variable.name, span);
+    if let Some(component_ref) = &variable.component_ref
+        && let Expression::BuiltinCall { args, .. } = &mut derivative
+        && let Some(Expression::VarRef { name, .. }) = args.first_mut()
+    {
+        *name = Reference::from_component_reference(component_ref.clone());
+    }
+    Ok(derivative)
 }
 
 fn required_variable_span(variable: &Variable, context: &str) -> Result<Span, StructuralError> {
@@ -1321,7 +1143,11 @@ fn der_arg_is_not_plain_state(args: &[Expression], state_name_set: &HashSet<Stri
             name,
             subscripts: _,
             ..
-        } => !state_name_set.contains(name.as_str()),
+        } => {
+            !state_name_set.contains(name.as_str())
+                && !rumoca_core::parse_scalar_name(name.as_str())
+                    .is_some_and(|scalar| state_name_set.contains(scalar.base))
+        }
         _ => true,
     }
 }

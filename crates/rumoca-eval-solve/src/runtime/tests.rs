@@ -49,6 +49,7 @@ fn set_complete_test_projection_plan(model: &mut solve::SolveModel) {
     } else {
         solve::AlgebraicProjectionPlan {
             blocks: vec![solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 y_indices: rows.clone(),
                 rows,
             }],
@@ -62,6 +63,7 @@ fn set_causal_test_projection_plan(model: &mut solve::SolveModel) {
     model.problem.continuous.algebraic_projection_plan = solve::AlgebraicProjectionPlan {
         blocks: (state_count..solver_count)
             .map(|index| solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 rows: vec![index],
                 y_indices: vec![index],
             })
@@ -145,7 +147,12 @@ fn solver_y_warm_start_rejects_layout_mismatch() {
         .update_solver_y_guess_from_state(&mut solver_y, &[3.0])
         .expect_err("an established warm start must match the Solve-IR layout");
 
-    assert!(error.to_string().contains("expected 2, got 1"));
+    assert!(
+        error
+            .to_string()
+            .contains("solver y has 1 values, expected 2"),
+        "{error}"
+    );
     assert_eq!(solver_y, vec![9.0]);
 }
 
@@ -420,10 +427,12 @@ fn causal_certificate_rejects_swapped_blt_equation_target_pairs() {
                 algebraic_projection_plan: solve::AlgebraicProjectionPlan {
                     blocks: vec![
                         solve::AlgebraicProjectionBlock {
+                            causal_steps: Vec::new(),
                             rows: vec![0],
                             y_indices: vec![1],
                         },
                         solve::AlgebraicProjectionBlock {
+                            causal_steps: Vec::new(),
                             rows: vec![1],
                             y_indices: vec![0],
                         },
@@ -529,6 +538,7 @@ fn refresh_residual_fallback_solves_positive_unit_coefficient() {
                 )),
                 algebraic_projection_plan: solve::AlgebraicProjectionPlan {
                     blocks: vec![solve::AlgebraicProjectionBlock {
+                        causal_steps: Vec::new(),
                         rows: vec![0],
                         y_indices: vec![0],
                     }],
@@ -661,6 +671,7 @@ fn mode_dependent_repivot_model() -> solve::SolveModel {
                 implicit_row_targets: vec![None, Some(solve::scalar_slot_y(1))],
                 algebraic_projection_plan: solve::AlgebraicProjectionPlan {
                     blocks: vec![solve::AlgebraicProjectionBlock {
+                        causal_steps: Vec::new(),
                         rows: vec![0, 1],
                         y_indices: vec![0, 1],
                     }],
@@ -1657,19 +1668,6 @@ fn direct_param_visible_value_row(index: usize) -> Vec<solve::LinearOp> {
     vec![
         solve::LinearOp::LoadP { dst: 0, index },
         solve::LinearOp::StoreOutput { src: 0 },
-    ]
-}
-
-fn indexed_param_root_row() -> Vec<solve::LinearOp> {
-    vec![
-        solve::LinearOp::Const { dst: 0, value: 1.0 },
-        solve::LinearOp::LoadIndexedP {
-            dst: 1,
-            base: 0,
-            count: 2,
-            index: 0,
-        },
-        solve::LinearOp::StoreOutput { src: 1 },
     ]
 }
 

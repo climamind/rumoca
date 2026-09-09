@@ -469,6 +469,7 @@ impl ImplicitProjectionModel for CoupledTargetedInitialProjectionModel {
             std::sync::OnceLock::new();
         PLAN.get_or_init(|| solve::AlgebraicProjectionPlan {
             blocks: vec![solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 rows: vec![0, 1],
                 y_indices: vec![0, 1],
             }],
@@ -517,10 +518,12 @@ fn project_algebraics_uses_solve_projection_plan_blocks() {
         plan: solve::AlgebraicProjectionPlan {
             blocks: vec![
                 solve::AlgebraicProjectionBlock {
+                    causal_steps: Vec::new(),
                     rows: vec![0],
                     y_indices: vec![0],
                 },
                 solve::AlgebraicProjectionBlock {
+                    causal_steps: Vec::new(),
                     rows: vec![1],
                     y_indices: vec![1],
                 },
@@ -541,6 +544,7 @@ fn project_algebraics_backtracks_to_variable_resolution() {
     let model = PoorlyScaledProjectionModel {
         plan: solve::AlgebraicProjectionPlan {
             blocks: vec![solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 rows: vec![0],
                 y_indices: vec![0],
             }],
@@ -574,6 +578,7 @@ fn continuous_singleton_assignment_avoids_jacobian_projection() {
         target_value: 5.0,
         plan: solve::AlgebraicProjectionPlan {
             blocks: vec![solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 rows: vec![0],
                 y_indices: vec![0],
             }],
@@ -599,6 +604,7 @@ fn continuous_singleton_assignment_does_not_accept_inexact_improvement() {
         target_value: 4.0,
         plan: solve::AlgebraicProjectionPlan {
             blocks: vec![solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 rows: vec![0],
                 y_indices: vec![0],
             }],
@@ -620,6 +626,7 @@ fn initial_singleton_assignment_is_certified_by_complete_residual() {
         initial_residual_row_calls: Cell::new(0),
         plan: solve::AlgebraicProjectionPlan {
             blocks: vec![solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 rows: vec![0],
                 y_indices: vec![0],
             }],
@@ -644,6 +651,7 @@ fn initial_projection_rejects_omitted_residual_and_restores_candidate() {
     let model = BlockProjectionModel {
         plan: solve::AlgebraicProjectionPlan {
             blocks: vec![solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 rows: vec![0],
                 y_indices: vec![0],
             }],
@@ -664,6 +672,7 @@ fn project_algebraics_rejects_nonzero_residual_row_omitted_from_plan() {
     let model = BlockProjectionModel {
         plan: solve::AlgebraicProjectionPlan {
             blocks: vec![solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 rows: vec![0],
                 y_indices: vec![0],
             }],
@@ -721,6 +730,7 @@ fn project_algebraic_block_rejects_rectangular_inventory() {
         initial_residual_len: 0,
     };
     let block = solve::AlgebraicProjectionBlock {
+        causal_steps: Vec::new(),
         rows: vec![0],
         y_indices: vec![0, 1],
     };
@@ -740,6 +750,7 @@ fn project_algebraic_block_rejects_row_outside_residual_vector() {
         initial_residual_len: 0,
     };
     let block = solve::AlgebraicProjectionBlock {
+        causal_steps: Vec::new(),
         rows: vec![2],
         y_indices: vec![0],
     };
@@ -818,6 +829,7 @@ impl ImplicitProjectionModel for ScaledResidualProjectionModel {
             std::sync::OnceLock::new();
         PLAN.get_or_init(|| solve::AlgebraicProjectionPlan {
             blocks: vec![solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 rows: vec![0],
                 y_indices: vec![0],
             }],
@@ -864,6 +876,7 @@ impl AlgebraicProjectionModel for ScaledResidualProjectionModel {
 fn project_initial_block_rejects_rectangular_inventory() {
     let model = RectInitialProjectionModel;
     let block = solve::AlgebraicProjectionBlock {
+        causal_steps: Vec::new(),
         rows: vec![0, 1],
         y_indices: vec![0],
     };
@@ -880,6 +893,7 @@ fn project_initial_block_rejects_rectangular_inventory() {
 fn project_initial_block_rejects_rectangular_targeted_inventory() {
     let model = TargetedInitialProjectionModel;
     let block = solve::AlgebraicProjectionBlock {
+        causal_steps: Vec::new(),
         rows: vec![0],
         y_indices: vec![0, 1],
     };
@@ -935,6 +949,7 @@ fn project_initial_variables_rejects_plan_rows_outside_residual_vector() {
     let model = CoupledTargetedInitialProjectionModel;
     let plan = solve::AlgebraicProjectionPlan {
         blocks: vec![solve::AlgebraicProjectionBlock {
+            causal_steps: Vec::new(),
             rows: vec![2],
             y_indices: vec![0],
         }],
@@ -952,6 +967,7 @@ fn project_algebraics_solves_targeted_loop_simultaneously_without_causal_steps()
     let model = BlockProjectionModel {
         plan: solve::AlgebraicProjectionPlan {
             blocks: vec![solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 rows: vec![0, 1],
                 y_indices: vec![0, 1],
             }],
@@ -993,6 +1009,7 @@ fn singleton_assignment_preserves_representable_sub_tolerance_change() {
         target_value: target,
         plan: solve::AlgebraicProjectionPlan {
             blocks: vec![solve::AlgebraicProjectionBlock {
+                causal_steps: Vec::new(),
                 rows: vec![0],
                 y_indices: vec![0],
             }],

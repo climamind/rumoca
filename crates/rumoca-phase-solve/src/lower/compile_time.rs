@@ -1296,7 +1296,7 @@ mod tests {
                 real(11.0),
             ]),
             true,
-            &[0],
+            &[7],
         );
         insert_parameter_start(
             &mut dae_model,
@@ -1342,7 +1342,7 @@ mod tests {
             &mut dae_model,
             "booleanTable.combiTimeTable",
             table_matrix,
-            &[0, 2],
+            &[8, 2],
         );
         dae_model
             .metadata

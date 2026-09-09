@@ -334,6 +334,7 @@ static double __rumoca_solve_external_call_default(const char* function, int out
    (for example, Axis.y would otherwise collide with ModelInstance.y). */
 /* Source-reference aliases: renderers may emit sanitized full source refs
  * while local unpack aliases use the allocated target symbol. */
+{% set runtime_field_macro_names = ["time", "x", "xdot", "y", "u", "w", "p", "z", "pre_z", "m", "pre_m", "constants", "event_indicators", "event_indicators_prev", "state", "dirty_values", "is_new_event_iteration"] %}
 {% for name in dae.symbol_refs %}
 {% set source_alias = name | sanitize %}
 {% set target_symbol = symbol(symbols, name) %}

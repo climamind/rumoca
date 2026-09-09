@@ -59,6 +59,7 @@ fn install_dense_algebraic_projection_plan(model: &mut solve::SolveModel) {
         blocks: vec![solve::AlgebraicProjectionBlock {
             rows: y_indices.clone(),
             y_indices,
+            causal_steps: Vec::new(),
         }],
     };
 }
@@ -73,6 +74,7 @@ fn install_scalar_initial_projection_plan(
         blocks: vec![solve::AlgebraicProjectionBlock {
             rows: vec![row],
             y_indices: vec![y_index],
+            causal_steps: Vec::new(),
         }],
     };
 }
@@ -212,10 +214,12 @@ fn state_only_bdf_accepts_transitive_projection_dependencies() {
             solve::AlgebraicProjectionBlock {
                 rows: vec![1],
                 y_indices: vec![1],
+                causal_steps: Vec::new(),
             },
             solve::AlgebraicProjectionBlock {
                 rows: vec![2],
                 y_indices: vec![2],
+                causal_steps: Vec::new(),
             },
         ],
     };
@@ -333,6 +337,7 @@ fn projected_derivative_model() -> solve::SolveModel {
         blocks: vec![solve::AlgebraicProjectionBlock {
             rows: vec![1],
             y_indices: vec![1],
+            causal_steps: Vec::new(),
         }],
     };
     model.initial_y = vec![0.0, 0.0];

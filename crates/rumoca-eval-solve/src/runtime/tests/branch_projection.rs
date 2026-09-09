@@ -39,15 +39,15 @@ fn explicit_branch_seeds_refresh_only_their_dependency_plan() {
     let mut root_seed = vec![99.0, 42.0];
     let mut root = [f64::NAN];
     runtime
-        .eval_root_search_conditions_with_guess_into(
-            0.0,
-            &[3.0],
-            &[],
-            &mut root_seed,
-            1.0e-12,
-            32,
-            &mut root,
-        )
+        .eval_root_search_conditions_with_guess_into(RootSearchInput {
+            t: 0.0,
+            state: &[3.0],
+            params: &[],
+            guess: &mut root_seed,
+            tol: 1.0e-12,
+            max_iters: 32,
+            out: &mut root,
+        })
         .expect("root branch should settle");
 
     let mut observation_seed = vec![99.0, 42.0];
@@ -62,8 +62,7 @@ fn explicit_branch_seeds_refresh_only_their_dependency_plan() {
     assert_eq!(root, [3.0]);
 }
 
-#[test]
-fn coupled_projection_preserves_the_accepted_local_branch() {
+fn accepted_local_branch_model() -> solve::SolveModel {
     use solve::LinearOp::{Binary, Const, LoadY, StoreOutput};
     use solve::{BinaryOp, ComputeBlock};
 
@@ -143,8 +142,17 @@ fn coupled_projection_preserves_the_accepted_local_branch() {
         ],
         "accepted_branch_projection.mo",
     ));
+    set_accepted_local_branch_jvp(&mut model);
+    set_complete_test_projection_plan(&mut model);
+    model.initial_y = vec![0.0, 1.1, 1.1];
+    model
+}
+
+fn set_accepted_local_branch_jvp(model: &mut solve::SolveModel) {
+    use solve::BinaryOp;
+    use solve::LinearOp::{Binary, Const, LoadY, StoreOutput};
     set_test_implicit_jvp(
-        &mut model,
+        model,
         vec![
             vec![
                 solve::LinearOp::LoadSeed { dst: 0, index: 0 },
@@ -209,8 +217,11 @@ fn coupled_projection_preserves_the_accepted_local_branch() {
         ],
         "accepted_branch_projection_jvp.mo",
     );
-    set_complete_test_projection_plan(&mut model);
-    model.initial_y = vec![0.0, 1.1, 1.1];
+}
+
+#[test]
+fn coupled_projection_preserves_the_accepted_local_branch() {
+    let model = accepted_local_branch_model();
     let runtime = SolveRuntime::new(&model).expect("valid multi-root projection runtime");
     assert!(!runtime.algebraic_refresh.causal_solution_certified);
 

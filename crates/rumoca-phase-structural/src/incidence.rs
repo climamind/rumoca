@@ -465,16 +465,6 @@ fn collect_equation_unknowns(
 
     collect_equation_lhs_unknown(eq.lhs.as_ref(), variable_resolver, &mut result);
     collect_expression_unknowns_with_constants(&eq.rhs, variable_resolver, &mut result, constants);
-    if !result.is_empty()
-        && let Some(target) = direct_residual_definition_target(&eq.rhs)
-        && equation_contains_derivative(&eq.rhs)
-    {
-        for idx in
-            variable_resolver.resolve_var_ref_all_with_constants(target.0, target.1, constants)
-        {
-            result.remove(&idx);
-        }
-    }
 
     result
 }

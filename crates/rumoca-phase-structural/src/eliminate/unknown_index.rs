@@ -306,7 +306,9 @@ pub(super) fn expression_references_boundary_unknown(
 ) -> Result<bool, StructuralError> {
     let mut refs = Vec::new();
     collect_var_ref_nodes(expr, &mut refs);
-    refs_contain_unknown(&refs, unknown, dae)
+    let mut exact_names = Vec::new();
+    collect_exact_reference_expr_names_in_dae(dae, expr, &mut exact_names);
+    refs_contain_unknown(&refs, &exact_names, unknown, dae)
 }
 
 fn unknown_scalar_size(dae: &Dae, unknown: &VarName) -> Result<usize, StructuralError> {

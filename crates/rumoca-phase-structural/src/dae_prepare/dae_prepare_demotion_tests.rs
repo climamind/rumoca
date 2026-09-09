@@ -1615,7 +1615,7 @@ fn test_demote_direct_assigned_array_state_from_structured_scalar_slots() {
             }],
         },
         first_equation_index: 0,
-        equation_counts: vec![1, 1],
+        equations_per_point: 1,
         span: test_span(),
         origin: "structured aggregate assignment".to_string(),
         regular: None,
@@ -1738,6 +1738,7 @@ fn test_symbolic_derivative_prefers_function_derivative_annotation() {
         .push(eq(sub(der("x"), var("xdot"))));
 
     let mut function = rumoca_core::Function::new("f", Span::DUMMY);
+    function.instance_id = Some(rumoca_core::FunctionInstanceId::new(4103));
     function.inputs.push(function_param("x"));
     function.outputs.push(function_param("y"));
     function.body.push(rumoca_core::Statement::Assignment {
@@ -1759,9 +1760,12 @@ fn test_symbolic_derivative_prefers_function_derivative_annotation() {
         rumoca_core::Function::new("f_der", Span::DUMMY),
     );
 
-    let derivative =
-        symbolic_time_derivative(&call("f", vec![var("x")]), &dae, &build_der_value_map(&dae))
-            .expect("function call should differentiate through annotation");
+    let derivative = symbolic_time_derivative(
+        &resolved_call_with_span("f", vec![var("x")], test_span(), 4103),
+        &dae,
+        &build_der_value_map(&dae),
+    )
+    .expect("function call should differentiate through annotation");
 
     let Expression::FunctionCall { name, args, .. } = derivative else {
         panic!("expected derivative function call");
@@ -2118,6 +2122,7 @@ fn test_constrained_dummy_reduction_differentiates_function_defined_position_con
     let mut position = rumoca_core::Function::new("position", Span::DUMMY);
     let mut q_qd_qdd = function_param("q_qd_qdd");
     q_qd_qdd.dims = vec![3];
+    position.instance_id = Some(rumoca_core::FunctionInstanceId::new(4104));
     position.inputs.push(q_qd_qdd);
     position.inputs.push(function_param("dummy"));
     position.outputs.push(function_param("q"));
@@ -2138,12 +2143,14 @@ fn test_constrained_dummy_reduction_differentiates_function_defined_position_con
         .push(eq(sub(der("inverse.phi"), var("inverse.w"))));
     dae.continuous.equations.push(eq(sub(
         var("inverse.phi"),
-        call(
+        resolved_call_with_span(
             "position",
             vec![
                 array(vec![var("direct.phi"), var("direct.w"), real(0.0)]),
                 var("time"),
             ],
+            test_span(),
+            4104,
         ),
     )));
 

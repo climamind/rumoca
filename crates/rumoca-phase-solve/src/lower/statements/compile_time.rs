@@ -79,21 +79,22 @@ impl<'a> LowerBuilder<'a> {
             }
             matched = Some(value);
         }
-        if let Some(starts) = self.variable_starts {
-            for (key, start) in starts.iter().filter(|(key, _)| key.ends_with(&suffix)) {
-                if start_metadata_refers_to_key(start, key.as_str()) {
-                    continue;
-                }
-                let Ok(value) = self.eval_compile_time_expr(start, const_scope) else {
-                    continue;
-                };
-                if let Some(previous) = matched
-                    && (previous - value).abs() > 1.0e-9
-                {
-                    return None;
-                }
-                matched = Some(value);
+        let Some(starts) = self.variable_starts else {
+            return matched;
+        };
+        for (key, start) in starts.iter().filter(|(key, _)| key.ends_with(&suffix)) {
+            if start_metadata_refers_to_key(start, key.as_str()) {
+                continue;
             }
+            let Ok(value) = self.eval_compile_time_expr(start, const_scope) else {
+                continue;
+            };
+            if let Some(previous) = matched
+                && (previous - value).abs() > 1.0e-9
+            {
+                return None;
+            }
+            matched = Some(value);
         }
         matched
     }

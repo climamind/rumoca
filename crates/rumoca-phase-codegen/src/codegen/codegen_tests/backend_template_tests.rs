@@ -1488,7 +1488,13 @@ fn test_fmi3_model_description_advertises_internal_root_event_cosimulation() {
         "{discrete_c}"
     );
 
-    discrete.events.scheduled_time_events.push(0.1);
+    discrete
+        .events
+        .scheduled_time_events
+        .push(dae::DaeScheduledTimeEvent {
+            time: 0.1,
+            source_span: None,
+        });
     let scheduled_xml = render_template_with_name(&discrete, template, "Scheduled").unwrap();
     assert!(!scheduled_xml.contains("<CoSimulation"), "{scheduled_xml}");
     let scheduled_c = render_template_with_name(&discrete, c_template, "Scheduled").unwrap();

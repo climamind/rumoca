@@ -734,7 +734,14 @@ fn test_boundary_connection_policy_accepts_scalar_element_of_aggregate_var() {
     ];
 
     assert!(
-        !should_skip_connection_equation(&dae, &connection_rhs, true, &live, &HashSet::new(),),
+        !should_skip_connection_equation(
+            &dae,
+            &connection_rhs,
+            true,
+            &live,
+            &HashSet::new(),
+            false
+        ),
         "scalar element aliases of aggregate variables should be eligible for connection elimination"
     );
 }
@@ -784,7 +791,7 @@ fn test_boundary_connection_policy_preserves_aggregate_only_scalar_elements() {
     ];
 
     assert!(
-        should_skip_connection_equation(&dae, &connection_rhs, true, &live, &HashSet::new()),
+        should_skip_connection_equation(&dae, &connection_rhs, true, &live, &HashSet::new(), false),
         "a scalar aggregate leaf whose only non-connection use is the materializable aggregate must keep its connection equation because the base vector storage cannot remove one leaf"
     );
 }

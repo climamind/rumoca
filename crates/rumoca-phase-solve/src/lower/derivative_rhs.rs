@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: Derivative lowering shares target selection and projection context.
+// split plan: separate target discovery from row emission.
+
 mod direct_matmul;
 mod equation_collection;
 #[path = "derivative_rhs/function_projection.rs"]

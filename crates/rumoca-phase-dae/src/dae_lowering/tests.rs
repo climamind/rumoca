@@ -1,3 +1,6 @@
+// SPEC_0021 file-size exception: DAE lowering regressions share flat-model fixtures.
+// split plan: group function and array lowering cases in child test modules.
+
 use super::*;
 use rumoca_core::Span;
 
@@ -1560,7 +1563,7 @@ fn sync_structured_templates_replaces_stale_materialized_external_table_arg() {
                 }],
             },
             first_equation_index: 0,
-            equation_counts: vec![1],
+            equations_per_point: 1,
             span,
             origin: "equation from integerTable.combiTimeTable".to_string(),
             regular: None,
@@ -1641,7 +1644,7 @@ fn sync_structured_templates_preserves_vector_equation_scalar_count() {
                 }],
             },
             first_equation_index: 0,
-            equation_counts: vec![1],
+            equations_per_point: 1,
             span,
             origin: "equation from vector column loop".to_string(),
             regular: None,

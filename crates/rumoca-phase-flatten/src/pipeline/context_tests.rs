@@ -5,9 +5,9 @@ use super::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rumoca_core::{ClassType, DefId};
+    use rumoca_core::{ClassType, DefId, EvalLookup};
     use rumoca_ir_ast as ast;
-    use rumoca_ir_ast::{ClassDef, ClassTree, InstanceData, InstanceId};
+    use rumoca_ir_ast::{ClassDef, ClassTree, Component, InstanceData, InstanceId};
     use rumoca_ir_flat as flat;
     use std::sync::Arc;
     const TEST_FILE: &str = "context_tests.mo";
@@ -2527,13 +2527,6 @@ mod tests {
         };
 
         assert_eq!(infer_expr_dims(&expr, &DimMap::new(), &DimMap::new()), None);
-    }
-
-    fn token(name: &str) -> rumoca_core::Token {
-        rumoca_core::Token {
-            text: Arc::from(name.to_string()),
-            ..rumoca_core::Token::default()
-        }
     }
 
     fn seed_class(tree: &mut ClassTree, name: &str, def_id: DefId, class_type: ClassType) {
